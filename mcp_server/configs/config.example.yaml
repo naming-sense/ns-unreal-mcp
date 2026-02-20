@@ -1,0 +1,30 @@
+server:
+  log_level: INFO
+  json_logs: false
+
+ue:
+  # 우선순위: UE_MCP_WS_URL > connection_file > project_root/Saved/UnrealMCP/connection.json > ws_url
+  ws_url: ws://127.0.0.1:19090
+  connection_file: ""
+  project_root: ""
+  connect_timeout_s: 10
+  ping_interval_s: 10
+  reconnect:
+    initial_delay_s: 0.5
+    max_delay_s: 10
+
+request:
+  default_timeout_ms: 30000
+
+catalog:
+  include_schemas: true
+  refresh_interval_s: 60
+
+retry:
+  transient_max_attempts: 2
+  backoff_initial_s: 0.2
+  backoff_max_s: 1.0
+
+metrics:
+  enabled: true
+  log_interval_s: 30

@@ -1,0 +1,708 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import asyncio
+from dataclasses import dataclass, replace
+import json
+from pathlib import Path
+import time
+from typing import Any, Callable
+import uuid
+
+from mcp_server.config import AppConfig, ConfigError, load_config
+from mcp_server.event_router import EventRouter
+from mcp_server.logging_setup import configure_logging
+from mcp_server.mcp_facade import MCPFacade, ToolCallResult
+from mcp_server.metrics import RuntimeMetrics
+from mcp_server.request_broker import RequestBroker
+from mcp_server.tool_catalog import ToolCatalog
+from mcp_server.tool_passthrough import MCPPassThroughService
+from mcp_server.ue_transport import UeWsTransport
+from mcp_server.ws_endpoint import resolve_ws_endpoint
+
+
+@dataclass(frozen=True)
+class ScenarioSpec:
+    key: str
+    tool: str
+    path_arg: str | None
+    discover_class_paths: tuple[str, ...]
+    discover_name_glob: str | None
+    params_builder: Callable[[str], dict[str, Any]]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="E2E smoke runner for material/niagara/umg + asset lifecycle tools"
+    )
+    parser.add_argument("--config", type=Path, default=None, help="Path to YAML config")
+    parser.add_argument("--log-level", type=str, default=None, help="Override log level")
+    parser.add_argument("--path-glob", type=str, default="/Game/**", help="Asset search path glob")
+    parser.add_argument("--material-path", type=str, default=None, help="Material instance object path")
+    parser.add_argument("--niagara-path", type=str, default=None, help="Niagara system object path")
+    parser.add_argument("--umg-path", type=str, default=None, help="Widget blueprint object path")
+    parser.add_argument(
+        "--skip-asset-lifecycle",
+        action="store_true",
+        help="Skip asset lifecycle scenario (duplicate/rename/create/delete)",
+    )
+    parser.add_argument(
+        "--asset-lifecycle-root-path",
+        type=str,
+        default="/Game/MCPRuntimeE2E",
+        help="Root path for temporary lifecycle assets",
+    )
+    parser.add_argument(
+        "--asset-lifecycle-source",
+        type=str,
+        default="/Engine/EngineMaterials/DefaultMaterial.DefaultMaterial",
+        help="Source object path used by asset.duplicate",
+    )
+    parser.add_argument(
+        "--asset-lifecycle-class-path",
+        type=str,
+        default="/Script/Engine.MaterialInstanceConstant",
+        help="Class path used by asset.create",
+    )
+    parser.add_argument(
+        "--asset-lifecycle-keep-assets",
+        action="store_true",
+        help="Keep created lifecycle assets instead of deleting them",
+    )
+    parser.add_argument(
+        "--no-auto-discover",
+        action="store_true",
+        help="Disable asset.find fallback when object paths are omitted",
+    )
+    parser.add_argument(
+        "--require-all",
+        action="store_true",
+        help="Fail when any scenario is skipped (missing asset path)",
+    )
+    parser.add_argument("--timeout-ms", type=int, default=None, help="Per-tool timeout override")
+    parser.add_argument(
+        "--stream-events",
+        action="store_true",
+        help="Collect event stream while each tool call is running",
+    )
+    parser.add_argument(
+        "--print-event-lines",
+        action="store_true",
+        help="Print every streamed event line (with --stream-events)",
+    )
+    parser.add_argument(
+        "--include-result",
+        action="store_true",
+        help="Include tool result payload in final JSON (may be large)",
+    )
+    return parser.parse_args()
+
+
+def _scenario_specs() -> tuple[ScenarioSpec, ...]:
+    return (
+        ScenarioSpec(
+            key="material",
+            tool="mat.instance.params.get",
+            path_arg="material_path",
+            discover_class_paths=(
+                "/Script/Engine.MaterialInstanceConstant",
+                "/Script/Engine.MaterialInstance",
+            ),
+            discover_name_glob="MI_*",
+            params_builder=lambda path: {
+                "object_path": path,
+                "include_inherited": True,
+            },
+        ),
+        ScenarioSpec(
+            key="niagara",
+            tool="niagara.stack.list",
+            path_arg="niagara_path",
+            discover_class_paths=("/Script/Niagara.NiagaraSystem",),
+            discover_name_glob="NS_*",
+            params_builder=lambda path: {
+                "object_path": path,
+            },
+        ),
+        ScenarioSpec(
+            key="umg",
+            tool="umg.tree.get",
+            path_arg="umg_path",
+            discover_class_paths=(
+                "/Script/UMGEditor.WidgetBlueprint",
+                "/Script/UMG.WidgetBlueprint",
+            ),
+            discover_name_glob="WBP_*",
+            params_builder=lambda path: {
+                "object_path": path,
+                "depth": 3,
+            },
+        ),
+    )
+
+
+async def _discover_object_path(
+    pass_through: MCPPassThroughService,
+    *,
+    path_glob: str,
+    class_paths: tuple[str, ...],
+    name_glob: str | None,
+    timeout_ms: int | None,
+) -> str | None:
+    if class_paths:
+        discovery_result = await pass_through.call_tool(
+            tool="asset.find",
+            params={
+                "path_glob": path_glob,
+                "class_path_in": list(class_paths),
+                "limit": 1,
+            },
+            timeout_ms=timeout_ms,
+        )
+        found = _extract_first_asset_path(discovery_result)
+        if found:
+            return found
+
+    if name_glob:
+        discovery_result = await pass_through.call_tool(
+            tool="asset.find",
+            params={
+                "path_glob": path_glob,
+                "name_glob": name_glob,
+                "limit": 1,
+            },
+            timeout_ms=timeout_ms,
+        )
+        found = _extract_first_asset_path(discovery_result)
+        if found:
+            return found
+
+    return None
+
+
+def _extract_first_asset_path(result: ToolCallResult) -> str | None:
+    assets = result.result.get("assets")
+    if not isinstance(assets, list):
+        return None
+    for asset in assets:
+        if not isinstance(asset, dict):
+            continue
+        object_path = asset.get("object_path")
+        if isinstance(object_path, str) and object_path:
+            return object_path
+    return None
+
+
+def _build_success_summary(spec: ScenarioSpec, result: ToolCallResult) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    if spec.key == "material":
+        params = result.result.get("params")
+        summary["param_count"] = len(params) if isinstance(params, list) else 0
+    elif spec.key == "niagara":
+        modules = result.result.get("modules")
+        summary["module_count"] = len(modules) if isinstance(modules, list) else 0
+    elif spec.key == "umg":
+        nodes = result.result.get("nodes")
+        summary["node_count"] = len(nodes) if isinstance(nodes, list) else 0
+    return summary
+
+
+def _tool_is_available(pass_through: MCPPassThroughService, tool: str) -> bool:
+    return any(defn.name == tool and defn.enabled for defn in pass_through.list_tools())
+
+
+async def _run_asset_lifecycle_scenario(
+    *,
+    pass_through: MCPPassThroughService,
+    timeout_ms: int | None,
+    stream_events: bool,
+    print_event_lines: bool,
+    include_result: bool,
+    root_path: str,
+    duplicate_source_path: str,
+    create_class_path: str,
+    keep_assets: bool,
+) -> dict[str, Any]:
+    required_tools = (
+        "asset.duplicate",
+        "asset.rename",
+        "asset.create",
+        "asset.delete",
+        "asset.load",
+    )
+    missing_tools = [tool for tool in required_tools if not _tool_is_available(pass_through, tool)]
+    if missing_tools:
+        return {
+            "scenario": "asset_lifecycle",
+            "status": "skipped",
+            "reason": f"required tools missing: {', '.join(missing_tools)}",
+            "required_tools": list(required_tools),
+            "missing_tools": missing_tools,
+        }
+
+    scenario_started = time.perf_counter()
+    scenario_events: list[dict[str, Any]] = []
+    steps: list[dict[str, Any]] = []
+
+    suffix = uuid.uuid4().hex[:8].upper()
+    duplicate_name = f"MCP_E2E_Duplicate_{suffix}"
+    renamed_name = f"MCP_E2E_Renamed_{suffix}"
+    created_name = f"MCP_E2E_Created_{suffix}"
+    duplicate_path = f"{root_path}/{duplicate_name}.{duplicate_name}"
+    renamed_path = f"{root_path}/{renamed_name}.{renamed_name}"
+    created_path = f"{root_path}/{created_name}.{created_name}"
+
+    async def _invoke(step_name: str, tool: str, params: dict[str, Any]) -> ToolCallResult:
+        started = time.perf_counter()
+        step_events: list[dict[str, Any]] = []
+        try:
+            if stream_events:
+
+                def _on_event(event: dict[str, Any]) -> None:
+                    scenario_events.append(event)
+                    step_events.append(event)
+                    if print_event_lines:
+                        print(
+                            json.dumps(
+                                {
+                                    "type": "event",
+                                    "scenario": "asset_lifecycle",
+                                    "step": step_name,
+                                    "event": event,
+                                },
+                                ensure_ascii=False,
+                            ),
+                            flush=True,
+                        )
+
+                result = await pass_through.call_tool_stream(
+                    tool=tool,
+                    params=params,
+                    timeout_ms=timeout_ms,
+                    on_event=_on_event,
+                )
+            else:
+                result = await pass_through.call_tool(
+                    tool=tool,
+                    params=params,
+                    timeout_ms=timeout_ms,
+                )
+        except Exception as exc:
+            duration_ms = int((time.perf_counter() - started) * 1000)
+            steps.append(
+                {
+                    "step": step_name,
+                    "tool": tool,
+                    "status": "error",
+                    "duration_ms": duration_ms,
+                    "event_count": len(step_events),
+                    "error": {"type": exc.__class__.__name__, "message": str(exc)},
+                }
+            )
+            raise
+
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        payload: dict[str, Any] = {
+            "step": step_name,
+            "tool": tool,
+            "request_id": result.request_id,
+            "status": result.status,
+            "duration_ms": duration_ms,
+            "event_count": len(step_events),
+            "diagnostics": result.diagnostics,
+        }
+        if include_result:
+            payload["result"] = result.result
+        steps.append(payload)
+        return result
+
+    try:
+        duplicate_result = await _invoke(
+            "duplicate",
+            "asset.duplicate",
+            {
+                "source_object_path": duplicate_source_path,
+                "dest_package_path": root_path,
+                "dest_asset_name": duplicate_name,
+                "overwrite": False,
+                "save": {"auto_save": keep_assets},
+            },
+        )
+        if not duplicate_result.ok or duplicate_result.status == "error":
+            raise RuntimeError("asset.duplicate failed")
+
+        rename_result = await _invoke(
+            "rename",
+            "asset.rename",
+            {
+                "object_path": duplicate_path,
+                "new_package_path": root_path,
+                "new_asset_name": renamed_name,
+                "fixup_redirectors": False,
+                "save": {"auto_save": keep_assets},
+            },
+        )
+        if not rename_result.ok or rename_result.status == "error":
+            raise RuntimeError("asset.rename failed")
+
+        create_result = await _invoke(
+            "create",
+            "asset.create",
+            {
+                "package_path": root_path,
+                "asset_name": created_name,
+                "asset_class_path": create_class_path,
+                "overwrite": False,
+                "save": {"auto_save": keep_assets},
+            },
+        )
+        if not create_result.ok or create_result.status == "error":
+            raise RuntimeError("asset.create failed")
+
+        if keep_assets:
+            for path in (renamed_path, created_path):
+                load_existing = await _invoke(
+                    f"verify.exists.{path.rsplit('/', 1)[-1]}",
+                    "asset.load",
+                    {"object_path": path},
+                )
+                if not load_existing.ok or load_existing.status == "error":
+                    raise RuntimeError(f"asset.load should succeed for retained asset: {path}")
+        else:
+            preview_result = await _invoke(
+                "delete.preview",
+                "asset.delete",
+                {
+                    "object_paths": [renamed_path, created_path],
+                    "mode": "preview",
+                    "fail_if_referenced": True,
+                },
+            )
+            if not preview_result.ok or preview_result.status == "error":
+                raise RuntimeError("asset.delete preview failed")
+
+            confirm_token = preview_result.result.get("confirm_token")
+            if not isinstance(confirm_token, str) or not confirm_token:
+                raise RuntimeError("asset.delete preview missing confirm_token")
+
+            apply_result = await _invoke(
+                "delete.apply",
+                "asset.delete",
+                {
+                    "object_paths": [renamed_path, created_path],
+                    "mode": "apply",
+                    "fail_if_referenced": True,
+                    "confirm_token": confirm_token,
+                },
+            )
+            if not apply_result.ok or apply_result.status == "error":
+                raise RuntimeError("asset.delete apply failed")
+
+            for path in (renamed_path, created_path):
+                load_after_delete = await _invoke(
+                    f"verify.deleted.{path.rsplit('/', 1)[-1]}",
+                    "asset.load",
+                    {"object_path": path},
+                )
+                if load_after_delete.status != "error":
+                    raise RuntimeError(f"asset.load should fail after delete: {path}")
+
+    except Exception as exc:
+        return {
+            "scenario": "asset_lifecycle",
+            "status": "error",
+            "duration_ms": int((time.perf_counter() - scenario_started) * 1000),
+            "event_count": len(scenario_events),
+            "error": {"type": exc.__class__.__name__, "message": str(exc)},
+            "summary": {
+                "root_path": root_path,
+                "duplicate_path": duplicate_path,
+                "renamed_path": renamed_path,
+                "created_path": created_path,
+            },
+            "steps": steps,
+        }
+
+    return {
+        "scenario": "asset_lifecycle",
+        "status": "ok",
+        "duration_ms": int((time.perf_counter() - scenario_started) * 1000),
+        "event_count": len(scenario_events),
+        "summary": {
+            "root_path": root_path,
+            "duplicate_source": duplicate_source_path,
+            "duplicate_path": duplicate_path,
+            "renamed_path": renamed_path,
+            "created_path": created_path,
+            "kept_assets": keep_assets,
+            "deleted_count": 0 if keep_assets else 2,
+        },
+        "steps": steps,
+    }
+
+
+async def run_e2e(
+    config: AppConfig,
+    *,
+    material_path: str | None,
+    niagara_path: str | None,
+    umg_path: str | None,
+    path_glob: str,
+    auto_discover: bool,
+    require_all: bool,
+    timeout_ms: int | None,
+    stream_events: bool,
+    print_event_lines: bool,
+    include_result: bool,
+    skip_asset_lifecycle: bool,
+    asset_lifecycle_root_path: str,
+    asset_lifecycle_source: str,
+    asset_lifecycle_class_path: str,
+    asset_lifecycle_keep_assets: bool,
+) -> int:
+    endpoint_resolution = resolve_ws_endpoint(config)
+    config = replace(config, ue=replace(config.ue, ws_url=endpoint_resolution.ws_url))
+
+    metrics = RuntimeMetrics() if config.metrics.enabled else None
+    request_broker = RequestBroker(
+        default_timeout_ms=config.request.default_timeout_ms,
+        metrics=metrics,
+    )
+    event_router = EventRouter(metrics=metrics)
+    transport = UeWsTransport(
+        ws_url=config.ue.ws_url,
+        request_broker=request_broker,
+        event_router=event_router,
+        connect_timeout_s=config.ue.connect_timeout_s,
+        ping_interval_s=config.ue.ping_interval_s,
+        reconnect_initial_delay_s=config.ue.reconnect.initial_delay_s,
+        reconnect_max_delay_s=config.ue.reconnect.max_delay_s,
+        metrics=metrics,
+    )
+    facade = MCPFacade(transport)
+    catalog = ToolCatalog()
+    pass_through = MCPPassThroughService(
+        facade=facade,
+        catalog=catalog,
+        event_router=event_router,
+        include_schemas=config.catalog.include_schemas,
+        refresh_interval_s=config.catalog.refresh_interval_s,
+        transient_max_attempts=config.retry.transient_max_attempts,
+        retry_backoff_initial_s=config.retry.backoff_initial_s,
+        retry_backoff_max_s=config.retry.backoff_max_s,
+        metrics=metrics,
+    )
+
+    supplied_paths = {
+        "material": material_path,
+        "niagara": niagara_path,
+        "umg": umg_path,
+    }
+
+    scenarios: list[dict[str, Any]] = []
+    overall_ok = True
+
+    await transport.start()
+    try:
+        await transport.wait_until_connected(timeout_s=config.ue.connect_timeout_s)
+    except TimeoutError:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "MCP.SERVER.CONNECT_TIMEOUT",
+                        "message": f"Failed to connect UE WS: {config.ue.ws_url}",
+                        "retriable": True,
+                    },
+                    "scenarios": [],
+                },
+                ensure_ascii=False,
+            )
+        )
+        await transport.stop()
+        return 3
+
+    try:
+        await pass_through.start()
+
+        for spec in _scenario_specs():
+            object_path = supplied_paths[spec.key]
+            discovery_used = False
+
+            if not object_path and auto_discover:
+                object_path = await _discover_object_path(
+                    pass_through,
+                    path_glob=path_glob,
+                    class_paths=spec.discover_class_paths,
+                    name_glob=spec.discover_name_glob,
+                    timeout_ms=timeout_ms,
+                )
+                discovery_used = object_path is not None
+
+            if not object_path:
+                skipped = {
+                    "scenario": spec.key,
+                    "tool": spec.tool,
+                    "status": "skipped",
+                    "reason": "asset path not provided/found",
+                    "auto_discover": auto_discover,
+                }
+                scenarios.append(skipped)
+                if require_all:
+                    overall_ok = False
+                continue
+
+            started = time.perf_counter()
+            events: list[dict[str, Any]] = []
+
+            try:
+                if stream_events:
+
+                    def _on_event(event: dict[str, Any]) -> None:
+                        events.append(event)
+                        if print_event_lines:
+                            print(
+                                json.dumps(
+                                    {
+                                        "type": "event",
+                                        "scenario": spec.key,
+                                        "event": event,
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                                flush=True,
+                            )
+
+                    result = await pass_through.call_tool_stream(
+                        tool=spec.tool,
+                        params=spec.params_builder(object_path),
+                        timeout_ms=timeout_ms,
+                        on_event=_on_event,
+                    )
+                else:
+                    result = await pass_through.call_tool(
+                        tool=spec.tool,
+                        params=spec.params_builder(object_path),
+                        timeout_ms=timeout_ms,
+                    )
+            except Exception as exc:
+                duration_ms = int((time.perf_counter() - started) * 1000)
+                scenarios.append(
+                    {
+                        "scenario": spec.key,
+                        "tool": spec.tool,
+                        "object_path": object_path,
+                        "status": "error",
+                        "duration_ms": duration_ms,
+                        "event_count": len(events),
+                        "auto_discovered": discovery_used,
+                        "error": {
+                            "type": exc.__class__.__name__,
+                            "message": str(exc),
+                        },
+                    }
+                )
+                overall_ok = False
+                continue
+
+            duration_ms = int((time.perf_counter() - started) * 1000)
+            scenario_ok = result.ok and result.status != "error"
+            if not scenario_ok:
+                overall_ok = False
+
+            scenario_payload: dict[str, Any] = {
+                "scenario": spec.key,
+                "tool": spec.tool,
+                "request_id": result.request_id,
+                "object_path": object_path,
+                "status": result.status if scenario_ok else "error",
+                "duration_ms": duration_ms,
+                "event_count": len(events),
+                "auto_discovered": discovery_used,
+                "summary": _build_success_summary(spec, result),
+                "diagnostics": result.diagnostics,
+            }
+            if include_result:
+                scenario_payload["result"] = result.result
+            scenarios.append(scenario_payload)
+
+        if not skip_asset_lifecycle:
+            lifecycle_result = await _run_asset_lifecycle_scenario(
+                pass_through=pass_through,
+                timeout_ms=timeout_ms,
+                stream_events=stream_events,
+                print_event_lines=print_event_lines,
+                include_result=include_result,
+                root_path=asset_lifecycle_root_path,
+                duplicate_source_path=asset_lifecycle_source,
+                create_class_path=asset_lifecycle_class_path,
+                keep_assets=asset_lifecycle_keep_assets,
+            )
+            scenarios.append(lifecycle_result)
+            if lifecycle_result.get("status") == "error":
+                overall_ok = False
+            if require_all and lifecycle_result.get("status") == "skipped":
+                overall_ok = False
+    finally:
+        await pass_through.stop()
+        await transport.stop()
+
+    payload: dict[str, Any] = {
+        "ok": overall_ok,
+        "auto_discover": auto_discover,
+        "require_all": require_all,
+        "path_glob": path_glob,
+        "scenarios": scenarios,
+    }
+    if metrics is not None:
+        payload["metrics"] = metrics.snapshot()
+    print(json.dumps(payload, ensure_ascii=False))
+    return 0 if overall_ok else 5
+
+
+def main() -> int:
+    args = parse_args()
+    if args.print_event_lines and not args.stream_events:
+        print("Argument error: --print-event-lines requires --stream-events.")
+        return 2
+
+    try:
+        config = load_config(args.config)
+    except ConfigError as exc:
+        print(f"Config error: {exc}")
+        return 2
+
+    if args.log_level:
+        config = replace(config, server=replace(config.server, log_level=args.log_level))
+
+    configure_logging(config.server.log_level, json_logs=config.server.json_logs)
+
+    try:
+        return asyncio.run(
+            run_e2e(
+                config,
+                material_path=args.material_path,
+                niagara_path=args.niagara_path,
+                umg_path=args.umg_path,
+                path_glob=args.path_glob,
+                auto_discover=not args.no_auto_discover,
+                require_all=args.require_all,
+                timeout_ms=args.timeout_ms,
+                stream_events=args.stream_events,
+                print_event_lines=args.print_event_lines,
+                include_result=args.include_result,
+                skip_asset_lifecycle=args.skip_asset_lifecycle,
+                asset_lifecycle_root_path=args.asset_lifecycle_root_path,
+                asset_lifecycle_source=args.asset_lifecycle_source,
+                asset_lifecycle_class_path=args.asset_lifecycle_class_path,
+                asset_lifecycle_keep_assets=args.asset_lifecycle_keep_assets,
+            )
+        )
+    except KeyboardInterrupt:
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

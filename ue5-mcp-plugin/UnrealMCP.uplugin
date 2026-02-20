@@ -1,0 +1,30 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "0.1.0",
+  "FriendlyName": "Unreal MCP",
+  "Description": "MCP bridge plugin for Unreal Editor workflows.",
+  "Category": "AI",
+  "CreatedBy": "Codex",
+  "CanContainContent": false,
+  "IsBetaVersion": true,
+  "Installed": false,
+  "Modules": [
+    {
+      "Name": "UnrealMCP",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
+    },
+    {
+      "Name": "UnrealMCPEditor",
+      "Type": "Editor",
+      "LoadingPhase": "Default"
+    }
+  ],
+  "Plugins": [
+    {
+      "Name": "WebSocketNetworking",
+      "Enabled": true
+    }
+  ]
+}

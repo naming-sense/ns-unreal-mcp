@@ -1,0 +1,1663 @@
+{
+  "tools.list": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "include_schemas": {
+          "type": "boolean",
+          "default": true
+        },
+        "domain_filter": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "protocol_version": {
+          "type": "string"
+        },
+        "schema_hash": {
+          "type": "string"
+        },
+        "capabilities": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "tools": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        }
+      },
+      "required": [
+        "protocol_version",
+        "schema_hash",
+        "tools"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "system.health": {
+    "params_schema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "engine_version": {
+          "type": "string"
+        },
+        "plugin_version": {
+          "type": "string"
+        },
+        "protocol_version": {
+          "type": "string"
+        },
+        "safe_mode": {
+          "type": "boolean"
+        },
+        "editor_state": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "engine_version",
+        "plugin_version",
+        "protocol_version",
+        "safe_mode"
+      ],
+      "additionalProperties": true
+    }
+  },
+  "asset.find": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "path_glob": {
+          "type": "string",
+          "default": "/Game/**"
+        },
+        "class_path_in": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "name_glob": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500,
+          "default": 50
+        },
+        "cursor": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "assets": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "object_path": {
+                "type": "string"
+              },
+              "class_path": {
+                "type": "string"
+              },
+              "package_path": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "object_path",
+              "class_path"
+            ]
+          }
+        },
+        "next_cursor": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "assets"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "asset.load": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "object_path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "object_path"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "loaded": {
+          "type": "boolean"
+        },
+        "object_path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "loaded",
+        "object_path"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "asset.save": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "packages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "only_dirty": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "required": [
+        "packages"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "saved": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "failed": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "saved",
+        "failed"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "world.outliner.list": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "world": {
+          "type": "string",
+          "enum": [
+            "editor"
+          ],
+          "default": "editor"
+        },
+        "scope": {
+          "type": "string",
+          "default": "all"
+        },
+        "filters": {
+          "type": "object",
+          "properties": {
+            "name_glob": {
+              "type": "string"
+            },
+            "class_path_in": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "only_loaded": {
+              "type": "boolean",
+              "default": true
+            }
+          }
+        },
+        "include": {
+          "type": "object",
+          "properties": {
+            "class": {
+              "type": "boolean",
+              "default": true
+            },
+            "folder_path": {
+              "type": "boolean",
+              "default": true
+            },
+            "tags": {
+              "type": "boolean",
+              "default": false
+            },
+            "transform": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2000,
+          "default": 200
+        },
+        "cursor": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "nodes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "node_type": {
+                "type": "string",
+                "enum": [
+                  "actor",
+                  "folder"
+                ]
+              },
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "actor_path": {
+                "type": "string"
+              },
+              "folder_path": {
+                "type": "string"
+              },
+              "parent_id": {
+                "type": "string"
+              },
+              "class_path": {
+                "type": "string"
+              },
+              "is_selected": {
+                "type": "boolean"
+              },
+              "is_hidden_in_editor": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "node_type",
+              "id",
+              "name"
+            ]
+          }
+        },
+        "next_cursor": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "nodes"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "world.selection.get": {
+    "params_schema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "actors": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "actors"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "world.selection.set": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "actors": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "replace",
+            "add",
+            "remove"
+          ],
+          "default": "replace"
+        }
+      },
+      "required": [
+        "actors"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "selected": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "selected"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "object.inspect": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
+        },
+        "filters": {
+          "type": "object",
+          "properties": {
+            "only_editable": {
+              "type": "boolean",
+              "default": true
+            },
+            "category_glob": {
+              "type": "string"
+            },
+            "property_name_glob": {
+              "type": "string"
+            },
+            "include_transient": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        },
+        "depth": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 5,
+          "default": 2
+        },
+        "format": {
+          "type": "string",
+          "enum": [
+            "typed",
+            "display"
+          ],
+          "default": "typed"
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "properties": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "category": {
+                "type": "string"
+              },
+              "cpp_type": {
+                "type": "string"
+              },
+              "editable": {
+                "type": "boolean"
+              },
+              "value": {},
+              "constraints": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "path",
+              "name",
+              "cpp_type",
+              "editable"
+            ]
+          }
+        }
+      },
+      "required": [
+        "properties"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "object.patch": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
+        },
+        "patch": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "op": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "value": {},
+              "from": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "path"
+            ]
+          }
+        },
+        "transaction": {
+          "type": "object",
+          "properties": {
+            "label": {
+              "type": "string",
+              "default": "MCP Patch"
+            }
+          }
+        },
+        "save": {
+          "type": "object",
+          "properties": {
+            "auto_save": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        },
+        "validation": {
+          "type": "object",
+          "properties": {
+            "preflight": {
+              "type": "boolean",
+              "default": true
+            },
+            "postflight": {
+              "type": "boolean",
+              "default": true
+            }
+          }
+        }
+      },
+      "required": [
+        "target",
+        "patch"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "changed_properties": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "touched_packages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "changed_properties",
+        "touched_packages"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "mat.instance.params.get": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "object_path": {
+          "type": "string"
+        },
+        "include_inherited": {
+          "type": "boolean",
+          "default": true
+        },
+        "kinds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "object_path"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "params": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string"
+              },
+              "value": {},
+              "overridden": {
+                "type": "boolean"
+              },
+              "source": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "kind",
+              "overridden",
+              "source"
+            ]
+          }
+        }
+      },
+      "required": [
+        "params"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "mat.instance.params.set": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "object_path": {
+          "type": "string"
+        },
+        "set": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string"
+              },
+              "value": {},
+              "override": {
+                "type": "boolean",
+                "default": true
+              }
+            },
+            "required": [
+              "name",
+              "kind",
+              "value"
+            ]
+          }
+        },
+        "clear": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "kind"
+            ]
+          }
+        },
+        "recompile": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "never",
+            "always"
+          ],
+          "default": "auto"
+        }
+      },
+      "required": [
+        "object_path"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "updated": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "compile_status": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "updated"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "niagara.params.get": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "object_path": {
+          "type": "string"
+        },
+        "scope": {
+          "type": "string",
+          "enum": [
+            "system",
+            "emitter"
+          ],
+          "default": "system"
+        }
+      },
+      "required": [
+        "object_path"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "params": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string"
+              },
+              "value": {},
+              "exposed": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "name",
+              "type",
+              "value"
+            ]
+          }
+        },
+        "compile_status": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "params"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "niagara.params.set": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "object_path": {
+          "type": "string"
+        },
+        "set": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string"
+              },
+              "value": {}
+            },
+            "required": [
+              "name",
+              "type",
+              "value"
+            ]
+          }
+        },
+        "strict_types": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "required": [
+        "object_path",
+        "set"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "updated": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "compile_status": {
+          "type": "string"
+        },
+        "errors": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "updated"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "niagara.stack.list": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "object_path": {
+          "type": "string"
+        },
+        "emitter_name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "object_path"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "modules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "module_key": {
+                "type": "string"
+              },
+              "display_name": {
+                "type": "string"
+              },
+              "enabled": {
+                "type": "boolean"
+              },
+              "category": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "module_key",
+              "display_name",
+              "enabled"
+            ]
+          }
+        }
+      },
+      "required": [
+        "modules"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "niagara.stack.module.set_param": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "object_path": {
+          "type": "string"
+        },
+        "module_key": {
+          "type": "string"
+        },
+        "set": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string"
+              },
+              "value": {}
+            },
+            "required": [
+              "name",
+              "type",
+              "value"
+            ]
+          }
+        }
+      },
+      "required": [
+        "object_path",
+        "module_key",
+        "set"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "updated": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "compile_status": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "updated"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "umg.tree.get": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "object_path": {
+          "type": "string"
+        },
+        "include": {
+          "type": "object",
+          "properties": {
+            "slot_summary": {
+              "type": "boolean",
+              "default": true
+            },
+            "layout_summary": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        },
+        "filters": {
+          "type": "object",
+          "properties": {
+            "name_glob": {
+              "type": "string"
+            },
+            "class_path_in": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "depth": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 20,
+          "default": 10
+        }
+      },
+      "required": [
+        "object_path"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "root_id": {
+          "type": "string"
+        },
+        "nodes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "widget_id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "class_path": {
+                "type": "string"
+              },
+              "parent_id": {
+                "type": "string"
+              },
+              "slot_type": {
+                "type": "string"
+              },
+              "children_count": {
+                "type": "integer"
+              },
+              "flags": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "widget_id",
+              "name",
+              "class_path"
+            ]
+          }
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "nodes"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "umg.widget.inspect": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "object_path": {
+          "type": "string"
+        },
+        "widget_ref": {
+          "type": "object",
+          "properties": {
+            "widget_id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          }
+        },
+        "include": {
+          "type": "object",
+          "properties": {
+            "properties": {
+              "type": "boolean",
+              "default": true
+            },
+            "metadata": {
+              "type": "boolean",
+              "default": true
+            },
+            "style": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        },
+        "depth": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 5,
+          "default": 2
+        }
+      },
+      "required": [
+        "object_path",
+        "widget_ref"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "widget": {
+          "type": "object",
+          "properties": {
+            "widget_id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "class_path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "class_path"
+          ]
+        },
+        "properties": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        }
+      },
+      "required": [
+        "widget",
+        "properties"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "umg.widget.patch": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "object_path": {
+          "type": "string"
+        },
+        "widget_ref": {
+          "type": "object",
+          "properties": {
+            "widget_id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          }
+        },
+        "patch": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "op": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "value": {}
+            },
+            "required": [
+              "op",
+              "path"
+            ]
+          }
+        },
+        "compile_on_success": {
+          "type": "boolean",
+          "default": true
+        },
+        "transaction": {
+          "type": "object",
+          "properties": {
+            "label": {
+              "type": "string",
+              "default": "MCP UMG Patch"
+            }
+          }
+        }
+      },
+      "required": [
+        "object_path",
+        "widget_ref",
+        "patch"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "changed_properties": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "compile": {
+          "type": "object"
+        },
+        "touched_packages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "changed_properties",
+        "touched_packages"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "umg.slot.patch": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "object_path": {
+          "type": "string"
+        },
+        "widget_ref": {
+          "type": "object",
+          "properties": {
+            "widget_id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          }
+        },
+        "patch": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "op": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "value": {}
+            },
+            "required": [
+              "op",
+              "path"
+            ]
+          }
+        }
+      },
+      "required": [
+        "object_path",
+        "widget_ref",
+        "patch"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "changed_properties": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "touched_packages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "changed_properties",
+        "touched_packages"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "changeset.list": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "status_in": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "partial",
+              "error"
+            ]
+          }
+        },
+        "tool_glob": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200,
+          "default": 50
+        },
+        "cursor": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "changesets": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "changeset_id": {
+                "type": "string"
+              },
+              "created_at": {
+                "type": "string"
+              },
+              "tool": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              },
+              "request_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "changeset_id",
+              "created_at",
+              "tool",
+              "status"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "next_cursor": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "changesets"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "changeset.get": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "changeset_id": {
+          "type": "string"
+        },
+        "include_logs": {
+          "type": "boolean",
+          "default": true
+        },
+        "include_snapshots": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "changeset_id"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "changeset_id": {
+          "type": "string"
+        },
+        "meta": {
+          "type": "object"
+        },
+        "touched_packages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "logs": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "snapshots": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "changeset_id",
+        "meta",
+        "touched_packages"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "changeset.rollback.preview": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "changeset_id": {
+          "type": "string"
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "local_snapshot",
+            "undo_transaction",
+            "vcs_revert"
+          ],
+          "default": "local_snapshot"
+        }
+      },
+      "required": [
+        "changeset_id"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "changeset_id": {
+          "type": "string"
+        },
+        "mode": {
+          "type": "string"
+        },
+        "impact": {
+          "type": "object",
+          "properties": {
+            "packages": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "missing_snapshots": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "conflicts": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "packages",
+            "missing_snapshots",
+            "conflicts"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "changeset_id",
+        "mode",
+        "impact"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "changeset.rollback.apply": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "changeset_id": {
+          "type": "string"
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "local_snapshot",
+            "undo_transaction",
+            "vcs_revert"
+          ],
+          "default": "local_snapshot"
+        },
+        "force": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "changeset_id"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "applied": {
+          "type": "boolean"
+        },
+        "rollback_changeset_id": {
+          "type": "string"
+        },
+        "touched_packages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "applied",
+        "touched_packages"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "job.get": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "job_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "job_id"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "job_id": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "queued",
+            "running",
+            "succeeded",
+            "failed",
+            "canceled"
+          ]
+        },
+        "progress": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "started_at": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "string"
+        },
+        "result": {},
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        }
+      },
+      "required": [
+        "job_id",
+        "status"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "job.cancel": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "job_id": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "job_id"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "job_id": {
+          "type": "string"
+        },
+        "canceled": {
+          "type": "boolean"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "queued",
+            "running",
+            "succeeded",
+            "failed",
+            "canceled"
+          ]
+        }
+      },
+      "required": [
+        "job_id",
+        "canceled",
+        "status"
+      ],
+      "additionalProperties": false
+    }
+  }
+}
