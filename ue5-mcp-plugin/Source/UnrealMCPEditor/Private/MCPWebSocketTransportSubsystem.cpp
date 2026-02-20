@@ -44,6 +44,44 @@ namespace
 
 		return BindAddress;
 	}
+
+	template<typename TWebSocketServer>
+	auto InitWebSocketServerCompatImpl(
+		TWebSocketServer* InServer,
+		const uint32 InPort,
+		const FWebSocketClientConnectedCallBack& InClientConnectedCallback,
+		const FString& InBindAddress,
+		int)
+		-> decltype(InServer->Init(InPort, InClientConnectedCallback, InBindAddress), bool())
+	{
+		return InServer->Init(InPort, InClientConnectedCallback, InBindAddress);
+	}
+
+	template<typename TWebSocketServer>
+	bool InitWebSocketServerCompatImpl(
+		TWebSocketServer* InServer,
+		const uint32 InPort,
+		const FWebSocketClientConnectedCallBack& InClientConnectedCallback,
+		const FString& InBindAddress,
+		...)
+	{
+		(void)InBindAddress;
+		return InServer->Init(InPort, InClientConnectedCallback);
+	}
+
+	bool InitWebSocketServerCompat(
+		IWebSocketServer* InServer,
+		const uint32 InPort,
+		const FWebSocketClientConnectedCallBack& InClientConnectedCallback,
+		const FString& InBindAddress)
+	{
+		if (InServer == nullptr)
+		{
+			return false;
+		}
+
+		return InitWebSocketServerCompatImpl(InServer, InPort, InClientConnectedCallback, InBindAddress, 0);
+	}
 }
 
 void UMCPWebSocketTransportSubsystem::Initialize(FSubsystemCollectionBase& Collection)
@@ -166,8 +204,8 @@ void UMCPWebSocketTransportSubsystem::StartServer()
 
 		ClientConnectedCallback.Unbind();
 		ClientConnectedCallback.BindUObject(this, &UMCPWebSocketTransportSubsystem::OnClientConnected);
-		if (CandidateServer->Init(CandidatePort, ClientConnectedCallback, BindAddress))
-		{
+			if (InitWebSocketServerCompat(CandidateServer.Get(), CandidatePort, ClientConnectedCallback, BindAddress))
+			{
 			Server = MoveTemp(CandidateServer);
 			bListening = true;
 			ListeningPort = static_cast<uint16>(CandidatePort);

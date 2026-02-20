@@ -1545,6 +1545,28 @@ namespace
 		return WidgetClass;
 	}
 
+	FString GetPanelSlotTypeName(UPanelWidget* PanelWidget)
+	{
+		if (PanelWidget == nullptr)
+		{
+			return FString();
+		}
+
+		const int32 ChildCount = PanelWidget->GetChildrenCount();
+		for (int32 ChildIndex = 0; ChildIndex < ChildCount; ++ChildIndex)
+		{
+			if (UWidget* ChildWidget = PanelWidget->GetChildAt(ChildIndex))
+			{
+				if (ChildWidget->Slot != nullptr)
+				{
+					return ChildWidget->Slot->GetClass()->GetName();
+				}
+			}
+		}
+
+		return UPanelSlot::StaticClass()->GetName();
+	}
+
 	FName BuildUniqueWidgetName(UWidgetBlueprint* WidgetBlueprint, UClass* WidgetClass, const FString& RequestedName)
 	{
 		if (WidgetBlueprint == nullptr || WidgetBlueprint->WidgetTree == nullptr)
@@ -6625,15 +6647,12 @@ bool UMCPToolRegistrySubsystem::HandleUMGWidgetAdd(const FMCPRequestEnvelope& Re
 				return false;
 			}
 
-			if (UPanelWidget* ParentPanel = Cast<UPanelWidget>(ParentWidget))
-			{
-				if (UClass* SlotClass = ParentPanel->GetSlotClass())
+				if (UPanelWidget* ParentPanel = Cast<UPanelWidget>(ParentWidget))
 				{
-					SlotType = SlotClass->GetName();
+					SlotType = GetPanelSlotTypeName(ParentPanel);
 				}
 			}
 		}
-	}
 
 	TSharedRef<FJsonObject> CompileObject = MakeShared<FJsonObject>();
 	if (bCompileOnSuccess && !Request.Context.bDryRun)
@@ -6946,17 +6965,14 @@ bool UMCPToolRegistrySubsystem::HandleUMGWidgetReparent(const FMCPRequestEnvelop
 	else
 	{
 		CollectChangedPropertiesFromPatchOperations(SlotPatchOperations, ChangedSlotProperties);
-		if (!bSetAsRoot && NewParentWidget != nullptr)
-		{
-			if (UPanelWidget* PanelWidget = Cast<UPanelWidget>(NewParentWidget))
+			if (!bSetAsRoot && NewParentWidget != nullptr)
 			{
-				if (UClass* SlotClass = PanelWidget->GetSlotClass())
+				if (UPanelWidget* PanelWidget = Cast<UPanelWidget>(NewParentWidget))
 				{
-					SlotType = SlotClass->GetName();
+					SlotType = GetPanelSlotTypeName(PanelWidget);
 				}
 			}
 		}
-	}
 
 	TSharedRef<FJsonObject> CompileObject = MakeShared<FJsonObject>();
 	if (bCompileOnSuccess && !Request.Context.bDryRun)
