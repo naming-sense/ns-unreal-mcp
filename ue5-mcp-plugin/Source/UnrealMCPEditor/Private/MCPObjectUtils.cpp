@@ -21,7 +21,7 @@ namespace
 		return Token;
 	}
 
-	UWorld* GetEditorWorld()
+	UWorld* GetEditorWorldForObjectUtils()
 	{
 		if (GEditor == nullptr)
 		{
@@ -499,7 +499,7 @@ namespace
 			{
 				TargetIdObject->TryGetStringField(TEXT("actor_guid"), ActorGuid);
 			}
-			OutObject = ResolveActorByPath(GetEditorWorld(), TargetPath, ActorGuid);
+			OutObject = ResolveActorByPath(GetEditorWorldForObjectUtils(), TargetPath, ActorGuid);
 			return OutObject != nullptr;
 		}
 
@@ -518,7 +518,7 @@ namespace
 				TargetIdObject->TryGetStringField(TEXT("actor_guid"), ActorGuid);
 			}
 
-			AActor* OwnerActor = ResolveActorByPath(GetEditorWorld(), ActorPath, ActorGuid);
+			AActor* OwnerActor = ResolveActorByPath(GetEditorWorldForObjectUtils(), ActorPath, ActorGuid);
 			if (OwnerActor == nullptr)
 			{
 				return false;

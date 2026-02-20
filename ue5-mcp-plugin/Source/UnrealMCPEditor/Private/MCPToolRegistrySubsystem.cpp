@@ -1426,17 +1426,32 @@ namespace
 		(*WidgetRefObject)->TryGetStringField(TEXT("widget_id"), WidgetId);
 		(*WidgetRefObject)->TryGetStringField(TEXT("name"), WidgetName);
 
-		const FString RequestedId = !WidgetId.IsEmpty() ? WidgetId : WidgetName;
-		if (RequestedId.IsEmpty())
+		TArray<FString> CandidateNames;
+		if (!WidgetName.IsEmpty())
+		{
+			CandidateNames.AddUnique(WidgetName);
+		}
+
+		if (!WidgetId.IsEmpty())
+		{
+			if (WidgetId.StartsWith(TEXT("name:")))
+			{
+				CandidateNames.AddUnique(WidgetId.RightChop(5));
+			}
+			else
+			{
+				FGuid ParsedGuid;
+				if (!FGuid::Parse(WidgetId, ParsedGuid))
+				{
+					CandidateNames.AddUnique(WidgetId);
+				}
+			}
+		}
+
+		if (CandidateNames.Num() == 0)
 		{
 			return nullptr;
 		}
-
-		const bool bNameQualifiedId = RequestedId.StartsWith(TEXT("name:"));
-		const FString RequestedName = bNameQualifiedId ? RequestedId.RightChop(5) : RequestedId;
-
-		FGuid RequestedGuid;
-		const bool bHasRequestedGuid = !bNameQualifiedId && FGuid::Parse(RequestedId, RequestedGuid);
 
 		TArray<UWidget*> AllWidgets;
 		WidgetBlueprint->WidgetTree->GetAllWidgets(AllWidgets);
@@ -1447,21 +1462,13 @@ namespace
 				continue;
 			}
 
-			if (Widget->GetName().Equals(RequestedName, ESearchCase::IgnoreCase))
+			for (const FString& CandidateName : CandidateNames)
 			{
-				return Widget;
-			}
-
-#if WITH_EDITORONLY_DATA
-			if (bHasRequestedGuid)
-			{
-				const FGuid* WidgetGuid = WidgetBlueprint->WidgetVariableNameToGuidMap.Find(Widget->GetFName());
-				if (WidgetGuid != nullptr && *WidgetGuid == RequestedGuid)
+				if (Widget->GetName().Equals(CandidateName, ESearchCase::IgnoreCase))
 				{
 					return Widget;
 				}
 			}
-#endif
 		}
 
 		return nullptr;
@@ -1474,116 +1481,18 @@ namespace
 			return TEXT("");
 		}
 
-#if WITH_EDITORONLY_DATA
-		if (const FGuid* ExistingGuid = WidgetBlueprint->WidgetVariableNameToGuidMap.Find(Widget->GetFName()))
-		{
-			return ExistingGuid->ToString(EGuidFormats::DigitsWithHyphens);
-		}
-#endif
 		return FString::Printf(TEXT("name:%s"), *Widget->GetName());
 	}
 
 	void EnsureWidgetGuidMap(UWidgetBlueprint* WidgetBlueprint)
 	{
-#if WITH_EDITORONLY_DATA
-		if (WidgetBlueprint == nullptr || WidgetBlueprint->WidgetTree == nullptr)
-		{
-			return;
-		}
-
-		const bool bGenerateDeterministicGuid = WidgetBlueprint->WidgetVariableNameToGuidMap.IsEmpty();
-		TSet<FName> ExistingVariableNames;
-		bool bMapChanged = false;
-		WidgetBlueprint->ForEachSourceWidget([&](UWidget* Widget)
-		{
-			if (Widget == nullptr)
-			{
-				return;
-			}
-
-			const FName VariableName = Widget->GetFName();
-			ExistingVariableNames.Add(VariableName);
-			if (!WidgetBlueprint->WidgetVariableNameToGuidMap.Contains(VariableName))
-			{
-				const FGuid NewGuid = bGenerateDeterministicGuid
-					? FGuid::NewDeterministicGuid(Widget->GetPathName())
-					: FGuid::NewGuid();
-				WidgetBlueprint->WidgetVariableNameToGuidMap.Add(VariableName, NewGuid);
-				bMapChanged = true;
-			}
-		});
-
-		for (UWidgetAnimation* Animation : WidgetBlueprint->Animations)
-		{
-			if (Animation == nullptr)
-			{
-				continue;
-			}
-
-			const FName VariableName = Animation->GetFName();
-			ExistingVariableNames.Add(VariableName);
-			if (!WidgetBlueprint->WidgetVariableNameToGuidMap.Contains(VariableName))
-			{
-				const FGuid NewGuid = bGenerateDeterministicGuid
-					? FGuid::NewDeterministicGuid(Animation->GetPathName())
-					: FGuid::NewGuid();
-				WidgetBlueprint->WidgetVariableNameToGuidMap.Add(VariableName, NewGuid);
-				bMapChanged = true;
-			}
-		}
-
-		TArray<FName> NamesToRemove;
-		for (const TPair<FName, FGuid>& Entry : WidgetBlueprint->WidgetVariableNameToGuidMap)
-		{
-			if (!ExistingVariableNames.Contains(Entry.Key))
-			{
-				NamesToRemove.Add(Entry.Key);
-			}
-		}
-
-		if (NamesToRemove.Num() > 0)
-		{
-			for (const FName NameToRemove : NamesToRemove)
-			{
-				WidgetBlueprint->WidgetVariableNameToGuidMap.Remove(NameToRemove);
-			}
-			bMapChanged = true;
-		}
-
-		if (bMapChanged)
-		{
-			WidgetBlueprint->Modify();
-			WidgetBlueprint->MarkPackageDirty();
-		}
-#else
 		(void)WidgetBlueprint;
-#endif
 	}
 
 	void EnsureWidgetGuidEntry(UWidgetBlueprint* WidgetBlueprint, UWidget* Widget)
 	{
-#if WITH_EDITORONLY_DATA
-		if (WidgetBlueprint == nullptr || Widget == nullptr)
-		{
-			return;
-		}
-
-		const FName VariableName = Widget->GetFName();
-		if (WidgetBlueprint->WidgetVariableNameToGuidMap.Contains(VariableName))
-		{
-			return;
-		}
-
-		const FGuid NewGuid = WidgetBlueprint->WidgetVariableNameToGuidMap.IsEmpty()
-			? FGuid::NewDeterministicGuid(Widget->GetPathName())
-			: FGuid::NewGuid();
-		WidgetBlueprint->WidgetVariableNameToGuidMap.Add(VariableName, NewGuid);
-		WidgetBlueprint->Modify();
-		WidgetBlueprint->MarkPackageDirty();
-#else
 		(void)WidgetBlueprint;
 		(void)Widget;
-#endif
 	}
 
 	void CollectChangedPropertiesFromPatchOperations(

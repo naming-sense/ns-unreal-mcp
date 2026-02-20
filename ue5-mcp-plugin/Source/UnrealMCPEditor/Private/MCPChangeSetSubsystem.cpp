@@ -16,7 +16,7 @@ namespace
 		return FDateTime::UtcNow().ToIso8601();
 	}
 
-	TArray<TSharedPtr<FJsonValue>> ToJsonStringArray(const TArray<FString>& Values)
+	TArray<TSharedPtr<FJsonValue>> ToJsonStringArrayForChangeSet(const TArray<FString>& Values)
 	{
 		TArray<TSharedPtr<FJsonValue>> OutValues;
 		OutValues.Reserve(Values.Num());
@@ -61,7 +61,7 @@ bool UMCPChangeSetSubsystem::CreateChangeSetRecord(
 	MetaObject->SetStringField(TEXT("policy_version"), PolicyVersion);
 	MetaObject->SetStringField(TEXT("schema_hash"), SchemaHash);
 	MetaObject->SetStringField(TEXT("engine_version"), Request.Context.EngineVersion);
-	MetaObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(Result.TouchedPackages));
+	MetaObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArrayForChangeSet(Result.TouchedPackages));
 
 	TArray<TSharedPtr<FJsonValue>> Targets;
 	const TSharedPtr<FJsonObject>* TargetObject = nullptr;
