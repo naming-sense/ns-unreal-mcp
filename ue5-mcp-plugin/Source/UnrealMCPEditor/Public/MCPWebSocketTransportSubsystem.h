@@ -44,7 +44,8 @@ private:
 
 	bool SendToConnection(uint16 ConnectionId, const FString& MessageJson);
 	void BroadcastToClients(const FString& MessageJson);
-	void WriteConnectionInfoFile() const;
+	void WriteConnectionInfoFile();
+	void CleanupConnectionInfoFiles();
 	FString ResolveConnectHost() const;
 
 	FString BuildWelcomePayload(uint16 ConnectionId) const;
@@ -67,4 +68,9 @@ private:
 	uint16 ListeningPort = 0;
 	FString BindAddress = TEXT("127.0.0.1");
 	int32 MaxPortScan = 20;
+	int64 ConnectionInfoHeartbeatIntervalMs = 1000;
+	int64 InstanceRegistryStaleTtlMs = 30000;
+	FString InstanceId;
+	int64 InstanceStartedAtMs = 0;
+	int64 LastConnectionInfoWriteMs = 0;
 };

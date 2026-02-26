@@ -14,6 +14,9 @@ def test_load_default_config_without_file() -> None:
     assert config.ue.project_root == ""
     assert config.request.default_timeout_ms == 30_000
     assert config.catalog.include_schemas is True
+    assert config.catalog.required_tools == ()
+    assert config.catalog.pin_schema_hash == ""
+    assert config.catalog.fail_on_schema_change is False
     assert config.retry.transient_max_attempts == 2
     assert config.metrics.enabled is True
 
@@ -39,6 +42,11 @@ request:
 catalog:
   include_schemas: false
   refresh_interval_s: 15
+  required_tools:
+    - system.health
+    - asset.create
+  pin_schema_hash: hash-abc
+  fail_on_schema_change: true
 retry:
   transient_max_attempts: 3
   backoff_initial_s: 0.3
@@ -61,6 +69,9 @@ metrics:
     assert config.request.default_timeout_ms == 12_345
     assert config.catalog.include_schemas is False
     assert config.catalog.refresh_interval_s == 15
+    assert config.catalog.required_tools == ("system.health", "asset.create")
+    assert config.catalog.pin_schema_hash == "hash-abc"
+    assert config.catalog.fail_on_schema_change is True
     assert config.retry.transient_max_attempts == 3
     assert config.retry.backoff_initial_s == 0.3
     assert config.retry.backoff_max_s == 2
@@ -102,6 +113,20 @@ def test_invalid_retry_attempts_raise_config_error(tmp_path: Path) -> None:
         """
 retry:
   transient_max_attempts: 0
+""".strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError):
+        load_config(config_path)
+
+
+def test_invalid_required_tools_type_raises_config_error(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+catalog:
+  required_tools: system.health
 """.strip(),
         encoding="utf-8",
     )

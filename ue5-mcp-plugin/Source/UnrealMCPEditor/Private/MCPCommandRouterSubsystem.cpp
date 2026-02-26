@@ -43,17 +43,47 @@ namespace
 		return CandidatePath;
 	}
 
-	FString TryGetFirstStringFromArray(const TSharedPtr<FJsonObject>& Params, const FString& FieldName)
+	FString BuildObjectPathFromPackageAndAsset(const FString& PackagePath, const FString& AssetName)
+	{
+		if (PackagePath.IsEmpty() || AssetName.IsEmpty())
+		{
+			return FString();
+		}
+
+		FString NormalizedPackagePath = PackagePath;
+		while (NormalizedPackagePath.EndsWith(TEXT("/")))
+		{
+			NormalizedPackagePath.LeftChopInline(1, false);
+		}
+
+		if (NormalizedPackagePath.IsEmpty())
+		{
+			return FString();
+		}
+
+		return FString::Printf(TEXT("%s.%s"), *NormalizedPackagePath, *AssetName);
+	}
+
+	void AppendNormalizedLockKey(TArray<FString>& OutLockKeys, const FString& CandidatePath)
+	{
+		const FString Normalized = NormalizeLockKeyPath(CandidatePath);
+		if (!Normalized.IsEmpty())
+		{
+			OutLockKeys.AddUnique(Normalized);
+		}
+	}
+
+	void AppendStringArrayFieldValues(const TSharedPtr<FJsonObject>& Params, const FString& FieldName, TArray<FString>& OutValues)
 	{
 		if (!Params.IsValid())
 		{
-			return FString();
+			return;
 		}
 
 		const TArray<TSharedPtr<FJsonValue>>* Values = nullptr;
 		if (!Params->TryGetArrayField(FieldName, Values) || Values == nullptr)
 		{
-			return FString();
+			return;
 		}
 
 		for (const TSharedPtr<FJsonValue>& Value : *Values)
@@ -61,54 +91,104 @@ namespace
 			FString Item;
 			if (Value.IsValid() && Value->TryGetString(Item) && !Item.IsEmpty())
 			{
-				return Item;
+				OutValues.AddUnique(Item);
 			}
 		}
-
-		return FString();
 	}
 
-	FString TryResolveLockKey(const FMCPRequestEnvelope& Request)
+	TArray<FString> TryResolveLockKeys(const FMCPRequestEnvelope& Request)
 	{
+		TArray<FString> LockKeys;
 		if (!Request.Params.IsValid())
 		{
-			return FString::Printf(TEXT("tool:%s"), *Request.Tool);
+			LockKeys.Add(FString::Printf(TEXT("tool:%s"), *Request.Tool));
+			return LockKeys;
 		}
 
-		const TSharedPtr<FJsonObject>* TargetObjectPtr = nullptr;
-		if (Request.Params->TryGetObjectField(TEXT("target"), TargetObjectPtr) && TargetObjectPtr != nullptr && TargetObjectPtr->IsValid())
+		if (Request.Tool.Equals(TEXT("asset.create"), ESearchCase::CaseSensitive))
 		{
-			FString TargetPath;
-			if ((*TargetObjectPtr)->TryGetStringField(TEXT("path"), TargetPath) && !TargetPath.IsEmpty())
+			FString PackagePath;
+			FString AssetName;
+			Request.Params->TryGetStringField(TEXT("package_path"), PackagePath);
+			Request.Params->TryGetStringField(TEXT("asset_name"), AssetName);
+			AppendNormalizedLockKey(LockKeys, BuildObjectPathFromPackageAndAsset(PackagePath, AssetName));
+		}
+		else if (Request.Tool.Equals(TEXT("asset.duplicate"), ESearchCase::CaseSensitive))
+		{
+			FString SourceObjectPath;
+			FString DestPackagePath;
+			FString DestAssetName;
+			Request.Params->TryGetStringField(TEXT("source_object_path"), SourceObjectPath);
+			Request.Params->TryGetStringField(TEXT("dest_package_path"), DestPackagePath);
+			Request.Params->TryGetStringField(TEXT("dest_asset_name"), DestAssetName);
+			AppendNormalizedLockKey(LockKeys, SourceObjectPath);
+			AppendNormalizedLockKey(LockKeys, BuildObjectPathFromPackageAndAsset(DestPackagePath, DestAssetName));
+		}
+		else if (Request.Tool.Equals(TEXT("asset.rename"), ESearchCase::CaseSensitive))
+		{
+			FString SourceObjectPath;
+			FString DestPackagePath;
+			FString DestAssetName;
+			Request.Params->TryGetStringField(TEXT("object_path"), SourceObjectPath);
+			Request.Params->TryGetStringField(TEXT("new_package_path"), DestPackagePath);
+			Request.Params->TryGetStringField(TEXT("new_asset_name"), DestAssetName);
+			AppendNormalizedLockKey(LockKeys, SourceObjectPath);
+			AppendNormalizedLockKey(LockKeys, BuildObjectPathFromPackageAndAsset(DestPackagePath, DestAssetName));
+		}
+		else if (Request.Tool.Equals(TEXT("asset.delete"), ESearchCase::CaseSensitive))
+		{
+			TArray<FString> ObjectPaths;
+			AppendStringArrayFieldValues(Request.Params, TEXT("object_paths"), ObjectPaths);
+			for (const FString& ObjectPath : ObjectPaths)
 			{
-				return NormalizeLockKeyPath(TargetPath);
+				AppendNormalizedLockKey(LockKeys, ObjectPath);
 			}
 		}
 
-		static const TCHAR* CandidateFields[] = {
-			TEXT("object_path"),
-			TEXT("package_path"),
-			TEXT("dest_package_path"),
-			TEXT("new_package_path"),
-			TEXT("source_object_path")
-		};
-
-		for (const TCHAR* CandidateField : CandidateFields)
+		if (LockKeys.Num() == 0)
 		{
-			FString CandidatePath;
-			if (Request.Params->TryGetStringField(CandidateField, CandidatePath) && !CandidatePath.IsEmpty())
+			const TSharedPtr<FJsonObject>* TargetObjectPtr = nullptr;
+			if (Request.Params->TryGetObjectField(TEXT("target"), TargetObjectPtr) && TargetObjectPtr != nullptr && TargetObjectPtr->IsValid())
 			{
-				return NormalizeLockKeyPath(CandidatePath);
+				FString TargetPath;
+				if ((*TargetObjectPtr)->TryGetStringField(TEXT("path"), TargetPath) && !TargetPath.IsEmpty())
+				{
+					AppendNormalizedLockKey(LockKeys, TargetPath);
+				}
+			}
+
+			static const TCHAR* CandidateFields[] = {
+				TEXT("object_path"),
+				TEXT("package_path"),
+				TEXT("dest_package_path"),
+				TEXT("new_package_path"),
+				TEXT("source_object_path")
+			};
+
+			for (const TCHAR* CandidateField : CandidateFields)
+			{
+				FString CandidatePath;
+				if (Request.Params->TryGetStringField(CandidateField, CandidatePath) && !CandidatePath.IsEmpty())
+				{
+					AppendNormalizedLockKey(LockKeys, CandidatePath);
+				}
+			}
+
+			TArray<FString> ArrayPathCandidates;
+			AppendStringArrayFieldValues(Request.Params, TEXT("object_paths"), ArrayPathCandidates);
+			for (const FString& ArrayPathCandidate : ArrayPathCandidates)
+			{
+				AppendNormalizedLockKey(LockKeys, ArrayPathCandidate);
 			}
 		}
 
-		const FString ArrayPathCandidate = TryGetFirstStringFromArray(Request.Params, TEXT("object_paths"));
-		if (!ArrayPathCandidate.IsEmpty())
+		if (LockKeys.Num() == 0)
 		{
-			return NormalizeLockKeyPath(ArrayPathCandidate);
+			LockKeys.Add(FString::Printf(TEXT("tool:%s"), *Request.Tool));
 		}
 
-		return FString::Printf(TEXT("tool:%s"), *Request.Tool);
+		LockKeys.Sort();
+		return LockKeys;
 	}
 
 	EMCPJobStatus ToJobStatus(const EMCPResponseStatus Status)
@@ -367,8 +447,8 @@ FString UMCPCommandRouterSubsystem::ExecuteRequestJson(const FString& RequestJso
 	FMCPToolExecutionResult ExecutionResult;
 	const bool bIsWriteTool = ToolRegistry->IsWriteTool(Request.Tool);
 	const FString LockOwner = Request.RequestId;
-	const FString LockKey = TryResolveLockKey(Request);
-	bool bLockAcquired = false;
+	const TArray<FString> LockKeys = TryResolveLockKeys(Request);
+	TArray<FString> AcquiredLockKeys;
 	const bool bTrackJob = Request.Context.bHasTimeoutOverride || Request.Context.bHasCancelToken;
 	FString TrackedJobId;
 	const int32 EffectiveTimeoutMs = Request.Context.bHasTimeoutOverride ? Request.Context.TimeoutMs : 0;
@@ -396,7 +476,7 @@ FString UMCPCommandRouterSubsystem::ExecuteRequestJson(const FString& RequestJso
 
 	ON_SCOPE_EXIT
 	{
-		if (bLockAcquired)
+		for (const FString& LockKey : AcquiredLockKeys)
 		{
 			LockSubsystem->ReleaseLock(LockKey, LockOwner);
 		}
@@ -427,19 +507,23 @@ FString UMCPCommandRouterSubsystem::ExecuteRequestJson(const FString& RequestJso
 			return ResponseJson;
 		}
 
-		FMCPDiagnostic LockDiagnostic;
-		if (!LockSubsystem->AcquireLock(LockKey, LockOwner, 30000, LockDiagnostic))
+		for (const FString& LockKey : LockKeys)
 		{
-			ExecutionResult.Status = EMCPResponseStatus::Error;
-			ExecutionResult.Diagnostics.Add(LockDiagnostic);
-			EmitDiagnosticLog(LockDiagnostic);
-			RecordToolMetric(EMCPResponseStatus::Error, false);
-			EmitProgress(100.0, TEXT("request.failed.lock"));
-			const FString ResponseJson = MCPJson::BuildResponseEnvelope(Request, ExecutionResult, TEXT(""), GetCurrentUnixTimestampMs() - StartMs);
-			CacheIdempotencyResponse(Request, ResponseJson);
-			return ResponseJson;
+			FMCPDiagnostic LockDiagnostic;
+			if (!LockSubsystem->AcquireLock(LockKey, LockOwner, 30000, LockDiagnostic))
+			{
+				ExecutionResult.Status = EMCPResponseStatus::Error;
+				ExecutionResult.Diagnostics.Add(LockDiagnostic);
+				EmitDiagnosticLog(LockDiagnostic);
+				RecordToolMetric(EMCPResponseStatus::Error, false);
+				EmitProgress(100.0, TEXT("request.failed.lock"));
+				const FString ResponseJson = MCPJson::BuildResponseEnvelope(Request, ExecutionResult, TEXT(""), GetCurrentUnixTimestampMs() - StartMs);
+				CacheIdempotencyResponse(Request, ResponseJson);
+				return ResponseJson;
+			}
+
+			AcquiredLockKeys.Add(LockKey);
 		}
-		bLockAcquired = true;
 		EmitProgress(45.0, TEXT("request.lock_acquired"));
 	}
 

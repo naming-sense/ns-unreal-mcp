@@ -223,6 +223,9 @@ bool FMCPToolsListAutomationTest::RunTest(const FString& Parameters)
 	bool bFoundSettingsGameModeRemoveMapOverride = false;
 	bool bFoundMatParamsGet = false;
 	bool bFoundNiagaraStackList = false;
+	bool bFoundUMGBlueprintCreate = false;
+	bool bFoundUMGBlueprintPatch = false;
+	bool bFoundUMGBlueprintReparent = false;
 	bool bFoundUMGTreeGet = false;
 	bool bFoundUMGWidgetClassList = false;
 	bool bFoundUMGWidgetAdd = false;
@@ -259,6 +262,9 @@ bool FMCPToolsListAutomationTest::RunTest(const FString& Parameters)
 			bFoundSettingsGameModeRemoveMapOverride |= Name == TEXT("settings.gamemode.remove_map_override");
 			bFoundMatParamsGet |= Name == TEXT("mat.instance.params.get");
 			bFoundNiagaraStackList |= Name == TEXT("niagara.stack.list");
+			bFoundUMGBlueprintCreate |= Name == TEXT("umg.blueprint.create");
+			bFoundUMGBlueprintPatch |= Name == TEXT("umg.blueprint.patch");
+			bFoundUMGBlueprintReparent |= Name == TEXT("umg.blueprint.reparent");
 			bFoundUMGWidgetClassList |= Name == TEXT("umg.widget.class.list");
 			bFoundUMGTreeGet |= Name == TEXT("umg.tree.get");
 			bFoundUMGWidgetAdd |= Name == TEXT("umg.widget.add");
@@ -288,6 +294,9 @@ bool FMCPToolsListAutomationTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("tools.list contains settings.gamemode.remove_map_override"), bFoundSettingsGameModeRemoveMapOverride);
 	TestTrue(TEXT("tools.list contains mat.instance.params.get"), bFoundMatParamsGet);
 	TestTrue(TEXT("tools.list contains niagara.stack.list"), bFoundNiagaraStackList);
+	TestTrue(TEXT("tools.list contains umg.blueprint.create"), bFoundUMGBlueprintCreate);
+	TestTrue(TEXT("tools.list contains umg.blueprint.patch"), bFoundUMGBlueprintPatch);
+	TestTrue(TEXT("tools.list contains umg.blueprint.reparent"), bFoundUMGBlueprintReparent);
 	TestTrue(TEXT("tools.list contains umg.widget.class.list"), bFoundUMGWidgetClassList);
 	TestTrue(TEXT("tools.list contains umg.tree.get"), bFoundUMGTreeGet);
 	TestTrue(TEXT("tools.list contains umg.widget.add"), bFoundUMGWidgetAdd);

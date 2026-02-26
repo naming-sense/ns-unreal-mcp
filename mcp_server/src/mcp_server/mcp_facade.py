@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
+import socket
+import uuid
 from typing import Any
 
 from mcp_server.models.ue_messages import UeResponse
@@ -21,9 +24,22 @@ class ToolCallResult:
     raw_envelope: dict[str, Any]
 
 
+def _build_runtime_session_id() -> str:
+    host = socket.gethostname().replace("|", "-")
+    process_id = os.getpid()
+    suffix = uuid.uuid4().hex[:8]
+    return f"mcp-server:{host}:{process_id}:{suffix}"
+
+
 class MCPFacade:
-    def __init__(self, transport: UeWsTransport) -> None:
+    def __init__(
+        self,
+        transport: UeWsTransport,
+        *,
+        session_id: str | None = None,
+    ) -> None:
         self._transport = transport
+        self._session_id = session_id or _build_runtime_session_id()
 
     async def call_tool(
         self,
@@ -33,6 +49,7 @@ class MCPFacade:
         context: dict[str, Any] | None = None,
         timeout_ms: int | None = None,
         request_id: str | None = None,
+        session_id: str | None = None,
         raise_on_error: bool = True,
     ) -> ToolCallResult:
         response: UeResponse = await self._transport.request(
@@ -41,6 +58,7 @@ class MCPFacade:
             context=context,
             timeout_ms=timeout_ms,
             request_id=request_id,
+            session_id=session_id or self._session_id,
         )
         envelope = response.envelope
         status = str(envelope.get("status", "error"))

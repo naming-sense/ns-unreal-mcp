@@ -27,6 +27,12 @@
   - `python examples/agent_tool_client.py --config configs/config.yaml --list-tools`
 - 매터리얼 파라미터 조회:
   - `python examples/agent_tool_client.py --config configs/config.yaml --tool mat.instance.params.get --params-json '{"object_path":"/Game/Materials/MI_Test.MI_Test"}'`
+- 위젯 블루프린트 생성:
+  - `python examples/agent_tool_client.py --config configs/config.yaml --tool umg.blueprint.create --params-json '{"package_path":"/Game/MCPRuntimeE2E","asset_name":"WBP_MCP_Auto","parent_class_path":"/Script/UMG.UserWidget","compile_on_success":true,"save":{"auto_save":true}}'`
+- 위젯 블루프린트 디자이너 크기/모드 패치:
+  - `python examples/agent_tool_client.py --config configs/config.yaml --tool umg.blueprint.patch --params-json '{"object_path":"/Game/MCPRuntimeE2E/WBP_MCP_Auto.WBP_MCP_Auto","design_time_size":{"x":1280,"y":720},"design_size_mode":"Custom","compile_on_success":true}'`
+- 위젯 블루프린트 부모 클래스 변경:
+  - `python examples/agent_tool_client.py --config configs/config.yaml --tool umg.blueprint.reparent --params-json '{"object_path":"/Game/MCPRuntimeE2E/WBP_MCP_Auto.WBP_MCP_Auto","new_parent_class_path":"/Script/UMG.UserWidget","compile_on_success":true}'`
 - 이벤트 스트리밍 포함 호출:
   - `python examples/agent_tool_client.py --config configs/config.yaml --tool system.health --stream-events`
 
@@ -49,6 +55,13 @@
   - `UE_MCP_WS_URL` > `UE_MCP_CONNECTION_FILE` > `ue.connection_file`
   - `UE_MCP_PROJECT_ROOT`/`ue.project_root` 하위 `Saved/UnrealMCP/connection.json`
   - 마지막 fallback은 `ue.ws_url`
+- 다중 UE 실행 시 endpoint selector 권장:
+  - 환경변수: `UE_MCP_INSTANCE_ID`, `UE_MCP_PROJECT_DIR`, `UE_MCP_PROCESS_ID`
+  - stdio 인자: `--ue-instance-id`, `--ue-project-dir`, `--ue-process-id`
+  - selector 없이 후보가 2개 이상이면 서버가 startup 실패로 종료하므로, 멀티 인스턴스 환경에서는 selector를 반드시 지정한다.
+  - 후보/selector 힌트 조회:
+    - `python -m mcp_server.mcp_stdio --config configs/config.yaml --once-endpoints`
+    - 출력의 `candidates[].selector_hint.env` 또는 `candidates[].selector_hint.args`를 그대로 복사해 등록/실행에 사용한다.
 
 ## 4. 출력 형식 요약
 - 일반 호출: 단일 JSON 출력
@@ -61,6 +74,10 @@
   - `server.json_logs: true`
 - 재시도:
   - `retry.transient_max_attempts`, `retry.backoff_initial_s`, `retry.backoff_max_s`
+- 카탈로그 가드:
+  - `catalog.required_tools`: startup 시 필수 툴 누락 시 즉시 실패
+  - `catalog.pin_schema_hash`: 기대 schema hash 고정 검증
+  - `catalog.fail_on_schema_change`: 런타임 schema 변경 감지 시 refresh 실패 처리
 - 메트릭:
   - `metrics.enabled: true`
   - `metrics.log_interval_s: 30`

@@ -7,6 +7,7 @@ import json
 import logging
 import signal
 from pathlib import Path
+from typing import Mapping
 
 from mcp_server.config import AppConfig, ConfigError, load_config
 from mcp_server.event_router import EventRouter
@@ -16,9 +17,15 @@ from mcp_server.mcp_facade import MCPFacade
 from mcp_server.metrics import RuntimeMetrics
 from mcp_server.request_broker import RequestBroker
 from mcp_server.tool_catalog import ToolCatalog
-from mcp_server.tool_passthrough import MCPPassThroughService, UnknownToolError
+from mcp_server.tool_passthrough import CatalogGuardError, MCPPassThroughService, UnknownToolError
 from mcp_server.ue_transport import UeWsTransport
-from mcp_server.ws_endpoint import resolve_ws_endpoint
+from mcp_server.ws_endpoint import (
+    WsEndpointCandidate,
+    WsEndpointSelectionError,
+    WsEndpointSelector,
+    list_ws_endpoint_candidates,
+    resolve_ws_endpoint,
+)
 
 LOGGER = logging.getLogger("mcp_server.app")
 
@@ -28,14 +35,28 @@ async def run(
     *,
     once_health: bool = False,
     once_tools: bool = False,
+    once_endpoints: bool = False,
     call_tool: str | None = None,
     call_tool_params: dict[str, object] | None = None,
     call_tool_context: dict[str, object] | None = None,
     call_tool_timeout_ms: int | None = None,
     stream_events: bool = False,
     print_metrics: bool = False,
+    endpoint_selector: WsEndpointSelector | None = None,
 ) -> int:
-    endpoint_resolution = resolve_ws_endpoint(config)
+    if once_endpoints:
+        payload = _build_endpoint_listing_payload(
+            config=config,
+            endpoint_selector=endpoint_selector,
+        )
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+
+    try:
+        endpoint_resolution = resolve_ws_endpoint(config, selector=endpoint_selector)
+    except WsEndpointSelectionError as exc:
+        LOGGER.error("UE endpoint selection failed: %s", exc)
+        return 2
     config = replace(config, ue=replace(config.ue, ws_url=endpoint_resolution.ws_url))
 
     LOGGER.info("Server bootstrap complete.")
@@ -43,6 +64,14 @@ async def run(
     LOGGER.info("UE WS endpoint source: %s", endpoint_resolution.source)
     if endpoint_resolution.connection_file:
         LOGGER.info("UE connection file: %s", endpoint_resolution.connection_file)
+    if endpoint_resolution.instance_id:
+        LOGGER.info(
+            "UE endpoint instance: instance_id=%s project_dir=%s process_id=%s project_name=%s",
+            endpoint_resolution.instance_id,
+            endpoint_resolution.project_dir or "-",
+            endpoint_resolution.process_id if endpoint_resolution.process_id is not None else "-",
+            endpoint_resolution.project_name or "-",
+        )
     LOGGER.info("Default request timeout: %dms", config.request.default_timeout_ms)
 
     metrics = RuntimeMetrics() if config.metrics.enabled else None
@@ -73,6 +102,9 @@ async def run(
         transient_max_attempts=config.retry.transient_max_attempts,
         retry_backoff_initial_s=config.retry.backoff_initial_s,
         retry_backoff_max_s=config.retry.backoff_max_s,
+        required_tools=config.catalog.required_tools,
+        pin_schema_hash=config.catalog.pin_schema_hash,
+        fail_on_schema_change=config.catalog.fail_on_schema_change,
         metrics=metrics,
     )
 
@@ -103,7 +135,19 @@ async def run(
                 name="metrics-log-loop",
             )
 
-        await pass_through.start()
+        try:
+            await pass_through.start()
+        except CatalogGuardError as exc:
+            LOGGER.error("Catalog guard failed: %s", exc)
+            _print_error_payload(
+                _build_error_payload(
+                    code="MCP.SERVER.CATALOG_GUARD_FAILED",
+                    message=str(exc),
+                    retriable=False,
+                ),
+                stream_events=stream_events,
+            )
+            return 7
 
         if once_health:
             health_snapshot = await health_monitor.check_once()
@@ -260,6 +304,11 @@ def parse_args() -> argparse.Namespace:
         help="Connect to UE, refresh tools catalog, print it, then exit",
     )
     parser.add_argument(
+        "--once-endpoints",
+        action="store_true",
+        help="List discovered UE endpoint candidates and exit",
+    )
+    parser.add_argument(
         "--call-tool",
         type=str,
         default=None,
@@ -293,6 +342,24 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print runtime metrics snapshot at the end of one-shot mode",
     )
+    parser.add_argument(
+        "--ue-instance-id",
+        type=str,
+        default=None,
+        help="Prefer UE endpoint with matching instance_id",
+    )
+    parser.add_argument(
+        "--ue-project-dir",
+        type=str,
+        default=None,
+        help="Prefer UE endpoint with matching project_dir",
+    )
+    parser.add_argument(
+        "--ue-process-id",
+        type=int,
+        default=None,
+        help="Prefer UE endpoint with matching process_id",
+    )
     return parser.parse_args()
 
 
@@ -316,11 +383,15 @@ def main() -> int:
         [
             1 if args.once_health else 0,
             1 if args.once_tools else 0,
+            1 if args.once_endpoints else 0,
             1 if args.call_tool else 0,
         ]
     )
     if mode_count > 1:
-        print("Argument error: choose only one mode among --once-health, --once-tools, --call-tool.")
+        print(
+            "Argument error: choose only one mode among "
+            "--once-health, --once-tools, --once-endpoints, --call-tool."
+        )
         return 2
     if args.stream_events and not args.call_tool:
         print("Argument error: --stream-events requires --call-tool.")
@@ -344,18 +415,27 @@ def main() -> int:
 
     configure_logging(config.server.log_level, json_logs=config.server.json_logs)
 
+    selector = WsEndpointSelector(
+        instance_id=(args.ue_instance_id.strip() if isinstance(args.ue_instance_id, str) and args.ue_instance_id.strip() else None),
+        project_dir=(args.ue_project_dir.strip() if isinstance(args.ue_project_dir, str) and args.ue_project_dir.strip() else None),
+        process_id=(args.ue_process_id if isinstance(args.ue_process_id, int) and args.ue_process_id > 0 else None),
+    )
+    endpoint_selector = selector if selector.has_any() else None
+
     try:
         return asyncio.run(
             run(
                 config,
                 once_health=args.once_health,
                 once_tools=args.once_tools,
+                once_endpoints=args.once_endpoints,
                 call_tool=args.call_tool,
                 call_tool_params=params_json,
                 call_tool_context=context_json,
                 call_tool_timeout_ms=args.timeout_ms,
                 stream_events=args.stream_events,
                 print_metrics=args.print_metrics,
+                endpoint_selector=endpoint_selector,
             )
         )
     except KeyboardInterrupt:
@@ -372,6 +452,95 @@ def _build_error_payload(
         "code": code,
         "message": message,
         "retriable": retriable,
+    }
+
+
+def _build_endpoint_listing_payload(
+    *,
+    config: AppConfig,
+    endpoint_selector: WsEndpointSelector | None,
+    env: Mapping[str, str] | None = None,
+    cwd: Path | None = None,
+) -> dict[str, object]:
+    candidates = list_ws_endpoint_candidates(
+        config,
+        selector=endpoint_selector,
+        env=env,
+        cwd=cwd,
+    )
+    payload: dict[str, object] = {
+        "selector": _selector_to_payload(endpoint_selector),
+        "candidate_count": len(candidates),
+        "candidates": [_candidate_to_payload(candidate) for candidate in candidates],
+    }
+
+    try:
+        resolution = resolve_ws_endpoint(
+            config,
+            selector=endpoint_selector,
+            env=env,
+            cwd=cwd,
+        )
+        payload["resolved"] = {
+            "ws_url": resolution.ws_url,
+            "source": resolution.source,
+            "instance_id": resolution.instance_id,
+            "project_dir": resolution.project_dir,
+            "process_id": resolution.process_id,
+            "project_name": resolution.project_name,
+            "connection_file": resolution.connection_file,
+        }
+    except WsEndpointSelectionError as exc:
+        payload["resolution_error"] = str(exc)
+    return payload
+
+
+def _selector_to_payload(selector: WsEndpointSelector | None) -> dict[str, object]:
+    if selector is None:
+        return {
+            "instance_id": None,
+            "project_dir": None,
+            "process_id": None,
+        }
+    return {
+        "instance_id": selector.instance_id,
+        "project_dir": selector.project_dir,
+        "process_id": selector.process_id,
+    }
+
+
+def _candidate_to_payload(candidate: WsEndpointCandidate) -> dict[str, object]:
+    return {
+        "ws_url": candidate.ws_url,
+        "source": candidate.source,
+        "instance_id": candidate.instance_id,
+        "project_dir": candidate.project_dir,
+        "process_id": candidate.process_id,
+        "project_name": candidate.project_name,
+        "connection_file": candidate.connection_file,
+        "descriptor_file": candidate.descriptor_file,
+        "heartbeat_at_ms": candidate.heartbeat_at_ms,
+        "updated_at_ms": candidate.updated_at_ms,
+        "stale": candidate.stale,
+        "selector_hint": _candidate_selector_hint(candidate),
+    }
+
+
+def _candidate_selector_hint(candidate: WsEndpointCandidate) -> dict[str, object]:
+    env: dict[str, object] = {}
+    args: list[str] = []
+    if candidate.instance_id:
+        env["UE_MCP_INSTANCE_ID"] = candidate.instance_id
+        args.extend(["--ue-instance-id", candidate.instance_id])
+    if candidate.project_dir:
+        env["UE_MCP_PROJECT_DIR"] = candidate.project_dir
+        args.extend(["--ue-project-dir", candidate.project_dir])
+    if candidate.process_id is not None:
+        env["UE_MCP_PROCESS_ID"] = candidate.process_id
+        args.extend(["--ue-process-id", str(candidate.process_id)])
+    return {
+        "env": env,
+        "args": args,
     }
 
 

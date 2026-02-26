@@ -1310,6 +1310,272 @@
       "additionalProperties": false
     }
   },
+  "umg.blueprint.create": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "package_path": {
+          "type": "string"
+        },
+        "asset_name": {
+          "type": "string"
+        },
+        "parent_class_path": {
+          "type": "string",
+          "default": "/Script/UMG.UserWidget"
+        },
+        "overwrite": {
+          "type": "boolean",
+          "default": false
+        },
+        "compile_on_success": {
+          "type": "boolean",
+          "default": true
+        },
+        "transaction": {
+          "type": "object",
+          "properties": {
+            "label": {
+              "type": "string",
+              "default": "MCP UMG Blueprint Create"
+            }
+          }
+        },
+        "save": {
+          "type": "object",
+          "properties": {
+            "auto_save": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        }
+      },
+      "required": [
+        "package_path",
+        "asset_name"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "created": {
+          "type": "boolean"
+        },
+        "reused": {
+          "type": "boolean"
+        },
+        "object_path": {
+          "type": "string"
+        },
+        "generated_class_path": {
+          "type": "string"
+        },
+        "parent_class_path": {
+          "type": "string"
+        },
+        "package": {
+          "type": "string"
+        },
+        "touched_packages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "created",
+        "reused",
+        "object_path",
+        "generated_class_path",
+        "parent_class_path",
+        "package",
+        "touched_packages"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "umg.blueprint.patch": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "object_path": {
+          "type": "string"
+        },
+        "design_time_size": {
+          "type": "object",
+          "properties": {
+            "x": {
+              "type": "number"
+            },
+            "y": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "x",
+            "y"
+          ],
+          "additionalProperties": false
+        },
+        "design_size_mode": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "compile_on_success": {
+          "type": "boolean",
+          "default": true
+        },
+        "transaction": {
+          "type": "object",
+          "properties": {
+            "label": {
+              "type": "string",
+              "default": "MCP UMG Blueprint Patch"
+            }
+          }
+        },
+        "save": {
+          "type": "object",
+          "properties": {
+            "auto_save": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        }
+      },
+      "required": [
+        "object_path"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "changed_properties": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "compile": {
+          "type": "object"
+        },
+        "touched_packages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "changed_properties",
+        "touched_packages"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "umg.blueprint.reparent": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "object_path": {
+          "type": "string"
+        },
+        "new_parent_class_path": {
+          "type": "string"
+        },
+        "compile_on_success": {
+          "type": "boolean",
+          "default": true
+        },
+        "transaction": {
+          "type": "object",
+          "properties": {
+            "label": {
+              "type": "string",
+              "default": "MCP UMG Blueprint Reparent"
+            }
+          }
+        },
+        "save": {
+          "type": "object",
+          "properties": {
+            "auto_save": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        }
+      },
+      "required": [
+        "object_path",
+        "new_parent_class_path"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "reparented": {
+          "type": "boolean"
+        },
+        "dry_run": {
+          "type": "boolean"
+        },
+        "no_op": {
+          "type": "boolean"
+        },
+        "old_parent_class_path": {
+          "type": "string"
+        },
+        "new_parent_class_path": {
+          "type": "string"
+        },
+        "generated_class_path": {
+          "type": "string"
+        },
+        "changed_properties": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "compile": {
+          "type": "object"
+        },
+        "touched_packages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "reparented",
+        "dry_run",
+        "no_op",
+        "old_parent_class_path",
+        "new_parent_class_path",
+        "generated_class_path",
+        "changed_properties",
+        "touched_packages"
+      ],
+      "additionalProperties": false
+    }
+  },
   "umg.widget.class.list": {
     "params_schema": {
       "type": "object",

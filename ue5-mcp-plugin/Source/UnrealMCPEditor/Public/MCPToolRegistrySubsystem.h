@@ -65,6 +65,9 @@ private:
 	bool HandleAssetImport(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
 	bool HandleAssetCreate(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
 	bool HandleBlueprintClassCreate(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleUMGBlueprintCreate(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleUMGBlueprintPatch(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleUMGBlueprintReparent(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
 	bool HandleAssetDuplicate(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
 	bool HandleAssetRename(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
 	bool HandleAssetDelete(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;

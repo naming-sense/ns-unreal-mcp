@@ -18,9 +18,24 @@
     - `UE_MCP_CONNECTION_FILE` 또는 `UE_MCP_PROJECT_ROOT`를 설정해 endpoint 자동탐지 사용
     - 필요 시 `~/.codex/config.toml`의 `startup_timeout_sec`를 30 이상으로 설정
 
+- 증상: `UE endpoint selection failed` / `Multiple UE endpoints matched` 에러
+  - 원인: 동시에 실행 중인 UE 인스턴스가 2개 이상인데 selector 없이 서버를 시작함
+  - 조치:
+    - `python -m mcp_server.mcp_stdio --config configs/config.yaml --once-endpoints`로 후보와 selector 힌트 확인
+    - 환경변수 또는 인자로 대상 인스턴스를 지정
+    - 예: `UE_MCP_INSTANCE_ID=<id>` 또는 `--ue-instance-id <id>`
+    - 대안: `UE_MCP_PROJECT_DIR`, `UE_MCP_PROCESS_ID`로도 선택 가능
+
 - 증상: `Unknown tool: ...`
   - 원인: 툴 카탈로그 동기화 이전 호출, 플러그인 쪽 미등록 도구
   - 조치: `--once-tools` 또는 `--list-tools` 실행 후 정확한 도구명 사용
+
+- 증상: `MCP.SERVER.CATALOG_GUARD_FAILED` 또는 `Catalog guard failed` 로그
+  - 원인: `catalog.required_tools` 누락, `catalog.pin_schema_hash` 불일치, 런타임 schema 변경(`fail_on_schema_change=true`)
+  - 조치:
+    - `python -m mcp_server --config configs/config.yaml --once-tools`로 실제 `tools[]/schema_hash` 확인
+    - 멀티 인스턴스 환경이면 `--once-endpoints`로 endpoint selector 재지정
+    - 설정 파일의 `catalog.required_tools`, `catalog.pin_schema_hash` 값을 현재 대상 UE 인스턴스 기준으로 맞춤
 
 - 증상: 요청이 `timeout`으로 실패
   - 원인: UE 작업 지연 또는 너무 짧은 timeout

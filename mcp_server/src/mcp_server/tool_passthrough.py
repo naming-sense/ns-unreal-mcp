@@ -25,6 +25,10 @@ class UnknownToolError(KeyError):
     """동기화된 툴 카탈로그에 존재하지 않는 툴."""
 
 
+class CatalogGuardError(RuntimeError):
+    """카탈로그 가드(required_tools/schema_hash) 위반."""
+
+
 EventCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
 
 
@@ -40,6 +44,9 @@ class MCPPassThroughService:
         transient_max_attempts: int = 2,
         retry_backoff_initial_s: float = 0.2,
         retry_backoff_max_s: float = 1.0,
+        required_tools: list[str] | tuple[str, ...] = (),
+        pin_schema_hash: str = "",
+        fail_on_schema_change: bool = False,
         metrics: "RuntimeMetrics | None" = None,
     ) -> None:
         self._facade = facade
@@ -50,6 +57,12 @@ class MCPPassThroughService:
         self._transient_max_attempts = max(transient_max_attempts, 1)
         self._retry_backoff_initial_s = retry_backoff_initial_s
         self._retry_backoff_max_s = retry_backoff_max_s
+        self._required_tools = tuple(
+            tool.strip() for tool in required_tools if isinstance(tool, str) and tool.strip()
+        )
+        self._pin_schema_hash = pin_schema_hash.strip().upper()
+        self._fail_on_schema_change = fail_on_schema_change
+        self._baseline_schema_hash: str | None = None
         self._metrics = metrics
 
         self._refresh_lock = asyncio.Lock()
@@ -97,6 +110,7 @@ class MCPPassThroughService:
                         self._facade,
                         include_schemas=self._include_schemas,
                     )
+                    self._validate_catalog_guard()
                     self._last_refresh_ms = int(time.time() * 1000)
                     LOGGER.info(
                         "Tool catalog refreshed. tools=%d protocol=%s schema_hash=%s",
@@ -296,6 +310,10 @@ class MCPPassThroughService:
 
             try:
                 await self.refresh_catalog()
+            except CatalogGuardError:
+                LOGGER.exception("Tool catalog guard failed.")
+                if self._fail_on_schema_change:
+                    return
             except Exception:
                 LOGGER.exception("Tool catalog refresh failed.")
 
@@ -338,3 +356,37 @@ class MCPPassThroughService:
                 if code or message:
                     return f"{code}: {message}"
         return "retryable tool error"
+
+    def _validate_catalog_guard(self) -> None:
+        if self._required_tools:
+            available_tool_names = {tool.name for tool in self._catalog.tools}
+            missing_tools = [tool for tool in self._required_tools if tool not in available_tool_names]
+            if missing_tools:
+                raise CatalogGuardError(
+                    "Missing required tools after catalog refresh: "
+                    + ", ".join(missing_tools)
+                )
+
+        schema_hash = self._catalog.schema_hash.strip().upper()
+        if self._pin_schema_hash:
+            if schema_hash != self._pin_schema_hash:
+                raise CatalogGuardError(
+                    "schema_hash mismatch: "
+                    f"expected={self._pin_schema_hash} actual={schema_hash or '-'}"
+                )
+
+        if not self._fail_on_schema_change:
+            return
+
+        if not schema_hash:
+            return
+
+        if self._baseline_schema_hash is None:
+            self._baseline_schema_hash = schema_hash
+            return
+
+        if schema_hash != self._baseline_schema_hash:
+            raise CatalogGuardError(
+                "schema_hash changed during runtime: "
+                f"baseline={self._baseline_schema_hash} current={schema_hash}"
+            )

@@ -9,7 +9,7 @@ from mcp_server.event_router import EventRouter
 from mcp_server.mcp_facade import ToolCallResult
 from mcp_server.request_broker import RequestTimeoutError
 from mcp_server.tool_catalog import ToolCatalog
-from mcp_server.tool_passthrough import MCPPassThroughService, UnknownToolError
+from mcp_server.tool_passthrough import CatalogGuardError, MCPPassThroughService, UnknownToolError
 
 
 class FakeFacade:
@@ -20,6 +20,18 @@ class FakeFacade:
         self._event_router = event_router
         self._pending_failures: list[Exception] = []
         self._pending_results: list[ToolCallResult] = []
+        self.tools_list_schema_hash = "hash-001"
+        self.tools_list_tools = [
+            {
+                "name": "system.health",
+                "domain": "system",
+                "version": "1.0.0",
+                "enabled": True,
+                "write": False,
+                "params_schema": {"type": "object"},
+                "result_schema": {"type": "object"},
+            }
+        ]
 
     def queue_failure(self, exc: Exception) -> None:
         self._pending_failures.append(exc)
@@ -54,18 +66,8 @@ class FakeFacade:
                 request_id="req-tools-list",
                 result={
                     "protocol_version": "unreal-mcp/1.0",
-                    "schema_hash": "hash-001",
-                    "tools": [
-                        {
-                            "name": "system.health",
-                            "domain": "system",
-                            "version": "1.0.0",
-                            "enabled": True,
-                            "write": False,
-                            "params_schema": {"type": "object"},
-                            "result_schema": {"type": "object"},
-                        }
-                    ],
+                    "schema_hash": self.tools_list_schema_hash,
+                    "tools": self.tools_list_tools,
                 },
                 diagnostics={},
                 raw_envelope={},
@@ -267,3 +269,52 @@ async def test_call_tool_retries_retryable_tool_result() -> None:
     assert result.status == "ok"
     tool_calls = [call for call in facade.calls if call["tool"] == "system.health"]
     assert len(tool_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_catalog_guard_required_tools_missing() -> None:
+    facade = FakeFacade()
+    service = MCPPassThroughService(
+        facade=facade,  # type: ignore[arg-type]
+        catalog=ToolCatalog(),
+        include_schemas=True,
+        refresh_interval_s=0,
+        required_tools=("asset.create",),
+    )
+
+    with pytest.raises(CatalogGuardError):
+        await service.start()
+
+
+@pytest.mark.asyncio
+async def test_catalog_guard_pin_schema_hash_mismatch() -> None:
+    facade = FakeFacade()
+    service = MCPPassThroughService(
+        facade=facade,  # type: ignore[arg-type]
+        catalog=ToolCatalog(),
+        include_schemas=True,
+        refresh_interval_s=0,
+        pin_schema_hash="HASH-XYZ",
+    )
+
+    with pytest.raises(CatalogGuardError):
+        await service.start()
+
+
+@pytest.mark.asyncio
+async def test_catalog_guard_fail_on_schema_change() -> None:
+    facade = FakeFacade()
+    service = MCPPassThroughService(
+        facade=facade,  # type: ignore[arg-type]
+        catalog=ToolCatalog(),
+        include_schemas=True,
+        refresh_interval_s=0,
+        fail_on_schema_change=True,
+    )
+    await service.start()
+    try:
+        facade.tools_list_schema_hash = "hash-002"
+        with pytest.raises(CatalogGuardError):
+            await service.refresh_catalog()
+    finally:
+        await service.stop()

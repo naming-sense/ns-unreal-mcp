@@ -43,6 +43,9 @@ class ServerConfig:
 class CatalogConfig:
     include_schemas: bool = True
     refresh_interval_s: float = 60.0
+    required_tools: tuple[str, ...] = ()
+    pin_schema_hash: str = ""
+    fail_on_schema_change: bool = False
 
 
 @dataclass(frozen=True)
@@ -126,6 +129,16 @@ def load_config(path: str | Path | None) -> AppConfig:
             refresh_interval_s=float(
                 catalog_data.get("refresh_interval_s", CatalogConfig.refresh_interval_s)
             ),
+            required_tools=_parse_required_tools(catalog_data.get("required_tools")),
+            pin_schema_hash=str(
+                catalog_data.get("pin_schema_hash", CatalogConfig.pin_schema_hash)
+            ).strip(),
+            fail_on_schema_change=bool(
+                catalog_data.get(
+                    "fail_on_schema_change",
+                    CatalogConfig.fail_on_schema_change,
+                )
+            ),
         ),
         retry=RetryConfig(
             transient_max_attempts=int(
@@ -183,6 +196,9 @@ def _validate_config(config: AppConfig) -> None:
         raise ConfigError("request.default_timeout_ms must be > 0")
     if config.catalog.refresh_interval_s < 0:
         raise ConfigError("catalog.refresh_interval_s must be >= 0")
+    for required_tool in config.catalog.required_tools:
+        if not required_tool.strip():
+            raise ConfigError("catalog.required_tools must not contain empty tool names")
     if config.retry.transient_max_attempts <= 0:
         raise ConfigError("retry.transient_max_attempts must be > 0")
     if config.retry.backoff_initial_s <= 0:
@@ -193,3 +209,24 @@ def _validate_config(config: AppConfig) -> None:
         raise ConfigError("retry.backoff_max_s must be >= backoff_initial_s")
     if config.metrics.log_interval_s < 0:
         raise ConfigError("metrics.log_interval_s must be >= 0")
+
+
+def _parse_required_tools(raw_value: Any) -> tuple[str, ...]:
+    if raw_value is None:
+        return CatalogConfig.required_tools
+    if not isinstance(raw_value, list):
+        raise ConfigError("'catalog.required_tools' must be an array of strings.")
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in raw_value:
+        if not isinstance(item, str):
+            raise ConfigError("'catalog.required_tools' must be an array of strings.")
+        stripped = item.strip()
+        if not stripped:
+            continue
+        if stripped in seen:
+            continue
+        seen.add(stripped)
+        normalized.append(stripped)
+    return tuple(normalized)

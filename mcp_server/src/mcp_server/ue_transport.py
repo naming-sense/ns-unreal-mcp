@@ -100,6 +100,7 @@ class UeWsTransport:
         context: dict[str, Any] | None = None,
         timeout_ms: int | None = None,
         request_id: str | None = None,
+        session_id: str | None = None,
     ) -> UeResponse:
         await self.wait_until_connected(timeout_s=self._connect_timeout_s)
         return await self._request_broker.send_request(
@@ -109,6 +110,7 @@ class UeWsTransport:
             context=context,
             timeout_ms=timeout_ms,
             request_id=request_id,
+            session_id=session_id or "default-session",
         )
 
     async def send_json(self, message: dict[str, Any]) -> None:

@@ -22,6 +22,7 @@
    - `<Project>/Saved/UnrealMCP/connection.json`
 
 > `connection.json`을 서버가 읽기 때문에, 사용자별 IP를 직접 입력할 필요가 없습니다.
+> 다중 UE 인스턴스를 동시에 쓰면 `Saved/UnrealMCP/instances/*.json`도 함께 생성됩니다.
 
 ---
 
@@ -87,6 +88,67 @@ codex mcp get ue-mcp --json
 ```toml
 [mcp_servers.ue-mcp]
 startup_timeout_sec = 60
+```
+
+## 5-1) (선택) 다중 UE 인스턴스 selector
+동시에 UE를 2개 이상 띄우는 경우, 등록 시 selector를 같이 넘기면 오연결을 줄일 수 있습니다.
+
+먼저 후보 목록/추천 selector를 확인합니다.
+- `python -m mcp_server.mcp_stdio --config configs/config.yaml --once-endpoints`
+- 출력 JSON의 `candidates[].selector_hint.env` 값을 그대로 사용하면 됩니다.
+
+### Windows
+```powershell
+$env:UE_MCP_INSTANCE_ID = "<instance_id>"
+codex mcp add ue-mcp -- D:\path\to\ue5-mcp-plugin\mcp_server\scripts\run_mcp_server.cmd
+```
+
+### WSL/Linux
+```bash
+UE_MCP_INSTANCE_ID="<instance_id>" codex mcp add ue-mcp -- /path/to/ue5-mcp-plugin/mcp_server/scripts/run_mcp_server.sh
+```
+
+## 5-2) VSCode Copilot MCP 등록 예시
+`settings.json`의 `mcp.servers`에 stdio 명령을 등록합니다.
+
+### Windows
+```json
+{
+  "mcp.servers": {
+    "ue-mcp": {
+      "type": "stdio",
+      "command": "D:/path/to/ue5-mcp-plugin/mcp_server/scripts/run_mcp_server.cmd",
+      "env": {
+        "UE_MCP_INSTANCE_ID": "<instance_id>"
+      }
+    }
+  }
+}
+```
+
+## 5-3) (선택) 카탈로그 가드 설정
+`configs/config.yaml`의 `catalog`에 아래 항목을 설정하면 잘못된 UE 인스턴스 연결을 조기에 차단할 수 있습니다.
+
+```yaml
+catalog:
+  required_tools: ["system.health", "asset.create"]
+  pin_schema_hash: ""
+  fail_on_schema_change: false
+```
+
+### WSL/Linux
+```json
+{
+  "mcp.servers": {
+    "ue-mcp": {
+      "type": "stdio",
+      "command": "/path/to/ue5-mcp-plugin/mcp_server/scripts/run_mcp_server.sh",
+      "env": {
+        "UE_MCP_INSTANCE_ID": "<instance_id>"
+      }
+    }
+  }
+}
 ```
 
 ---

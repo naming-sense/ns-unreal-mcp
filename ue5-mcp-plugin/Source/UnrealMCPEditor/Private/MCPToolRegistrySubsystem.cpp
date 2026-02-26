@@ -36,6 +36,8 @@
 #include "ObjectTools.h"
 #include "WidgetBlueprint.h"
 #include "Engine/Blueprint.h"
+#include "Blueprint/UserWidget.h"
+#include "Blueprint/WidgetBlueprintGeneratedClass.h"
 #include "Blueprint/WidgetTree.h"
 #include "Components/PanelWidget.h"
 #include "Components/PanelSlot.h"
@@ -1077,6 +1079,8 @@ namespace
 		FString PackagePath;
 		FString AssetName;
 		UClass* ParentClass = nullptr;
+		UClass* BlueprintAssetClass = UBlueprint::StaticClass();
+		UClass* BlueprintGeneratedClass = UBlueprintGeneratedClass::StaticClass();
 		bool bOverwrite = false;
 		bool bDryRun = false;
 		bool bCompileOnSuccess = true;
@@ -1110,6 +1114,20 @@ namespace
 			return false;
 		}
 
+		if (Options.BlueprintAssetClass == nullptr || !Options.BlueprintAssetClass->IsChildOf(UBlueprint::StaticClass()))
+		{
+			OutDiagnostic.Code = MCPErrorCodes::ASSET_CREATE_FAILED;
+			OutDiagnostic.Message = TEXT("Blueprint asset class is invalid.");
+			return false;
+		}
+
+		if (Options.BlueprintGeneratedClass == nullptr || !Options.BlueprintGeneratedClass->IsChildOf(UBlueprintGeneratedClass::StaticClass()))
+		{
+			OutDiagnostic.Code = MCPErrorCodes::ASSET_CREATE_FAILED;
+			OutDiagnostic.Message = TEXT("Blueprint generated class is invalid.");
+			return false;
+		}
+
 		if (!IsValidAssetDestination(Options.PackagePath, Options.AssetName))
 		{
 			OutDiagnostic.Code = MCPErrorCodes::ASSET_PATH_INVALID;
@@ -1131,6 +1149,19 @@ namespace
 		}
 
 		UBlueprint* BlueprintAsset = Cast<UBlueprint>(ExistingObject);
+		if (BlueprintAsset != nullptr && !BlueprintAsset->IsA(Options.BlueprintAssetClass))
+		{
+			OutDiagnostic.Code = MCPErrorCodes::ASSET_CREATE_FAILED;
+			OutDiagnostic.Message = TEXT("Existing Blueprint type is incompatible with requested Blueprint asset class.");
+			OutDiagnostic.Detail = FString::Printf(
+				TEXT("object_path=%s existing_type=%s requested_type=%s"),
+				*ObjectPath,
+				*BlueprintAsset->GetClass()->GetPathName(),
+				*Options.BlueprintAssetClass->GetPathName());
+			OutDiagnostic.Suggestion = TEXT("Set overwrite=true or choose another destination.");
+			return false;
+		}
+
 		bool bCreatedNew = false;
 		if (BlueprintAsset != nullptr && !Options.bOverwrite)
 		{
@@ -1185,8 +1216,8 @@ namespace
 					Package,
 					FName(*Options.AssetName),
 					EBlueprintType::BPTYPE_Normal,
-					UBlueprint::StaticClass(),
-					UBlueprintGeneratedClass::StaticClass(),
+					Options.BlueprintAssetClass,
+					Options.BlueprintGeneratedClass,
 					FName(TEXT("UnrealMCP")));
 
 				if (BlueprintAsset == nullptr)
@@ -2294,6 +2325,39 @@ void UMCPToolRegistrySubsystem::RegisterBuiltInTools()
 		nullptr,
 		nullptr,
 		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleNiagaraStackModuleSetParam(Request, OutResult); }
+	});
+
+	RegisterTool({
+		TEXT("umg.blueprint.create"),
+		TEXT("umg"),
+		TEXT("1.0.0"),
+		true,
+		true,
+		nullptr,
+		nullptr,
+		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleUMGBlueprintCreate(Request, OutResult); }
+	});
+
+	RegisterTool({
+		TEXT("umg.blueprint.patch"),
+		TEXT("umg"),
+		TEXT("1.0.0"),
+		true,
+		true,
+		nullptr,
+		nullptr,
+		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleUMGBlueprintPatch(Request, OutResult); }
+	});
+
+	RegisterTool({
+		TEXT("umg.blueprint.reparent"),
+		TEXT("umg"),
+		TEXT("1.0.0"),
+		true,
+		true,
+		nullptr,
+		nullptr,
+		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleUMGBlueprintReparent(Request, OutResult); }
 	});
 
 	RegisterTool({
@@ -3530,6 +3594,427 @@ bool UMCPToolRegistrySubsystem::HandleBlueprintClassCreate(const FMCPRequestEnve
 	OutResult.ResultObject->SetStringField(TEXT("package"), CreateResult.PackageName);
 	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(OutResult.TouchedPackages));
 	OutResult.Status = CreateResult.bSaved ? EMCPResponseStatus::Ok : EMCPResponseStatus::Partial;
+	return true;
+}
+
+bool UMCPToolRegistrySubsystem::HandleUMGBlueprintCreate(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
+{
+	FString PackagePath;
+	FString AssetName;
+	FString ParentClassPath = TEXT("/Script/UMG.UserWidget");
+	bool bOverwrite = false;
+	bool bCompileOnSuccess = true;
+	bool bAutoSave = false;
+
+	if (Request.Params.IsValid())
+	{
+		Request.Params->TryGetStringField(TEXT("package_path"), PackagePath);
+		Request.Params->TryGetStringField(TEXT("asset_name"), AssetName);
+		Request.Params->TryGetStringField(TEXT("parent_class_path"), ParentClassPath);
+		Request.Params->TryGetBoolField(TEXT("overwrite"), bOverwrite);
+		Request.Params->TryGetBoolField(TEXT("compile_on_success"), bCompileOnSuccess);
+		ParseAutoSaveOption(Request.Params, bAutoSave);
+	}
+
+	AssetName = ObjectTools::SanitizeObjectName(AssetName);
+	if (PackagePath.IsEmpty() || AssetName.IsEmpty())
+	{
+		FMCPDiagnostic Diagnostic;
+		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+		Diagnostic.Message = TEXT("package_path and asset_name are required for umg.blueprint.create.");
+		OutResult.Diagnostics.Add(Diagnostic);
+		OutResult.Status = EMCPResponseStatus::Error;
+		return false;
+	}
+
+	if (!IsValidAssetDestination(PackagePath, AssetName))
+	{
+		FMCPDiagnostic Diagnostic;
+		Diagnostic.Code = MCPErrorCodes::ASSET_PATH_INVALID;
+		Diagnostic.Message = TEXT("Invalid package_path or asset_name for umg.blueprint.create.");
+		Diagnostic.Detail = FString::Printf(TEXT("package_path=%s asset_name=%s"), *PackagePath, *AssetName);
+		OutResult.Diagnostics.Add(Diagnostic);
+		OutResult.Status = EMCPResponseStatus::Error;
+		return false;
+	}
+
+	UClass* ParentClass = ResolveClassByPath(ParentClassPath);
+	if (ParentClass == nullptr || !ParentClass->IsChildOf(UUserWidget::StaticClass()))
+	{
+		FMCPDiagnostic Diagnostic;
+		Diagnostic.Code = MCPErrorCodes::ASSET_CREATE_FAILED;
+		Diagnostic.Message = TEXT("parent_class_path must resolve to a UUserWidget-derived class.");
+		Diagnostic.Detail = ParentClassPath;
+		Diagnostic.Suggestion = TEXT("Use /Script/UMG.UserWidget or a Blueprintable UUserWidget subclass.");
+		OutResult.Diagnostics.Add(Diagnostic);
+		OutResult.Status = EMCPResponseStatus::Error;
+		return false;
+	}
+
+	if (!FKismetEditorUtilities::CanCreateBlueprintOfClass(ParentClass))
+	{
+		FMCPDiagnostic Diagnostic;
+		Diagnostic.Code = MCPErrorCodes::ASSET_CREATE_FAILED;
+		Diagnostic.Message = TEXT("Widget Blueprint cannot be created from the requested parent class.");
+		Diagnostic.Detail = ParentClass->GetPathName();
+		Diagnostic.Suggestion = TEXT("Use a Blueprintable UUserWidget parent class.");
+		OutResult.Diagnostics.Add(Diagnostic);
+		OutResult.Status = EMCPResponseStatus::Error;
+		return false;
+	}
+
+	FMCPBlueprintCreateOptions CreateOptions;
+	CreateOptions.PackagePath = PackagePath;
+	CreateOptions.AssetName = AssetName;
+	CreateOptions.ParentClass = ParentClass;
+	CreateOptions.BlueprintAssetClass = UWidgetBlueprint::StaticClass();
+	CreateOptions.BlueprintGeneratedClass = UWidgetBlueprintGeneratedClass::StaticClass();
+	CreateOptions.bOverwrite = bOverwrite;
+	CreateOptions.bDryRun = Request.Context.bDryRun;
+	CreateOptions.bCompileOnSuccess = bCompileOnSuccess;
+	CreateOptions.bAutoSave = bAutoSave;
+	CreateOptions.TransactionLabel = ParseTransactionLabel(Request.Params, TEXT("MCP UMG Blueprint Create"));
+
+	FMCPBlueprintCreateResult CreateResult;
+	FMCPDiagnostic CreateDiagnostic;
+	if (!EnsureBlueprintClassAsset(CreateOptions, OutResult, CreateResult, CreateDiagnostic))
+	{
+		OutResult.Diagnostics.Add(CreateDiagnostic);
+		OutResult.Status = EMCPResponseStatus::Error;
+		return false;
+	}
+
+	UClass* GeneratedClass = ResolveClassByPath(CreateResult.GeneratedClassPath);
+	const FString GeneratedClassPath = GeneratedClass != nullptr
+		? GeneratedClass->GetPathName()
+		: CreateResult.GeneratedClassPath;
+
+	OutResult.ResultObject = MakeShared<FJsonObject>();
+	OutResult.ResultObject->SetBoolField(TEXT("created"), CreateResult.bCreatedNew);
+	OutResult.ResultObject->SetBoolField(TEXT("reused"), !CreateResult.bCreatedNew);
+	OutResult.ResultObject->SetStringField(TEXT("object_path"), CreateResult.ObjectPath);
+	OutResult.ResultObject->SetStringField(TEXT("generated_class_path"), GeneratedClassPath);
+	OutResult.ResultObject->SetStringField(TEXT("parent_class_path"), CreateResult.ParentClassPath);
+	OutResult.ResultObject->SetStringField(TEXT("package"), CreateResult.PackageName);
+	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(OutResult.TouchedPackages));
+	OutResult.Status = CreateResult.bSaved ? EMCPResponseStatus::Ok : EMCPResponseStatus::Partial;
+	return true;
+}
+
+bool UMCPToolRegistrySubsystem::HandleUMGBlueprintPatch(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
+{
+	FString ObjectPath;
+	bool bCompileOnSuccess = true;
+	bool bAutoSave = false;
+
+	const TSharedPtr<FJsonObject>* DesignTimeSizeObject = nullptr;
+	const TSharedPtr<FJsonValue>* DesignSizeModeValue = nullptr;
+	bool bHasDesignTimeSize = false;
+	bool bHasDesignSizeMode = false;
+
+	if (Request.Params.IsValid())
+	{
+		Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
+		Request.Params->TryGetBoolField(TEXT("compile_on_success"), bCompileOnSuccess);
+		ParseAutoSaveOption(Request.Params, bAutoSave);
+
+		bHasDesignTimeSize = Request.Params->HasField(TEXT("design_time_size"));
+		if (bHasDesignTimeSize && !Request.Params->TryGetObjectField(TEXT("design_time_size"), DesignTimeSizeObject))
+		{
+			FMCPDiagnostic Diagnostic;
+			Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+			Diagnostic.Message = TEXT("design_time_size must be an object with x/y.");
+			OutResult.Diagnostics.Add(Diagnostic);
+			OutResult.Status = EMCPResponseStatus::Error;
+			return false;
+		}
+
+		bHasDesignSizeMode = Request.Params->HasField(TEXT("design_size_mode"));
+		if (bHasDesignSizeMode)
+		{
+			DesignSizeModeValue = Request.Params->Values.Find(TEXT("design_size_mode"));
+			if (DesignSizeModeValue == nullptr || !DesignSizeModeValue->IsValid())
+			{
+				FMCPDiagnostic Diagnostic;
+				Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+				Diagnostic.Message = TEXT("design_size_mode must be string/number/null.");
+				OutResult.Diagnostics.Add(Diagnostic);
+				OutResult.Status = EMCPResponseStatus::Error;
+				return false;
+			}
+		}
+	}
+
+	if (ObjectPath.IsEmpty())
+	{
+		FMCPDiagnostic Diagnostic;
+		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+		Diagnostic.Message = TEXT("object_path is required for umg.blueprint.patch.");
+		OutResult.Diagnostics.Add(Diagnostic);
+		OutResult.Status = EMCPResponseStatus::Error;
+		return false;
+	}
+
+	if (!bHasDesignTimeSize && !bHasDesignSizeMode)
+	{
+		FMCPDiagnostic Diagnostic;
+		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+		Diagnostic.Message = TEXT("At least one of design_time_size or design_size_mode is required.");
+		OutResult.Diagnostics.Add(Diagnostic);
+		OutResult.Status = EMCPResponseStatus::Error;
+		return false;
+	}
+
+	UWidgetBlueprint* WidgetBlueprint = LoadWidgetBlueprintByPath(ObjectPath);
+	if (WidgetBlueprint == nullptr)
+	{
+		FMCPDiagnostic Diagnostic;
+		Diagnostic.Code = MCPErrorCodes::OBJECT_NOT_FOUND;
+		Diagnostic.Message = TEXT("Widget blueprint not found.");
+		Diagnostic.Detail = ObjectPath;
+		OutResult.Diagnostics.Add(Diagnostic);
+		OutResult.Status = EMCPResponseStatus::Error;
+		return false;
+	}
+
+	TArray<TSharedPtr<FJsonValue>> PatchOperations;
+
+	if (bHasDesignTimeSize)
+	{
+		double X = 0.0;
+		double Y = 0.0;
+		const bool bHasX = DesignTimeSizeObject != nullptr && DesignTimeSizeObject->IsValid()
+			&& ((*DesignTimeSizeObject)->TryGetNumberField(TEXT("x"), X) || (*DesignTimeSizeObject)->TryGetNumberField(TEXT("X"), X));
+		const bool bHasY = DesignTimeSizeObject != nullptr && DesignTimeSizeObject->IsValid()
+			&& ((*DesignTimeSizeObject)->TryGetNumberField(TEXT("y"), Y) || (*DesignTimeSizeObject)->TryGetNumberField(TEXT("Y"), Y));
+		if (!bHasX || !bHasY)
+		{
+			FMCPDiagnostic Diagnostic;
+			Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+			Diagnostic.Message = TEXT("design_time_size requires both x and y numeric fields.");
+			OutResult.Diagnostics.Add(Diagnostic);
+			OutResult.Status = EMCPResponseStatus::Error;
+			return false;
+		}
+
+		TSharedRef<FJsonObject> ValueObject = MakeShared<FJsonObject>();
+		ValueObject->SetNumberField(TEXT("X"), X);
+		ValueObject->SetNumberField(TEXT("Y"), Y);
+
+		TSharedRef<FJsonObject> PatchObject = MakeShared<FJsonObject>();
+		PatchObject->SetStringField(TEXT("op"), TEXT("replace"));
+		PatchObject->SetStringField(TEXT("path"), TEXT("/DesignTimeSize"));
+		PatchObject->SetObjectField(TEXT("value"), ValueObject);
+		PatchOperations.Add(MakeShared<FJsonValueObject>(PatchObject));
+	}
+
+	if (bHasDesignSizeMode)
+	{
+		TSharedRef<FJsonObject> PatchObject = MakeShared<FJsonObject>();
+		if ((*DesignSizeModeValue)->Type == EJson::Null)
+		{
+			PatchObject->SetStringField(TEXT("op"), TEXT("remove"));
+		}
+		else
+		{
+			PatchObject->SetStringField(TEXT("op"), TEXT("replace"));
+			PatchObject->SetField(TEXT("value"), *DesignSizeModeValue);
+		}
+		PatchObject->SetStringField(TEXT("path"), TEXT("/DesignSizeMode"));
+		PatchOperations.Add(MakeShared<FJsonValueObject>(PatchObject));
+	}
+
+	TArray<FString> ChangedProperties;
+	FMCPDiagnostic PatchDiagnostic;
+
+	if (!Request.Context.bDryRun)
+	{
+		const FString TransactionLabel = ParseTransactionLabel(Request.Params, TEXT("MCP UMG Blueprint Patch"));
+		FScopedTransaction Transaction(FText::FromString(TransactionLabel));
+		WidgetBlueprint->Modify();
+
+		if (!MCPObjectUtils::ApplyPatch(WidgetBlueprint, &PatchOperations, ChangedProperties, PatchDiagnostic))
+		{
+			Transaction.Cancel();
+			OutResult.Diagnostics.Add(PatchDiagnostic);
+			OutResult.Status = EMCPResponseStatus::Error;
+			return false;
+		}
+
+		WidgetBlueprint->PostEditChange();
+		WidgetBlueprint->MarkPackageDirty();
+	}
+	else
+	{
+		CollectChangedPropertiesFromPatchOperations(&PatchOperations, ChangedProperties);
+	}
+
+	TSharedRef<FJsonObject> CompileObject = MakeShared<FJsonObject>();
+	if (bCompileOnSuccess && !Request.Context.bDryRun)
+	{
+		FKismetEditorUtilities::CompileBlueprint(WidgetBlueprint);
+		CompileObject->SetStringField(TEXT("status"), TEXT("requested"));
+	}
+	else
+	{
+		CompileObject->SetStringField(TEXT("status"), TEXT("skipped"));
+	}
+
+	MCPObjectUtils::AppendTouchedPackage(WidgetBlueprint, OutResult.TouchedPackages);
+	bool bAllSaved = true;
+	if (!Request.Context.bDryRun && bAutoSave)
+	{
+		for (const FString& PackageName : OutResult.TouchedPackages)
+		{
+			bAllSaved &= SavePackageByName(PackageName, OutResult);
+		}
+	}
+
+	OutResult.ResultObject = MakeShared<FJsonObject>();
+	OutResult.ResultObject->SetArrayField(TEXT("changed_properties"), ToJsonStringArray(ChangedProperties));
+	OutResult.ResultObject->SetObjectField(TEXT("compile"), CompileObject);
+	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(OutResult.TouchedPackages));
+	OutResult.Status = bAllSaved ? EMCPResponseStatus::Ok : EMCPResponseStatus::Partial;
+	return true;
+}
+
+bool UMCPToolRegistrySubsystem::HandleUMGBlueprintReparent(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
+{
+	FString ObjectPath;
+	FString NewParentClassPath;
+	bool bCompileOnSuccess = true;
+	bool bAutoSave = false;
+
+	if (Request.Params.IsValid())
+	{
+		Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
+		Request.Params->TryGetStringField(TEXT("new_parent_class_path"), NewParentClassPath);
+		Request.Params->TryGetBoolField(TEXT("compile_on_success"), bCompileOnSuccess);
+		ParseAutoSaveOption(Request.Params, bAutoSave);
+	}
+
+	if (ObjectPath.IsEmpty() || NewParentClassPath.IsEmpty())
+	{
+		FMCPDiagnostic Diagnostic;
+		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+		Diagnostic.Message = TEXT("object_path and new_parent_class_path are required for umg.blueprint.reparent.");
+		OutResult.Diagnostics.Add(Diagnostic);
+		OutResult.Status = EMCPResponseStatus::Error;
+		return false;
+	}
+
+	UWidgetBlueprint* WidgetBlueprint = LoadWidgetBlueprintByPath(ObjectPath);
+	if (WidgetBlueprint == nullptr)
+	{
+		FMCPDiagnostic Diagnostic;
+		Diagnostic.Code = MCPErrorCodes::OBJECT_NOT_FOUND;
+		Diagnostic.Message = TEXT("Widget blueprint not found.");
+		Diagnostic.Detail = ObjectPath;
+		OutResult.Diagnostics.Add(Diagnostic);
+		OutResult.Status = EMCPResponseStatus::Error;
+		return false;
+	}
+
+	UClass* NewParentClass = ResolveClassByPath(NewParentClassPath);
+	if (NewParentClass == nullptr || !NewParentClass->IsChildOf(UUserWidget::StaticClass()))
+	{
+		FMCPDiagnostic Diagnostic;
+		Diagnostic.Code = MCPErrorCodes::ASSET_CREATE_FAILED;
+		Diagnostic.Message = TEXT("new_parent_class_path must resolve to a UUserWidget-derived class.");
+		Diagnostic.Detail = NewParentClassPath;
+		Diagnostic.Suggestion = TEXT("Use /Script/UMG.UserWidget or a Blueprintable UUserWidget subclass.");
+		OutResult.Diagnostics.Add(Diagnostic);
+		OutResult.Status = EMCPResponseStatus::Error;
+		return false;
+	}
+
+	if (!FKismetEditorUtilities::CanCreateBlueprintOfClass(NewParentClass))
+	{
+		FMCPDiagnostic Diagnostic;
+		Diagnostic.Code = MCPErrorCodes::ASSET_CREATE_FAILED;
+		Diagnostic.Message = TEXT("Widget Blueprint cannot be reparented to the requested parent class.");
+		Diagnostic.Detail = NewParentClass->GetPathName();
+		Diagnostic.Suggestion = TEXT("Use a Blueprintable UUserWidget parent class.");
+		OutResult.Diagnostics.Add(Diagnostic);
+		OutResult.Status = EMCPResponseStatus::Error;
+		return false;
+	}
+
+	const FString OldParentClassPath = WidgetBlueprint->ParentClass
+		? WidgetBlueprint->ParentClass->GetPathName()
+		: FString();
+	const FString ResolvedParentClassPath = NewParentClass->GetPathName();
+	const bool bNoop = WidgetBlueprint->ParentClass == NewParentClass;
+
+	TArray<FString> ChangedProperties;
+	if (!bNoop)
+	{
+		ChangedProperties.Add(TEXT("ParentClass"));
+	}
+
+	if (!Request.Context.bDryRun && !bNoop)
+	{
+		const FString TransactionLabel = ParseTransactionLabel(Request.Params, TEXT("MCP UMG Blueprint Reparent"));
+		FScopedTransaction Transaction(FText::FromString(TransactionLabel));
+		WidgetBlueprint->Modify();
+
+		WidgetBlueprint->ParentClass = NewParentClass;
+		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WidgetBlueprint);
+		WidgetBlueprint->PostEditChange();
+		WidgetBlueprint->MarkPackageDirty();
+	}
+
+	TSharedRef<FJsonObject> CompileObject = MakeShared<FJsonObject>();
+	if (bCompileOnSuccess && !Request.Context.bDryRun && !bNoop)
+	{
+		FKismetEditorUtilities::CompileBlueprint(WidgetBlueprint);
+		CompileObject->SetStringField(TEXT("status"), TEXT("requested"));
+	}
+	else
+	{
+		CompileObject->SetStringField(TEXT("status"), TEXT("skipped"));
+	}
+
+	if (!Request.Context.bDryRun && !bNoop)
+	{
+		const bool bParentApplied = WidgetBlueprint->ParentClass == NewParentClass;
+		if (!bParentApplied)
+		{
+			FMCPDiagnostic Diagnostic;
+			Diagnostic.Code = MCPErrorCodes::INTERNAL_EXCEPTION;
+			Diagnostic.Message = TEXT("Widget Blueprint parent class was not applied.");
+			Diagnostic.Detail = FString::Printf(TEXT("expected=%s actual=%s"), *ResolvedParentClassPath, *(WidgetBlueprint->ParentClass ? WidgetBlueprint->ParentClass->GetPathName() : FString(TEXT("None"))));
+			OutResult.Diagnostics.Add(Diagnostic);
+			OutResult.Status = EMCPResponseStatus::Error;
+			return false;
+		}
+	}
+
+	MCPObjectUtils::AppendTouchedPackage(WidgetBlueprint, OutResult.TouchedPackages);
+	bool bAllSaved = true;
+	if (!Request.Context.bDryRun && bAutoSave)
+	{
+		for (const FString& PackageName : OutResult.TouchedPackages)
+		{
+			bAllSaved &= SavePackageByName(PackageName, OutResult);
+		}
+	}
+
+	const FString GeneratedClassPath = (WidgetBlueprint->GeneratedClass != nullptr)
+		? WidgetBlueprint->GeneratedClass->GetPathName()
+		: BuildGeneratedClassPathFromObjectPath(ObjectPath);
+
+	OutResult.ResultObject = MakeShared<FJsonObject>();
+	OutResult.ResultObject->SetBoolField(TEXT("reparented"), !Request.Context.bDryRun && !bNoop);
+	OutResult.ResultObject->SetBoolField(TEXT("dry_run"), Request.Context.bDryRun);
+	OutResult.ResultObject->SetBoolField(TEXT("no_op"), bNoop);
+	OutResult.ResultObject->SetStringField(TEXT("old_parent_class_path"), OldParentClassPath);
+	OutResult.ResultObject->SetStringField(TEXT("new_parent_class_path"), ResolvedParentClassPath);
+	OutResult.ResultObject->SetStringField(TEXT("generated_class_path"), GeneratedClassPath);
+	OutResult.ResultObject->SetArrayField(TEXT("changed_properties"), ToJsonStringArray(ChangedProperties));
+	OutResult.ResultObject->SetObjectField(TEXT("compile"), CompileObject);
+	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(OutResult.TouchedPackages));
+	OutResult.Status = bAllSaved ? EMCPResponseStatus::Ok : EMCPResponseStatus::Partial;
 	return true;
 }
 

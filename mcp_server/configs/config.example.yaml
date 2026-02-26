@@ -19,6 +19,12 @@ request:
 catalog:
   include_schemas: true
   refresh_interval_s: 60
+  # startup 시 반드시 노출되어야 하는 툴 이름 목록
+  required_tools: []
+  # 지정 시 tools.list의 schema_hash가 정확히 일치해야 startup 성공
+  pin_schema_hash: ""
+  # true면 런타임 중 schema_hash 변경 시 refresh 실패로 간주
+  fail_on_schema_change: false
 
 retry:
   transient_max_attempts: 2

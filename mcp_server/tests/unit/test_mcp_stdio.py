@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import io
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
 
+from mcp_server.config import AppConfig, UeConfig
 from mcp_server.mcp_facade import ToolCallResult
 from mcp_server.mcp_stdio import (
     JSONRPC_INVALID_PARAMS,
     JSONRPC_SERVER_NOT_INITIALIZED,
     MCPRequestDispatcher,
+    _build_endpoint_listing_payload,
     read_framed_message,
     read_stdio_message,
     write_jsonl_message,
@@ -258,3 +261,38 @@ async def test_tools_call_rejects_non_object_arguments() -> None:
     )
 
     assert response["error"]["code"] == JSONRPC_INVALID_PARAMS
+
+
+def test_build_endpoint_listing_payload_includes_selector_hint(tmp_path: Path) -> None:
+    project_root = tmp_path / "ProjectHints"
+    project_root.mkdir(parents=True, exist_ok=True)
+    (project_root / "ProjectHints.uproject").write_text("{}", encoding="utf-8")
+
+    instances_dir = project_root / "Saved" / "UnrealMCP" / "instances"
+    instances_dir.mkdir(parents=True, exist_ok=True)
+    (instances_dir / "instance-a.json").write_text(
+        json.dumps(
+            {
+                "instance_id": "instance-a",
+                "ws_url": "ws://127.0.0.1:19090",
+                "project_dir": str(project_root),
+                "process_id": 4321,
+                "heartbeat_at_ms": 9_999_999_999_999,
+                "updated_at_ms": 9_999_999_999_999,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = _build_endpoint_listing_payload(
+        AppConfig(ue=UeConfig(ws_url="ws://127.0.0.1:18080")),
+        endpoint_selector=None,
+        env={"UE_MCP_PROJECT_ROOT": str(project_root)},
+        cwd=tmp_path,
+    )
+
+    assert payload["candidate_count"] == 1
+    assert payload["resolved"]["ws_url"] == "ws://127.0.0.1:19090"
+    first_candidate = payload["candidates"][0]
+    assert first_candidate["selector_hint"]["env"]["UE_MCP_INSTANCE_ID"] == "instance-a"
+    assert first_candidate["selector_hint"]["env"]["UE_MCP_PROCESS_ID"] == 4321
