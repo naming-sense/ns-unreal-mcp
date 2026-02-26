@@ -91,25 +91,42 @@ UnrealMCP UE 5.7 플러그인과 AI Agent를 연결하는 MCP 서버 구현 디�
 - 트러블슈팅: `docs/TROUBLESHOOTING.md`
 - 릴리스 체크리스트: `docs/RELEASE_CHECKLIST.md`
 
-## Codex CLI MCP 등록(stdio)
-- 표준 MCP stdio 서버 실행:
-  - `bash scripts/run_mcp_server.sh`
-  - (Windows PowerShell) `powershell -ExecutionPolicy Bypass -File scripts/run_mcp_server.ps1`
-  - (Windows CMD) `scripts\\run_mcp_server.cmd`
-- Codex CLI에 서버 등록:
-  - `codex mcp add ue-mcp -- /mnt/d/codex-cli/ue5-mcp-plugin/mcp_server/scripts/run_mcp_server.sh`
-  - (Windows Codex) `codex mcp add ue-mcp -- D:\\path\\to\\ue5-mcp-plugin\\mcp_server\\scripts\\run_mcp_server.cmd`
-- 등록 확인:
-  - `codex mcp list`
-  - `codex mcp get ue-mcp --json`
-- 호환성 참고:
-  - `mcp_server.mcp_stdio`는 `Content-Length` framed JSON과 JSON line 입력을 모두 지원합니다.
-  - 일부 Codex 버전은 startup 단계에서 JSON line `initialize`를 전송하므로, 이 호환 모드가 필요합니다.
-- startup timeout 권장:
-  - UE 초기 연결/카탈로그 동기화 지연 시를 대비해 `~/.codex/config.toml`에 `startup_timeout_sec = 30` 이상 설정을 권장합니다.
-  - 예시:
-    - `[mcp_servers.ue-mcp]`
-    - `startup_timeout_sec = 30`
+## MCP 클라이언트 등록(stdio)
+- 서버 실행 엔트리:
+  - Linux/WSL: `bash scripts/run_mcp_server.sh`
+  - Windows PowerShell: `powershell -ExecutionPolicy Bypass -File scripts/run_mcp_server.ps1`
+  - Windows CMD: `scripts\\run_mcp_server.cmd`
+
+### Codex CLI
+- `codex mcp add ue-mcp -- /path/to/mcp_server/scripts/run_mcp_server.sh`
+- Windows: `codex mcp add ue-mcp -- D:\\path\\to\\mcp_server\\scripts\\run_mcp_server.cmd`
+- 확인: `codex mcp list`
+- timeout 권장:
+  - `~/.codex/config.toml`
+  - `[mcp_servers.ue-mcp]`
+  - `startup_timeout_sec = 30`
+
+### Claude Code
+- `claude mcp add-json ue-mcp '{"type":"stdio","command":"/path/to/mcp_server/scripts/run_mcp_server.sh"}' --scope user`
+- Windows:
+  - `claude mcp add-json ue-mcp "{\"type\":\"stdio\",\"command\":\"D:\\\\path\\\\to\\\\mcp_server\\\\scripts\\\\run_mcp_server.cmd\"}" --scope user`
+
+### Cursor
+- `.cursor/mcp.json`:
+  - `{"mcpServers":{"ue-mcp":{"command":"/path/to/mcp_server/scripts/run_mcp_server.sh"}}}`
+- Windows:
+  - `{"mcpServers":{"ue-mcp":{"command":"D:\\\\path\\\\to\\\\mcp_server\\\\scripts\\\\run_mcp_server.cmd"}}}`
+
+### GitHub Copilot (VS Code MCP)
+- `.vscode/mcp.json`:
+  - `{"servers":{"ue-mcp":{"command":"/path/to/mcp_server/scripts/run_mcp_server.sh"}}}`
+- Windows:
+  - `{"servers":{"ue-mcp":{"command":"D:\\\\path\\\\to\\\\mcp_server\\\\scripts\\\\run_mcp_server.cmd"}}}`
+- VS Code Command Palette의 `MCP: Add Server`로도 추가 가능
+
+### 호환성 참고
+- `mcp_server.mcp_stdio`는 `Content-Length` framed JSON과 JSON line 입력을 모두 지원합니다.
+- 일부 클라이언트는 startup에서 JSON line `initialize`를 전송하므로 호환 모드가 필요합니다.
 
 ## 테스트
 - `pytest`
