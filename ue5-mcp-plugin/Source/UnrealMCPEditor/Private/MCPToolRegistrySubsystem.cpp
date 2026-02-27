@@ -42,6 +42,7 @@
 #include "Components/PanelWidget.h"
 #include "Components/PanelSlot.h"
 #include "Components/ContentWidget.h"
+#include "Components/NamedSlotInterface.h"
 #include "Components/Widget.h"
 #include "Animation/WidgetAnimation.h"
 #include "Kismet2/BlueprintEditorUtils.h"
@@ -67,6 +68,8 @@
 #include "UObject/SoftObjectPath.h"
 #include "UObject/UObjectGlobals.h"
 #include "UObject/UObjectIterator.h"
+#include <type_traits>
+#include <utility>
 
 namespace
 {
@@ -1515,6 +1518,104 @@ namespace
 		return FString::Printf(TEXT("name:%s"), *Widget->GetName());
 	}
 
+	template <typename T, typename = void>
+	struct THasWidgetVariableGuidMap : std::false_type
+	{
+	};
+
+	template <typename T>
+	struct THasWidgetVariableGuidMap<T, std::void_t<decltype(std::declval<T>().WidgetVariableNameToGuidMap)>> : std::true_type
+	{
+	};
+
+	template <typename T, typename = void>
+	struct THasOnVariableAdded : std::false_type
+	{
+	};
+
+	template <typename T>
+	struct THasOnVariableAdded<T, std::void_t<decltype(std::declval<T*>()->OnVariableAdded(FName()))>> : std::true_type
+	{
+	};
+
+	template <typename T, typename = void>
+	struct THasOnVariableRemoved : std::false_type
+	{
+	};
+
+	template <typename T>
+	struct THasOnVariableRemoved<T, std::void_t<decltype(std::declval<T*>()->OnVariableRemoved(FName()))>> : std::true_type
+	{
+	};
+
+	template <typename T, typename = void>
+	struct THasGetInheritedAvailableNamedSlots : std::false_type
+	{
+	};
+
+	template <typename T>
+	struct THasGetInheritedAvailableNamedSlots<T, std::void_t<decltype(std::declval<const T*>()->GetInheritedAvailableNamedSlots())>> : std::true_type
+	{
+	};
+
+	void CollectWidgetSubtreeVariableNames(UWidget* Widget, TArray<FName>& OutVariableNames)
+	{
+		if (Widget == nullptr)
+		{
+			return;
+		}
+
+		OutVariableNames.AddUnique(Widget->GetFName());
+
+		if (UPanelWidget* PanelWidget = Cast<UPanelWidget>(Widget))
+		{
+			const int32 ChildCount = PanelWidget->GetChildrenCount();
+			for (int32 ChildIndex = 0; ChildIndex < ChildCount; ++ChildIndex)
+			{
+				CollectWidgetSubtreeVariableNames(PanelWidget->GetChildAt(ChildIndex), OutVariableNames);
+			}
+		}
+		else if (UContentWidget* ContentWidget = Cast<UContentWidget>(Widget))
+		{
+			CollectWidgetSubtreeVariableNames(ContentWidget->GetContent(), OutVariableNames);
+		}
+
+		if (INamedSlotInterface* NamedSlotHost = Cast<INamedSlotInterface>(Widget))
+		{
+			TArray<FName> SlotNames;
+			NamedSlotHost->GetSlotNames(SlotNames);
+			for (const FName& SlotName : SlotNames)
+			{
+				CollectWidgetSubtreeVariableNames(NamedSlotHost->GetContentForSlot(SlotName), OutVariableNames);
+			}
+		}
+	}
+
+	void RemoveWidgetGuidEntry(UWidgetBlueprint* WidgetBlueprint, const FName WidgetName)
+	{
+		if (WidgetBlueprint == nullptr || WidgetName.IsNone())
+		{
+			return;
+		}
+
+		if constexpr (THasWidgetVariableGuidMap<UWidgetBlueprint>::value)
+		{
+			if (!WidgetBlueprint->WidgetVariableNameToGuidMap.Contains(WidgetName))
+			{
+				return;
+			}
+		}
+
+		if constexpr (THasOnVariableRemoved<UWidgetBlueprint>::value)
+		{
+			WidgetBlueprint->OnVariableRemoved(WidgetName);
+		}
+		else if constexpr (THasWidgetVariableGuidMap<UWidgetBlueprint>::value)
+		{
+			WidgetBlueprint->WidgetVariableNameToGuidMap.Remove(WidgetName);
+		}
+	}
+
 	void EnsureWidgetGuidMap(UWidgetBlueprint* WidgetBlueprint)
 	{
 		(void)WidgetBlueprint;
@@ -1522,8 +1623,33 @@ namespace
 
 	void EnsureWidgetGuidEntry(UWidgetBlueprint* WidgetBlueprint, UWidget* Widget)
 	{
-		(void)WidgetBlueprint;
-		(void)Widget;
+		if (WidgetBlueprint == nullptr || Widget == nullptr)
+		{
+			return;
+		}
+
+		const FName WidgetName = Widget->GetFName();
+		if (WidgetName.IsNone())
+		{
+			return;
+		}
+
+		if constexpr (THasWidgetVariableGuidMap<UWidgetBlueprint>::value)
+		{
+			if (WidgetBlueprint->WidgetVariableNameToGuidMap.Contains(WidgetName))
+			{
+				return;
+			}
+		}
+
+		if constexpr (THasOnVariableAdded<UWidgetBlueprint>::value)
+		{
+			WidgetBlueprint->OnVariableAdded(WidgetName);
+		}
+		else if constexpr (THasWidgetVariableGuidMap<UWidgetBlueprint>::value)
+		{
+			WidgetBlueprint->WidgetVariableNameToGuidMap.Add(WidgetName, FGuid::NewGuid());
+		}
 	}
 
 	void CollectChangedPropertiesFromPatchOperations(
@@ -1632,11 +1758,309 @@ namespace
 
 	FString GetParentWidgetId(const UWidgetBlueprint* WidgetBlueprint, const UWidget* Widget)
 	{
-		if (WidgetBlueprint == nullptr || Widget == nullptr || Widget->Slot == nullptr || Widget->Slot->Parent == nullptr)
+		if (WidgetBlueprint == nullptr || Widget == nullptr)
 		{
 			return TEXT("");
 		}
-		return GetWidgetStableId(WidgetBlueprint, Widget->Slot->Parent);
+
+		if (Widget->Slot != nullptr && Widget->Slot->Parent != nullptr)
+		{
+			return GetWidgetStableId(WidgetBlueprint, Widget->Slot->Parent);
+		}
+
+		if (WidgetBlueprint->WidgetTree == nullptr)
+		{
+			return TEXT("");
+		}
+
+		TArray<UWidget*> AllWidgets;
+		WidgetBlueprint->WidgetTree->GetAllWidgets(AllWidgets);
+		for (UWidget* CandidateHost : AllWidgets)
+		{
+			if (CandidateHost == nullptr || CandidateHost == Widget)
+			{
+				continue;
+			}
+
+			INamedSlotInterface* NamedSlotHost = Cast<INamedSlotInterface>(CandidateHost);
+			if (NamedSlotHost == nullptr)
+			{
+				continue;
+			}
+
+			TArray<FName> SlotNames;
+			NamedSlotHost->GetSlotNames(SlotNames);
+			for (const FName SlotName : SlotNames)
+			{
+				if (SlotName.IsNone())
+				{
+					continue;
+				}
+
+				if (NamedSlotHost->GetContentForSlot(SlotName) == Widget)
+				{
+					return GetWidgetStableId(WidgetBlueprint, CandidateHost);
+				}
+			}
+		}
+
+		TArray<FName> TreeSlotNames;
+		WidgetBlueprint->WidgetTree->GetSlotNames(TreeSlotNames);
+		for (const FName SlotName : TreeSlotNames)
+		{
+			if (SlotName.IsNone())
+			{
+				continue;
+			}
+
+			if (WidgetBlueprint->WidgetTree->GetContentForSlot(SlotName) == Widget)
+			{
+				return TEXT("this");
+			}
+		}
+
+		return TEXT("");
+	}
+
+	FString GetWidgetSlotType(const UWidgetBlueprint* WidgetBlueprint, const UWidget* Widget, FString* OutNamedSlotName = nullptr)
+	{
+		if (OutNamedSlotName != nullptr)
+		{
+			OutNamedSlotName->Reset();
+		}
+
+		if (Widget == nullptr)
+		{
+			return FString();
+		}
+
+		if (Widget->Slot != nullptr)
+		{
+			return Widget->Slot->GetClass()->GetName();
+		}
+
+		if (WidgetBlueprint == nullptr || WidgetBlueprint->WidgetTree == nullptr)
+		{
+			return FString();
+		}
+
+		TArray<UWidget*> AllWidgets;
+		WidgetBlueprint->WidgetTree->GetAllWidgets(AllWidgets);
+		for (UWidget* CandidateHost : AllWidgets)
+		{
+			if (CandidateHost == nullptr || CandidateHost == Widget)
+			{
+				continue;
+			}
+
+			INamedSlotInterface* NamedSlotHost = Cast<INamedSlotInterface>(CandidateHost);
+			if (NamedSlotHost == nullptr)
+			{
+				continue;
+			}
+
+			TArray<FName> SlotNames;
+			NamedSlotHost->GetSlotNames(SlotNames);
+			for (const FName SlotName : SlotNames)
+			{
+				if (SlotName.IsNone())
+				{
+					continue;
+				}
+
+				if (NamedSlotHost->GetContentForSlot(SlotName) == Widget)
+				{
+					if (OutNamedSlotName != nullptr)
+					{
+						*OutNamedSlotName = SlotName.ToString();
+					}
+					return FString::Printf(TEXT("NamedSlot:%s"), *SlotName.ToString());
+				}
+			}
+		}
+
+		TArray<FName> TreeSlotNames;
+		WidgetBlueprint->WidgetTree->GetSlotNames(TreeSlotNames);
+		for (const FName SlotName : TreeSlotNames)
+		{
+			if (SlotName.IsNone())
+			{
+				continue;
+			}
+
+			if (WidgetBlueprint->WidgetTree->GetContentForSlot(SlotName) == Widget)
+			{
+				if (OutNamedSlotName != nullptr)
+				{
+					*OutNamedSlotName = SlotName.ToString();
+				}
+
+				return FString::Printf(TEXT("NamedSlot:%s"), *SlotName.ToString());
+			}
+		}
+
+		return FString();
+	}
+
+	void CollectWidgetTreeNamedSlotNames(const UWidgetBlueprint* WidgetBlueprint, TArray<FName>& OutSlotNames)
+	{
+		OutSlotNames.Reset();
+		if (WidgetBlueprint == nullptr || WidgetBlueprint->WidgetTree == nullptr)
+		{
+			return;
+		}
+
+		WidgetBlueprint->WidgetTree->GetSlotNames(OutSlotNames);
+
+		if constexpr (THasGetInheritedAvailableNamedSlots<UWidgetBlueprint>::value)
+		{
+			const TArray<FName> InheritedNamedSlots = WidgetBlueprint->GetInheritedAvailableNamedSlots();
+			for (const FName InheritedNamedSlot : InheritedNamedSlots)
+			{
+				if (!InheritedNamedSlot.IsNone())
+				{
+					OutSlotNames.AddUnique(InheritedNamedSlot);
+				}
+			}
+		}
+
+		OutSlotNames.RemoveAll([](const FName SlotName) { return SlotName.IsNone(); });
+	}
+
+	FString JoinNamedSlotNames(const TArray<FName>& SlotNames)
+	{
+		TArray<FString> Names;
+		Names.Reserve(SlotNames.Num());
+		for (const FName SlotName : SlotNames)
+		{
+			if (!SlotName.IsNone())
+			{
+				Names.Add(SlotName.ToString());
+			}
+		}
+
+		return FString::Join(Names, TEXT(", "));
+	}
+
+	bool ResolveNamedSlotName(
+		UWidget* ParentWidget,
+		const FString& RequestedNamedSlotName,
+		FName& OutSlotName,
+		FMCPDiagnostic& OutDiagnostic)
+	{
+		OutSlotName = NAME_None;
+
+		if (ParentWidget == nullptr)
+		{
+			OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+			OutDiagnostic.Message = TEXT("named_slot_name requires a valid parent widget.");
+			return false;
+		}
+
+		INamedSlotInterface* NamedSlotHost = Cast<INamedSlotInterface>(ParentWidget);
+		if (NamedSlotHost == nullptr)
+		{
+			OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+			OutDiagnostic.Message = TEXT("parent_ref does not support named slots.");
+			OutDiagnostic.Detail = ParentWidget->GetClass()->GetPathName();
+			OutDiagnostic.Suggestion = TEXT("Choose a UUserWidget (or widget) that exposes named slots.");
+			return false;
+		}
+
+		TArray<FName> SlotNames;
+		NamedSlotHost->GetSlotNames(SlotNames);
+		SlotNames.RemoveAll([](const FName Name) { return Name.IsNone(); });
+		if (SlotNames.Num() == 0)
+		{
+			OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+			OutDiagnostic.Message = TEXT("parent_ref has no named slots.");
+			OutDiagnostic.Detail = ParentWidget->GetName();
+			return false;
+		}
+
+		if (!RequestedNamedSlotName.IsEmpty())
+		{
+			for (const FName SlotName : SlotNames)
+			{
+				if (SlotName.ToString().Equals(RequestedNamedSlotName, ESearchCase::IgnoreCase))
+				{
+					OutSlotName = SlotName;
+					return true;
+				}
+			}
+
+			OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+			OutDiagnostic.Message = TEXT("named_slot_name does not exist on parent_ref.");
+			OutDiagnostic.Detail = RequestedNamedSlotName;
+			OutDiagnostic.Suggestion = FString::Printf(TEXT("Available named slots: %s"), *JoinNamedSlotNames(SlotNames));
+			return false;
+		}
+
+		if (SlotNames.Num() == 1)
+		{
+			OutSlotName = SlotNames[0];
+			return true;
+		}
+
+		OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+		OutDiagnostic.Message = TEXT("named_slot_name is required because parent_ref has multiple named slots.");
+		OutDiagnostic.Suggestion = FString::Printf(TEXT("Available named slots: %s"), *JoinNamedSlotNames(SlotNames));
+		return false;
+	}
+
+	bool ResolveWidgetTreeNamedSlotName(
+		UWidgetBlueprint* WidgetBlueprint,
+		const FString& RequestedNamedSlotName,
+		FName& OutSlotName,
+		FMCPDiagnostic& OutDiagnostic)
+	{
+		OutSlotName = NAME_None;
+
+		if (WidgetBlueprint == nullptr || WidgetBlueprint->WidgetTree == nullptr)
+		{
+			OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+			OutDiagnostic.Message = TEXT("Widget blueprint context is invalid.");
+			return false;
+		}
+
+		TArray<FName> SlotNames;
+		CollectWidgetTreeNamedSlotNames(WidgetBlueprint, SlotNames);
+		if (SlotNames.Num() == 0)
+		{
+			OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+			OutDiagnostic.Message = TEXT("No top-level named slots are available on this widget blueprint.");
+			OutDiagnostic.Suggestion = TEXT("Use parent_ref for panel/content widgets, or expose named slots in the parent widget class.");
+			return false;
+		}
+
+		if (!RequestedNamedSlotName.IsEmpty())
+		{
+			for (const FName SlotName : SlotNames)
+			{
+				if (SlotName.ToString().Equals(RequestedNamedSlotName, ESearchCase::IgnoreCase))
+				{
+					OutSlotName = SlotName;
+					return true;
+				}
+			}
+
+			OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+			OutDiagnostic.Message = TEXT("named_slot_name does not exist on this widget blueprint.");
+			OutDiagnostic.Detail = RequestedNamedSlotName;
+			OutDiagnostic.Suggestion = FString::Printf(TEXT("Available named slots: %s"), *JoinNamedSlotNames(SlotNames));
+			return false;
+		}
+
+		if (SlotNames.Num() == 1)
+		{
+			OutSlotName = SlotNames[0];
+			return true;
+		}
+
+		OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+		OutDiagnostic.Message = TEXT("named_slot_name is required because multiple top-level named slots are available.");
+		OutDiagnostic.Suggestion = FString::Printf(TEXT("Available named slots: %s"), *JoinNamedSlotNames(SlotNames));
+		return false;
 	}
 
 	bool AttachWidgetToParent(
@@ -1645,13 +2069,61 @@ namespace
 		UWidget* ChildWidget,
 		const int32 InsertIndex,
 		const bool bReplaceContent,
+		const FString& NamedSlotName,
+		FString& OutResolvedNamedSlotName,
+		FString& OutResolvedSlotType,
 		FMCPDiagnostic& OutDiagnostic)
 	{
+		OutResolvedNamedSlotName.Reset();
+		OutResolvedSlotType.Reset();
+
 		if (WidgetBlueprint == nullptr || WidgetBlueprint->WidgetTree == nullptr || ChildWidget == nullptr)
 		{
 			OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
 			OutDiagnostic.Message = TEXT("Widget blueprint context is invalid.");
 			return false;
+		}
+
+		if (ParentWidget == nullptr && !NamedSlotName.IsEmpty())
+		{
+			FName ResolvedNamedSlot = NAME_None;
+			FMCPDiagnostic NamedSlotDiagnostic;
+			if (!ResolveWidgetTreeNamedSlotName(WidgetBlueprint, NamedSlotName, ResolvedNamedSlot, NamedSlotDiagnostic))
+			{
+				OutDiagnostic = NamedSlotDiagnostic;
+				return false;
+			}
+
+			UWidget* ExistingContent = WidgetBlueprint->WidgetTree->GetContentForSlot(ResolvedNamedSlot);
+			if (ExistingContent != nullptr && ExistingContent != ChildWidget && !bReplaceContent)
+			{
+				OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+				OutDiagnostic.Message = TEXT("Target top-level named slot already has content. Set replace_content=true to replace it.");
+				OutDiagnostic.Detail = ResolvedNamedSlot.ToString();
+				return false;
+			}
+
+			if (ExistingContent != nullptr && ExistingContent != ChildWidget && bReplaceContent)
+			{
+				TArray<FName> RemovedVariableNames;
+				CollectWidgetSubtreeVariableNames(ExistingContent, RemovedVariableNames);
+				if (!WidgetBlueprint->WidgetTree->RemoveWidget(ExistingContent))
+				{
+					WidgetBlueprint->WidgetTree->SetContentForSlot(ResolvedNamedSlot, nullptr);
+				}
+				else
+				{
+					for (const FName& RemovedVariableName : RemovedVariableNames)
+					{
+						RemoveWidgetGuidEntry(WidgetBlueprint, RemovedVariableName);
+					}
+				}
+			}
+
+			WidgetBlueprint->WidgetTree->SetContentForSlot(ResolvedNamedSlot, ChildWidget);
+			OutResolvedNamedSlotName = ResolvedNamedSlot.ToString();
+			OutResolvedSlotType = FString::Printf(TEXT("NamedSlot:%s"), *OutResolvedNamedSlotName);
+			return true;
 		}
 
 		if (ParentWidget == nullptr)
@@ -1667,6 +2139,54 @@ namespace
 			return true;
 		}
 
+		const bool bIsPanelWidget = Cast<UPanelWidget>(ParentWidget) != nullptr;
+		const bool bIsContentWidget = Cast<UContentWidget>(ParentWidget) != nullptr;
+		const bool bShouldUseNamedSlot =
+			!NamedSlotName.IsEmpty() || (!bIsPanelWidget && !bIsContentWidget && Cast<INamedSlotInterface>(ParentWidget) != nullptr);
+
+		if (bShouldUseNamedSlot)
+		{
+			FName ResolvedNamedSlot = NAME_None;
+			FMCPDiagnostic NamedSlotDiagnostic;
+			if (!ResolveNamedSlotName(ParentWidget, NamedSlotName, ResolvedNamedSlot, NamedSlotDiagnostic))
+			{
+				OutDiagnostic = NamedSlotDiagnostic;
+				return false;
+			}
+
+			INamedSlotInterface* NamedSlotHost = Cast<INamedSlotInterface>(ParentWidget);
+			UWidget* ExistingContent = NamedSlotHost->GetContentForSlot(ResolvedNamedSlot);
+			if (ExistingContent != nullptr && ExistingContent != ChildWidget && !bReplaceContent)
+			{
+				OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+				OutDiagnostic.Message = TEXT("Target named slot already has content. Set replace_content=true to replace it.");
+				OutDiagnostic.Detail = ResolvedNamedSlot.ToString();
+				return false;
+			}
+
+			if (ExistingContent != nullptr && ExistingContent != ChildWidget && bReplaceContent)
+			{
+				TArray<FName> RemovedVariableNames;
+				CollectWidgetSubtreeVariableNames(ExistingContent, RemovedVariableNames);
+				if (!WidgetBlueprint->WidgetTree->RemoveWidget(ExistingContent))
+				{
+					NamedSlotHost->SetContentForSlot(ResolvedNamedSlot, nullptr);
+				}
+				else
+				{
+					for (const FName& RemovedVariableName : RemovedVariableNames)
+					{
+						RemoveWidgetGuidEntry(WidgetBlueprint, RemovedVariableName);
+					}
+				}
+			}
+
+			NamedSlotHost->SetContentForSlot(ResolvedNamedSlot, ChildWidget);
+			OutResolvedNamedSlotName = ResolvedNamedSlot.ToString();
+			OutResolvedSlotType = FString::Printf(TEXT("NamedSlot:%s"), *OutResolvedNamedSlotName);
+			return true;
+		}
+
 		if (UContentWidget* ContentWidget = Cast<UContentWidget>(ParentWidget))
 		{
 			if (ContentWidget->GetContent() != nullptr && !bReplaceContent)
@@ -1678,11 +2198,19 @@ namespace
 
 			if (ContentWidget->GetContent() != nullptr && bReplaceContent)
 			{
-				if (!WidgetBlueprint->WidgetTree->RemoveWidget(ContentWidget->GetContent()))
+				UWidget* ExistingContent = ContentWidget->GetContent();
+				TArray<FName> RemovedVariableNames;
+				CollectWidgetSubtreeVariableNames(ExistingContent, RemovedVariableNames);
+				if (!WidgetBlueprint->WidgetTree->RemoveWidget(ExistingContent))
 				{
 					OutDiagnostic.Code = MCPErrorCodes::INTERNAL_EXCEPTION;
 					OutDiagnostic.Message = TEXT("Failed to remove existing child from content widget.");
 					return false;
+				}
+
+				for (const FName& RemovedVariableName : RemovedVariableNames)
+				{
+					RemoveWidgetGuidEntry(WidgetBlueprint, RemovedVariableName);
 				}
 			}
 
@@ -1693,6 +2221,7 @@ namespace
 				OutDiagnostic.Message = TEXT("Failed to attach child to content widget.");
 				return false;
 			}
+			OutResolvedSlotType = NewSlot->GetClass()->GetName();
 			return true;
 		}
 
@@ -1700,7 +2229,7 @@ namespace
 		if (PanelWidget == nullptr)
 		{
 			OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-			OutDiagnostic.Message = TEXT("parent_ref must point to a panel/content widget.");
+			OutDiagnostic.Message = TEXT("parent_ref must point to a panel/content/named-slot widget.");
 			return false;
 		}
 
@@ -1721,6 +2250,7 @@ namespace
 			return false;
 		}
 
+		OutResolvedSlotType = NewSlot->GetClass()->GetName();
 		return true;
 	}
 
@@ -1744,6 +2274,54 @@ namespace
 
 		if (Widget->Slot == nullptr || Widget->Slot->Parent == nullptr)
 		{
+			TArray<UWidget*> AllWidgets;
+			WidgetBlueprint->WidgetTree->GetAllWidgets(AllWidgets);
+			for (UWidget* CandidateHost : AllWidgets)
+			{
+				if (CandidateHost == nullptr || CandidateHost == Widget)
+				{
+					continue;
+				}
+
+				INamedSlotInterface* NamedSlotHost = Cast<INamedSlotInterface>(CandidateHost);
+				if (NamedSlotHost == nullptr)
+				{
+					continue;
+				}
+
+				TArray<FName> SlotNames;
+				NamedSlotHost->GetSlotNames(SlotNames);
+				for (const FName SlotName : SlotNames)
+				{
+					if (SlotName.IsNone())
+					{
+						continue;
+					}
+
+					if (NamedSlotHost->GetContentForSlot(SlotName) == Widget)
+					{
+						NamedSlotHost->SetContentForSlot(SlotName, nullptr);
+						return true;
+					}
+				}
+			}
+
+			TArray<FName> TreeSlotNames;
+			WidgetBlueprint->WidgetTree->GetSlotNames(TreeSlotNames);
+			for (const FName SlotName : TreeSlotNames)
+			{
+				if (SlotName.IsNone())
+				{
+					continue;
+				}
+
+				if (WidgetBlueprint->WidgetTree->GetContentForSlot(SlotName) == Widget)
+				{
+					WidgetBlueprint->WidgetTree->SetContentForSlot(SlotName, nullptr);
+					return true;
+				}
+			}
+
 			OutDiagnostic.Code = MCPErrorCodes::UMG_WIDGET_NOT_FOUND;
 			OutDiagnostic.Message = TEXT("Widget has no parent slot and cannot be detached.");
 			return false;
@@ -1769,6 +2347,7 @@ namespace
 		const UWidgetBlueprint* WidgetBlueprint,
 		UWidget* Widget,
 		const FString& ParentId,
+		const FString& SlotTypeOverride,
 		const FString& NameGlob,
 		const TSet<FString>& AllowedClassPaths,
 		const int32 MaxDepth,
@@ -1792,12 +2371,31 @@ namespace
 			NodeObject->SetStringField(TEXT("name"), Widget->GetName());
 			NodeObject->SetStringField(TEXT("class_path"), ClassPath);
 			NodeObject->SetStringField(TEXT("parent_id"), ParentId);
-			NodeObject->SetStringField(TEXT("slot_type"), Widget->Slot ? Widget->Slot->GetClass()->GetName() : TEXT(""));
+			const FString SlotType = !SlotTypeOverride.IsEmpty()
+				? SlotTypeOverride
+				: GetWidgetSlotType(WidgetBlueprint, Widget);
+			NodeObject->SetStringField(TEXT("slot_type"), SlotType);
 
 			int32 ChildrenCount = 0;
 			if (const UPanelWidget* Panel = Cast<UPanelWidget>(Widget))
 			{
-				ChildrenCount = Panel->GetChildrenCount();
+				ChildrenCount += Panel->GetChildrenCount();
+			}
+			if (const INamedSlotInterface* NamedSlotHost = Cast<INamedSlotInterface>(Widget))
+			{
+				TArray<FName> SlotNames;
+				NamedSlotHost->GetSlotNames(SlotNames);
+				for (const FName SlotName : SlotNames)
+				{
+					if (SlotName.IsNone())
+					{
+						continue;
+					}
+					if (NamedSlotHost->GetContentForSlot(SlotName) != nullptr)
+					{
+						++ChildrenCount;
+					}
+				}
 			}
 			NodeObject->SetNumberField(TEXT("children_count"), ChildrenCount);
 			NodeObject->SetObjectField(TEXT("flags"), MakeShared<FJsonObject>());
@@ -1808,7 +2406,35 @@ namespace
 		{
 			for (int32 Index = 0; Index < Panel->GetChildrenCount(); ++Index)
 			{
-				BuildWidgetTreeNodesRecursive(WidgetBlueprint, Panel->GetChildAt(Index), WidgetId, NameGlob, AllowedClassPaths, MaxDepth, Depth + 1, OutNodes);
+				UWidget* ChildWidget = Panel->GetChildAt(Index);
+				const FString ChildSlotType = (ChildWidget != nullptr && ChildWidget->Slot != nullptr)
+					? ChildWidget->Slot->GetClass()->GetName()
+					: FString();
+				BuildWidgetTreeNodesRecursive(WidgetBlueprint, ChildWidget, WidgetId, ChildSlotType, NameGlob, AllowedClassPaths, MaxDepth, Depth + 1, OutNodes);
+			}
+		}
+
+		if (const INamedSlotInterface* NamedSlotHost = Cast<INamedSlotInterface>(Widget))
+		{
+			TSet<const UWidget*> VisitedNamedSlotChildren;
+			TArray<FName> SlotNames;
+			NamedSlotHost->GetSlotNames(SlotNames);
+			for (const FName SlotName : SlotNames)
+			{
+				if (SlotName.IsNone())
+				{
+					continue;
+				}
+
+				UWidget* SlotContent = NamedSlotHost->GetContentForSlot(SlotName);
+				if (SlotContent == nullptr || VisitedNamedSlotChildren.Contains(SlotContent))
+				{
+					continue;
+				}
+
+				VisitedNamedSlotChildren.Add(SlotContent);
+				const FString NamedSlotType = FString::Printf(TEXT("NamedSlot:%s"), *SlotName.ToString());
+				BuildWidgetTreeNodesRecursive(WidgetBlueprint, SlotContent, WidgetId, NamedSlotType, NameGlob, AllowedClassPaths, MaxDepth, Depth + 1, OutNodes);
 			}
 		}
 	}
@@ -6928,6 +7554,7 @@ bool UMCPToolRegistrySubsystem::HandleUMGWidgetAdd(const FMCPRequestEnvelope& Re
 	FString ObjectPath;
 	FString WidgetClassPath;
 	FString WidgetName;
+	FString NamedSlotName;
 	const TSharedPtr<FJsonObject>* ParentRef = nullptr;
 	const TArray<TSharedPtr<FJsonValue>>* WidgetPatchOperations = nullptr;
 	const TArray<TSharedPtr<FJsonValue>>* SlotPatchOperations = nullptr;
@@ -6941,6 +7568,7 @@ bool UMCPToolRegistrySubsystem::HandleUMGWidgetAdd(const FMCPRequestEnvelope& Re
 		Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
 		Request.Params->TryGetStringField(TEXT("widget_class_path"), WidgetClassPath);
 		Request.Params->TryGetStringField(TEXT("widget_name"), WidgetName);
+		Request.Params->TryGetStringField(TEXT("named_slot_name"), NamedSlotName);
 		Request.Params->TryGetObjectField(TEXT("parent_ref"), ParentRef);
 		Request.Params->TryGetArrayField(TEXT("widget_patch"), WidgetPatchOperations);
 		Request.Params->TryGetArrayField(TEXT("slot_patch"), SlotPatchOperations);
@@ -7002,7 +7630,7 @@ bool UMCPToolRegistrySubsystem::HandleUMGWidgetAdd(const FMCPRequestEnvelope& Re
 			return false;
 		}
 	}
-	else if (WidgetBlueprint->WidgetTree->RootWidget != nullptr)
+	else if (WidgetBlueprint->WidgetTree->RootWidget != nullptr && NamedSlotName.IsEmpty())
 	{
 		ParentWidget = WidgetBlueprint->WidgetTree->RootWidget;
 	}
@@ -7023,12 +7651,13 @@ bool UMCPToolRegistrySubsystem::HandleUMGWidgetAdd(const FMCPRequestEnvelope& Re
 	FString AddedWidgetId = FString::Printf(TEXT("name:%s"), *GeneratedWidgetName.ToString());
 	FString ParentId = ParentWidget ? GetWidgetStableId(WidgetBlueprint, ParentWidget) : FString();
 	FString SlotType;
+	FString ResolvedNamedSlotName;
 
-		if (!Request.Context.bDryRun)
-		{
-			EnsureWidgetGuidMap(WidgetBlueprint);
-			FScopedTransaction Transaction(FText::FromString(TEXT("MCP UMG Widget Add")));
-			WidgetBlueprint->Modify();
+	if (!Request.Context.bDryRun)
+	{
+		EnsureWidgetGuidMap(WidgetBlueprint);
+		FScopedTransaction Transaction(FText::FromString(TEXT("MCP UMG Widget Add")));
+		WidgetBlueprint->Modify();
 
 		UWidget* NewWidget = WidgetBlueprint->WidgetTree->ConstructWidget<UWidget>(WidgetClass, GeneratedWidgetName);
 		if (NewWidget == nullptr)
@@ -7045,7 +7674,16 @@ bool UMCPToolRegistrySubsystem::HandleUMGWidgetAdd(const FMCPRequestEnvelope& Re
 
 		NewWidget->Modify();
 		FMCPDiagnostic AttachDiagnostic;
-		if (!AttachWidgetToParent(WidgetBlueprint, ParentWidget, NewWidget, InsertIndex, bReplaceContent, AttachDiagnostic))
+		if (!AttachWidgetToParent(
+			WidgetBlueprint,
+			ParentWidget,
+			NewWidget,
+			InsertIndex,
+			bReplaceContent,
+			NamedSlotName,
+			ResolvedNamedSlotName,
+			SlotType,
+			AttachDiagnostic))
 		{
 			Transaction.Cancel();
 			OutResult.Diagnostics.Add(AttachDiagnostic);
@@ -7102,15 +7740,72 @@ bool UMCPToolRegistrySubsystem::HandleUMGWidgetAdd(const FMCPRequestEnvelope& Re
 		WidgetBlueprint->MarkPackageDirty();
 		AddedWidgetId = GetWidgetStableId(WidgetBlueprint, NewWidget);
 		ParentId = GetParentWidgetId(WidgetBlueprint, NewWidget);
-		SlotType = NewWidget->Slot ? NewWidget->Slot->GetClass()->GetName() : FString();
+		SlotType = GetWidgetSlotType(WidgetBlueprint, NewWidget, &ResolvedNamedSlotName);
 	}
 	else
 	{
 		CollectChangedPropertiesFromPatchOperations(WidgetPatchOperations, ChangedWidgetProperties);
 		CollectChangedPropertiesFromPatchOperations(SlotPatchOperations, ChangedSlotProperties);
-		if (ParentWidget != nullptr)
+
+		if (ParentWidget == nullptr && !NamedSlotName.IsEmpty())
 		{
-			if (UContentWidget* ContentParent = Cast<UContentWidget>(ParentWidget))
+			FName ResolvedNamedSlot = NAME_None;
+			FMCPDiagnostic NamedSlotDiagnostic;
+			if (!ResolveWidgetTreeNamedSlotName(WidgetBlueprint, NamedSlotName, ResolvedNamedSlot, NamedSlotDiagnostic))
+			{
+				OutResult.Diagnostics.Add(NamedSlotDiagnostic);
+				OutResult.Status = EMCPResponseStatus::Error;
+				return false;
+			}
+
+			ResolvedNamedSlotName = ResolvedNamedSlot.ToString();
+			if (WidgetBlueprint->WidgetTree->GetContentForSlot(ResolvedNamedSlot) != nullptr && !bReplaceContent)
+			{
+				FMCPDiagnostic Diagnostic;
+				Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+				Diagnostic.Message = TEXT("Target top-level named slot already has content. Set replace_content=true to replace it.");
+				Diagnostic.Detail = ResolvedNamedSlotName;
+				OutResult.Diagnostics.Add(Diagnostic);
+				OutResult.Status = EMCPResponseStatus::Error;
+				return false;
+			}
+
+			SlotType = FString::Printf(TEXT("NamedSlot:%s"), *ResolvedNamedSlotName);
+		}
+		else if (ParentWidget != nullptr)
+		{
+			const bool bIsPanelParent = Cast<UPanelWidget>(ParentWidget) != nullptr;
+			const bool bIsContentParent = Cast<UContentWidget>(ParentWidget) != nullptr;
+			const bool bUseNamedSlot =
+				!NamedSlotName.IsEmpty() || (!bIsPanelParent && !bIsContentParent && Cast<INamedSlotInterface>(ParentWidget) != nullptr);
+			if (bUseNamedSlot)
+			{
+				FName ResolvedNamedSlot = NAME_None;
+				FMCPDiagnostic NamedSlotDiagnostic;
+				if (!ResolveNamedSlotName(ParentWidget, NamedSlotName, ResolvedNamedSlot, NamedSlotDiagnostic))
+				{
+					OutResult.Diagnostics.Add(NamedSlotDiagnostic);
+					OutResult.Status = EMCPResponseStatus::Error;
+					return false;
+				}
+
+				ResolvedNamedSlotName = ResolvedNamedSlot.ToString();
+				if (INamedSlotInterface* NamedSlotHost = Cast<INamedSlotInterface>(ParentWidget))
+				{
+					if (NamedSlotHost->GetContentForSlot(ResolvedNamedSlot) != nullptr && !bReplaceContent)
+					{
+						FMCPDiagnostic Diagnostic;
+						Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+						Diagnostic.Message = TEXT("Target named slot already has content. Set replace_content=true to replace it.");
+						Diagnostic.Detail = ResolvedNamedSlotName;
+						OutResult.Diagnostics.Add(Diagnostic);
+						OutResult.Status = EMCPResponseStatus::Error;
+						return false;
+					}
+				}
+				SlotType = FString::Printf(TEXT("NamedSlot:%s"), *ResolvedNamedSlotName);
+			}
+			else if (UContentWidget* ContentParent = Cast<UContentWidget>(ParentWidget))
 			{
 				if (ContentParent->GetContent() != nullptr && !bReplaceContent)
 				{
@@ -7126,18 +7821,27 @@ bool UMCPToolRegistrySubsystem::HandleUMGWidgetAdd(const FMCPRequestEnvelope& Re
 			{
 				FMCPDiagnostic Diagnostic;
 				Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-				Diagnostic.Message = TEXT("parent_ref must point to a panel/content widget.");
+				Diagnostic.Message = TEXT("parent_ref must point to a panel/content/named-slot widget.");
 				OutResult.Diagnostics.Add(Diagnostic);
 				OutResult.Status = EMCPResponseStatus::Error;
 				return false;
 			}
 
-				if (UPanelWidget* ParentPanel = Cast<UPanelWidget>(ParentWidget))
-				{
-					SlotType = GetPanelSlotTypeName(ParentPanel);
-				}
+			if (UPanelWidget* ParentPanel = Cast<UPanelWidget>(ParentWidget))
+			{
+				SlotType = GetPanelSlotTypeName(ParentPanel);
 			}
 		}
+		else if (WidgetBlueprint->WidgetTree->RootWidget != nullptr)
+		{
+			FMCPDiagnostic Diagnostic;
+			Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+			Diagnostic.Message = TEXT("WidgetTree root already exists. Provide parent_ref or named_slot_name.");
+			OutResult.Diagnostics.Add(Diagnostic);
+			OutResult.Status = EMCPResponseStatus::Error;
+			return false;
+		}
+	}
 
 	TSharedRef<FJsonObject> CompileObject = MakeShared<FJsonObject>();
 	if (bCompileOnSuccess && !Request.Context.bDryRun)
@@ -7166,6 +7870,10 @@ bool UMCPToolRegistrySubsystem::HandleUMGWidgetAdd(const FMCPRequestEnvelope& Re
 	WidgetObject->SetStringField(TEXT("class_path"), WidgetClass->GetPathName());
 	WidgetObject->SetStringField(TEXT("parent_id"), ParentId);
 	WidgetObject->SetStringField(TEXT("slot_type"), SlotType);
+	if (!ResolvedNamedSlotName.IsEmpty())
+	{
+		WidgetObject->SetStringField(TEXT("named_slot_name"), ResolvedNamedSlotName);
+	}
 
 	OutResult.ResultObject = MakeShared<FJsonObject>();
 	OutResult.ResultObject->SetBoolField(TEXT("created"), !Request.Context.bDryRun);
@@ -7214,9 +7922,11 @@ bool UMCPToolRegistrySubsystem::HandleUMGWidgetRemove(const FMCPRequestEnvelope&
 	const FString RemovedParentId = GetParentWidgetId(WidgetBlueprint, Widget);
 
 	bool bRemoved = true;
+	TArray<FName> RemovedVariableNames;
 	if (!Request.Context.bDryRun)
 	{
 		EnsureWidgetGuidMap(WidgetBlueprint);
+		CollectWidgetSubtreeVariableNames(Widget, RemovedVariableNames);
 		FScopedTransaction Transaction(FText::FromString(TEXT("MCP UMG Widget Remove")));
 		WidgetBlueprint->Modify();
 
@@ -7231,6 +7941,11 @@ bool UMCPToolRegistrySubsystem::HandleUMGWidgetRemove(const FMCPRequestEnvelope&
 			OutResult.Diagnostics.Add(Diagnostic);
 			OutResult.Status = EMCPResponseStatus::Error;
 			return false;
+		}
+
+		for (const FName& RemovedVariableName : RemovedVariableNames)
+		{
+			RemoveWidgetGuidEntry(WidgetBlueprint, RemovedVariableName);
 		}
 
 		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WidgetBlueprint);
@@ -7276,6 +7991,7 @@ bool UMCPToolRegistrySubsystem::HandleUMGWidgetRemove(const FMCPRequestEnvelope&
 bool UMCPToolRegistrySubsystem::HandleUMGWidgetReparent(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
 	FString ObjectPath;
+	FString NamedSlotName;
 	const TSharedPtr<FJsonObject>* WidgetRef = nullptr;
 	const TSharedPtr<FJsonObject>* NewParentRef = nullptr;
 	const TArray<TSharedPtr<FJsonValue>>* SlotPatchOperations = nullptr;
@@ -7288,6 +8004,7 @@ bool UMCPToolRegistrySubsystem::HandleUMGWidgetReparent(const FMCPRequestEnvelop
 	if (Request.Params.IsValid())
 	{
 		Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
+		Request.Params->TryGetStringField(TEXT("named_slot_name"), NamedSlotName);
 		Request.Params->TryGetObjectField(TEXT("widget_ref"), WidgetRef);
 		Request.Params->TryGetObjectField(TEXT("new_parent_ref"), NewParentRef);
 		Request.Params->TryGetArrayField(TEXT("slot_patch"), SlotPatchOperations);
@@ -7301,11 +8018,15 @@ bool UMCPToolRegistrySubsystem::HandleUMGWidgetReparent(const FMCPRequestEnvelop
 		InsertIndex = FMath::Clamp(static_cast<int32>(InsertIndexNumber), -1, 10000);
 	}
 
-	if (!bSetAsRoot && (NewParentRef == nullptr || !NewParentRef->IsValid()))
+	const bool bUseTopLevelNamedSlotTarget = !bSetAsRoot
+		&& (NewParentRef == nullptr || !NewParentRef->IsValid())
+		&& !NamedSlotName.IsEmpty();
+
+	if (!bSetAsRoot && !bUseTopLevelNamedSlotTarget && (NewParentRef == nullptr || !NewParentRef->IsValid()))
 	{
 		FMCPDiagnostic Diagnostic;
 		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("new_parent_ref is required unless set_as_root=true.");
+		Diagnostic.Message = TEXT("new_parent_ref is required unless set_as_root=true or named_slot_name targets a top-level named slot.");
 		OutResult.Diagnostics.Add(Diagnostic);
 		OutResult.Status = EMCPResponseStatus::Error;
 		return false;
@@ -7327,41 +8048,44 @@ bool UMCPToolRegistrySubsystem::HandleUMGWidgetReparent(const FMCPRequestEnvelop
 	UWidget* NewParentWidget = nullptr;
 	if (!bSetAsRoot)
 	{
-		NewParentWidget = ResolveWidgetFromRef(WidgetBlueprint, NewParentRef);
-		if (NewParentWidget == nullptr)
+		if (!bUseTopLevelNamedSlotTarget)
 		{
-			FMCPDiagnostic Diagnostic;
-			Diagnostic.Code = MCPErrorCodes::UMG_WIDGET_NOT_FOUND;
-			Diagnostic.Message = TEXT("new_parent_ref could not be resolved.");
-			Diagnostic.Detail = ObjectPath;
-			OutResult.Diagnostics.Add(Diagnostic);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-
-		if (NewParentWidget == Widget)
-		{
-			FMCPDiagnostic Diagnostic;
-			Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-			Diagnostic.Message = TEXT("Widget cannot be reparented to itself.");
-			OutResult.Diagnostics.Add(Diagnostic);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-
-		UWidget* CursorWidget = NewParentWidget;
-		while (CursorWidget != nullptr)
-		{
-			if (CursorWidget == Widget)
+			NewParentWidget = ResolveWidgetFromRef(WidgetBlueprint, NewParentRef);
+			if (NewParentWidget == nullptr)
 			{
 				FMCPDiagnostic Diagnostic;
-				Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-				Diagnostic.Message = TEXT("Widget cannot be reparented into its own subtree.");
+				Diagnostic.Code = MCPErrorCodes::UMG_WIDGET_NOT_FOUND;
+				Diagnostic.Message = TEXT("new_parent_ref could not be resolved.");
+				Diagnostic.Detail = ObjectPath;
 				OutResult.Diagnostics.Add(Diagnostic);
 				OutResult.Status = EMCPResponseStatus::Error;
 				return false;
 			}
-			CursorWidget = (CursorWidget->Slot != nullptr) ? CursorWidget->Slot->Parent : nullptr;
+
+			if (NewParentWidget == Widget)
+			{
+				FMCPDiagnostic Diagnostic;
+				Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+				Diagnostic.Message = TEXT("Widget cannot be reparented to itself.");
+				OutResult.Diagnostics.Add(Diagnostic);
+				OutResult.Status = EMCPResponseStatus::Error;
+				return false;
+			}
+
+			UWidget* CursorWidget = NewParentWidget;
+			while (CursorWidget != nullptr)
+			{
+				if (CursorWidget == Widget)
+				{
+					FMCPDiagnostic Diagnostic;
+					Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+					Diagnostic.Message = TEXT("Widget cannot be reparented into its own subtree.");
+					OutResult.Diagnostics.Add(Diagnostic);
+					OutResult.Status = EMCPResponseStatus::Error;
+					return false;
+				}
+				CursorWidget = (CursorWidget->Slot != nullptr) ? CursorWidget->Slot->Parent : nullptr;
+			}
 		}
 	}
 	else if (WidgetBlueprint->WidgetTree->RootWidget != nullptr && WidgetBlueprint->WidgetTree->RootWidget != Widget)
@@ -7374,13 +8098,24 @@ bool UMCPToolRegistrySubsystem::HandleUMGWidgetReparent(const FMCPRequestEnvelop
 		return false;
 	}
 
+	if (bSetAsRoot && !NamedSlotName.IsEmpty())
+	{
+		FMCPDiagnostic Diagnostic;
+		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+		Diagnostic.Message = TEXT("named_slot_name cannot be used when set_as_root=true.");
+		OutResult.Diagnostics.Add(Diagnostic);
+		OutResult.Status = EMCPResponseStatus::Error;
+		return false;
+	}
+
 	const FString WidgetId = GetWidgetStableId(WidgetBlueprint, Widget);
 	const FString WidgetName = Widget->GetName();
 	const FString WidgetClassPath = Widget->GetClass() ? Widget->GetClass()->GetPathName() : FString();
 	const FString OldParentId = GetParentWidgetId(WidgetBlueprint, Widget);
 	TArray<FString> ChangedSlotProperties;
-	FString NewParentId = bSetAsRoot ? FString() : GetWidgetStableId(WidgetBlueprint, NewParentWidget);
+	FString NewParentId = bSetAsRoot ? FString() : (NewParentWidget ? GetWidgetStableId(WidgetBlueprint, NewParentWidget) : FString());
 	FString SlotType;
+	FString ResolvedNamedSlotName;
 
 	if (!Request.Context.bDryRun)
 	{
@@ -7405,7 +8140,16 @@ bool UMCPToolRegistrySubsystem::HandleUMGWidgetReparent(const FMCPRequestEnvelop
 		else
 		{
 			FMCPDiagnostic AttachDiagnostic;
-			if (!AttachWidgetToParent(WidgetBlueprint, NewParentWidget, Widget, InsertIndex, bReplaceContent, AttachDiagnostic))
+			if (!AttachWidgetToParent(
+				WidgetBlueprint,
+				NewParentWidget,
+				Widget,
+				InsertIndex,
+				bReplaceContent,
+				NamedSlotName,
+				ResolvedNamedSlotName,
+				SlotType,
+				AttachDiagnostic))
 			{
 				Transaction.Cancel();
 				OutResult.Diagnostics.Add(AttachDiagnostic);
@@ -7445,19 +8189,79 @@ bool UMCPToolRegistrySubsystem::HandleUMGWidgetReparent(const FMCPRequestEnvelop
 		EnsureWidgetGuidMap(WidgetBlueprint);
 
 		NewParentId = GetParentWidgetId(WidgetBlueprint, Widget);
-		SlotType = Widget->Slot ? Widget->Slot->GetClass()->GetName() : FString();
+		SlotType = GetWidgetSlotType(WidgetBlueprint, Widget, &ResolvedNamedSlotName);
 	}
 	else
 	{
 		CollectChangedPropertiesFromPatchOperations(SlotPatchOperations, ChangedSlotProperties);
-			if (!bSetAsRoot && NewParentWidget != nullptr)
+
+		if (!bSetAsRoot && NewParentWidget == nullptr && !NamedSlotName.IsEmpty())
+		{
+			FName ResolvedNamedSlot = NAME_None;
+			FMCPDiagnostic NamedSlotDiagnostic;
+			if (!ResolveWidgetTreeNamedSlotName(WidgetBlueprint, NamedSlotName, ResolvedNamedSlot, NamedSlotDiagnostic))
 			{
-				if (UPanelWidget* PanelWidget = Cast<UPanelWidget>(NewParentWidget))
+				OutResult.Diagnostics.Add(NamedSlotDiagnostic);
+				OutResult.Status = EMCPResponseStatus::Error;
+				return false;
+			}
+
+			ResolvedNamedSlotName = ResolvedNamedSlot.ToString();
+			UWidget* ExistingContent = WidgetBlueprint->WidgetTree->GetContentForSlot(ResolvedNamedSlot);
+			if (ExistingContent != nullptr && ExistingContent != Widget && !bReplaceContent)
+			{
+				FMCPDiagnostic Diagnostic;
+				Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+				Diagnostic.Message = TEXT("Target top-level named slot already has content. Set replace_content=true to replace it.");
+				Diagnostic.Detail = ResolvedNamedSlotName;
+				OutResult.Diagnostics.Add(Diagnostic);
+				OutResult.Status = EMCPResponseStatus::Error;
+				return false;
+			}
+
+			NewParentId = TEXT("this");
+			SlotType = FString::Printf(TEXT("NamedSlot:%s"), *ResolvedNamedSlotName);
+		}
+		else if (!bSetAsRoot && NewParentWidget != nullptr)
+		{
+			const bool bIsPanelParent = Cast<UPanelWidget>(NewParentWidget) != nullptr;
+			const bool bIsContentParent = Cast<UContentWidget>(NewParentWidget) != nullptr;
+			const bool bUseNamedSlot =
+				!NamedSlotName.IsEmpty() || (!bIsPanelParent && !bIsContentParent && Cast<INamedSlotInterface>(NewParentWidget) != nullptr);
+			if (bUseNamedSlot)
+			{
+				FName ResolvedNamedSlot = NAME_None;
+				FMCPDiagnostic NamedSlotDiagnostic;
+				if (!ResolveNamedSlotName(NewParentWidget, NamedSlotName, ResolvedNamedSlot, NamedSlotDiagnostic))
 				{
-					SlotType = GetPanelSlotTypeName(PanelWidget);
+					OutResult.Diagnostics.Add(NamedSlotDiagnostic);
+					OutResult.Status = EMCPResponseStatus::Error;
+					return false;
 				}
+
+				ResolvedNamedSlotName = ResolvedNamedSlot.ToString();
+				if (INamedSlotInterface* NamedSlotHost = Cast<INamedSlotInterface>(NewParentWidget))
+				{
+					UWidget* ExistingContent = NamedSlotHost->GetContentForSlot(ResolvedNamedSlot);
+					if (ExistingContent != nullptr && ExistingContent != Widget && !bReplaceContent)
+					{
+						FMCPDiagnostic Diagnostic;
+						Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+						Diagnostic.Message = TEXT("Target named slot already has content. Set replace_content=true to replace it.");
+						Diagnostic.Detail = ResolvedNamedSlotName;
+						OutResult.Diagnostics.Add(Diagnostic);
+						OutResult.Status = EMCPResponseStatus::Error;
+						return false;
+					}
+				}
+				SlotType = FString::Printf(TEXT("NamedSlot:%s"), *ResolvedNamedSlotName);
+			}
+			else if (UPanelWidget* PanelWidget = Cast<UPanelWidget>(NewParentWidget))
+			{
+				SlotType = GetPanelSlotTypeName(PanelWidget);
 			}
 		}
+	}
 
 	TSharedRef<FJsonObject> CompileObject = MakeShared<FJsonObject>();
 	if (bCompileOnSuccess && !Request.Context.bDryRun)
@@ -7492,6 +8296,10 @@ bool UMCPToolRegistrySubsystem::HandleUMGWidgetReparent(const FMCPRequestEnvelop
 	OutResult.ResultObject->SetStringField(TEXT("old_parent_id"), OldParentId);
 	OutResult.ResultObject->SetStringField(TEXT("new_parent_id"), NewParentId);
 	OutResult.ResultObject->SetStringField(TEXT("slot_type"), SlotType);
+	if (!ResolvedNamedSlotName.IsEmpty())
+	{
+		OutResult.ResultObject->SetStringField(TEXT("named_slot_name"), ResolvedNamedSlotName);
+	}
 	OutResult.ResultObject->SetArrayField(TEXT("slot_changed_properties"), ToJsonStringArray(ChangedSlotProperties));
 	OutResult.ResultObject->SetObjectField(TEXT("compile"), CompileObject);
 	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(OutResult.TouchedPackages));
@@ -7548,7 +8356,48 @@ bool UMCPToolRegistrySubsystem::HandleUMGTreeGet(const FMCPRequestEnvelope& Requ
 	UWidget* RootWidget = WidgetBlueprint->WidgetTree->RootWidget;
 	if (RootWidget != nullptr)
 	{
-		BuildWidgetTreeNodesRecursive(WidgetBlueprint, RootWidget, TEXT(""), NameGlob, AllowedClassPaths, Depth, 0, Nodes);
+		BuildWidgetTreeNodesRecursive(WidgetBlueprint, RootWidget, TEXT(""), TEXT(""), NameGlob, AllowedClassPaths, Depth, 0, Nodes);
+	}
+
+	TArray<FName> TopLevelSlotNames;
+	WidgetBlueprint->WidgetTree->GetSlotNames(TopLevelSlotNames);
+	TSet<UWidget*> TopLevelVisited;
+	for (const FName SlotName : TopLevelSlotNames)
+	{
+		if (SlotName.IsNone())
+		{
+			continue;
+		}
+
+		UWidget* SlotContent = WidgetBlueprint->WidgetTree->GetContentForSlot(SlotName);
+		if (SlotContent == nullptr || TopLevelVisited.Contains(SlotContent))
+		{
+			continue;
+		}
+
+		bool bReachableFromRoot = false;
+		if (RootWidget != nullptr)
+		{
+			UWidgetTree::ForEachWidgetAndChildrenUntil(RootWidget, [&bReachableFromRoot, SlotContent](UWidget* CandidateWidget)
+			{
+				if (CandidateWidget == SlotContent)
+				{
+					bReachableFromRoot = true;
+					return false;
+				}
+
+				return true;
+			});
+		}
+
+		if (bReachableFromRoot)
+		{
+			continue;
+		}
+
+		TopLevelVisited.Add(SlotContent);
+		const FString SlotType = FString::Printf(TEXT("NamedSlot:%s"), *SlotName.ToString());
+		BuildWidgetTreeNodesRecursive(WidgetBlueprint, SlotContent, TEXT("this"), SlotType, NameGlob, AllowedClassPaths, Depth, 0, Nodes);
 	}
 
 	TArray<TSharedPtr<FJsonValue>> Warnings;
