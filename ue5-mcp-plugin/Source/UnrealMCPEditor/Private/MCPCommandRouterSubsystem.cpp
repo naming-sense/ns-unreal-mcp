@@ -50,11 +50,11 @@ namespace
 			return FString();
 		}
 
-		FString NormalizedPackagePath = PackagePath;
-		while (NormalizedPackagePath.EndsWith(TEXT("/")))
-		{
-			NormalizedPackagePath.LeftChopInline(1, false);
-		}
+			FString NormalizedPackagePath = PackagePath;
+			while (NormalizedPackagePath.EndsWith(TEXT("/")))
+			{
+				NormalizedPackagePath.LeftChopInline(1, EAllowShrinking::No);
+			}
 
 		if (NormalizedPackagePath.IsEmpty())
 		{

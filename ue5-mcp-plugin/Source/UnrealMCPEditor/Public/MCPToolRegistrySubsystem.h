@@ -59,6 +59,7 @@ private:
 
 	bool HandleToolsList(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
 	bool HandleSystemHealth(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleEditorLiveCodingCompile(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
 	bool HandleAssetFind(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
 	bool HandleAssetLoad(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
 	bool HandleAssetSave(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
@@ -87,6 +88,7 @@ private:
 	bool HandleJobCancel(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
 	bool HandleObjectInspect(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
 	bool HandleObjectPatch(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleObjectPatchV2(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
 	bool HandleWorldOutlinerList(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
 	bool HandleWorldSelectionGet(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
 	bool HandleWorldSelectionSet(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
@@ -99,11 +101,26 @@ private:
 	bool HandleUMGWidgetClassList(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
 	bool HandleUMGTreeGet(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
 	bool HandleUMGWidgetInspect(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleUMGSlotInspect(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
 	bool HandleUMGWidgetAdd(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
 	bool HandleUMGWidgetRemove(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
 	bool HandleUMGWidgetReparent(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
 	bool HandleUMGWidgetPatch(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
 	bool HandleUMGSlotPatch(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleUMGWidgetPatchV2(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleUMGSlotPatchV2(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleUMGAnimationList(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleUMGAnimationCreate(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleUMGAnimationRemove(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleUMGAnimationTrackAdd(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleUMGAnimationKeySet(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleUMGAnimationKeyRemove(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleUMGBindingList(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleUMGBindingSet(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleUMGBindingClear(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleUMGWidgetEventBind(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleUMGWidgetEventUnbind(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleUMGGraphSummary(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
 
 	FString BuildDeleteConfirmationToken(const TArray<FString>& ObjectPaths, bool bFailIfReferenced) const;
 	bool ConsumeDeleteConfirmationToken(const FString& Token, const TArray<FString>& ObjectPaths, bool bFailIfReferenced) const;

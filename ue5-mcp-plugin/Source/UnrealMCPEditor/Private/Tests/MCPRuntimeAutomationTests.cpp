@@ -1031,6 +1031,87 @@ bool FMCPUMGToolsAutomationTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("umg.widget.reparent result has moved"), (*ReparentResultObject)->TryGetBoolField(TEXT("moved"), bMoved));
 	TestTrue(TEXT("umg.widget.reparent moved should be true"), bMoved);
 
+	FString AddNamedSlotHostResponseJson;
+	bool bAddNamedSlotHostSuccess = false;
+	const FString AddNamedSlotHostParamsJson = FString::Printf(
+		TEXT("{\"object_path\":\"%s\",\"widget_class_path\":\"/Script/UMG.ExpandableArea\",\"widget_name\":\"RuntimeNamedSlotHost\",\"parent_ref\":{\"name\":\"RootCanvas\"},\"compile_on_success\":false}"),
+		*WidgetBlueprintPath);
+	const FString AddNamedSlotHostRequestJson = MakeRequestEnvelope(TEXT("umg.widget.add"), AddNamedSlotHostParamsJson, false);
+	TestTrue(TEXT("Execute umg.widget.add for named slot host"), ExecuteMCPRequest(AddNamedSlotHostRequestJson, AddNamedSlotHostResponseJson, bAddNamedSlotHostSuccess));
+	TestTrue(TEXT("umg.widget.add named slot host status should be success"), bAddNamedSlotHostSuccess);
+
+	TSharedPtr<FJsonObject> AddNamedSlotHostResponseObject;
+	TestTrue(TEXT("Parse umg.widget.add named slot host response"), ParseJsonObject(AddNamedSlotHostResponseJson, AddNamedSlotHostResponseObject));
+	const TSharedPtr<FJsonObject>* AddNamedSlotHostResultObject = nullptr;
+	TestTrue(TEXT("umg.widget.add named slot host has result"), AddNamedSlotHostResponseObject->TryGetObjectField(TEXT("result"), AddNamedSlotHostResultObject));
+	const TSharedPtr<FJsonObject>* AddedNamedSlotHostWidgetObject = nullptr;
+	TestTrue(TEXT("umg.widget.add named slot host has widget"), (*AddNamedSlotHostResultObject)->TryGetObjectField(TEXT("widget"), AddedNamedSlotHostWidgetObject));
+	FString AddedNamedSlotHostName;
+	TestTrue(TEXT("umg.widget.add named slot host widget has name"), (*AddedNamedSlotHostWidgetObject)->TryGetStringField(TEXT("name"), AddedNamedSlotHostName));
+
+	FString AddNamedSlotContentResponseJson;
+	bool bAddNamedSlotContentSuccess = false;
+	const FString AddNamedSlotContentParamsJson = FString::Printf(
+		TEXT("{\"object_path\":\"%s\",\"widget_class_path\":\"/Script/UMG.TextBlock\",\"widget_name\":\"RuntimeNamedSlotContent\",\"parent_ref\":{\"name\":\"%s\"},\"named_slot_name\":\"Body\",\"replace_content\":true,\"compile_on_success\":false}"),
+		*WidgetBlueprintPath,
+		*AddedNamedSlotHostName);
+	const FString AddNamedSlotContentRequestJson = MakeRequestEnvelope(TEXT("umg.widget.add"), AddNamedSlotContentParamsJson, false);
+	TestTrue(TEXT("Execute umg.widget.add for named slot content"), ExecuteMCPRequest(AddNamedSlotContentRequestJson, AddNamedSlotContentResponseJson, bAddNamedSlotContentSuccess));
+	TestTrue(TEXT("umg.widget.add named slot content status should be success"), bAddNamedSlotContentSuccess);
+
+	TSharedPtr<FJsonObject> AddNamedSlotContentResponseObject;
+	TestTrue(TEXT("Parse umg.widget.add named slot content response"), ParseJsonObject(AddNamedSlotContentResponseJson, AddNamedSlotContentResponseObject));
+	const TSharedPtr<FJsonObject>* AddNamedSlotContentResultObject = nullptr;
+	TestTrue(TEXT("umg.widget.add named slot content has result"), AddNamedSlotContentResponseObject->TryGetObjectField(TEXT("result"), AddNamedSlotContentResultObject));
+	const TSharedPtr<FJsonObject>* AddedNamedSlotContentWidgetObject = nullptr;
+	TestTrue(TEXT("umg.widget.add named slot content has widget"), (*AddNamedSlotContentResultObject)->TryGetObjectField(TEXT("widget"), AddedNamedSlotContentWidgetObject));
+	FString AddedNamedSlotContentName;
+	TestTrue(TEXT("umg.widget.add named slot content widget has name"), (*AddedNamedSlotContentWidgetObject)->TryGetStringField(TEXT("name"), AddedNamedSlotContentName));
+	FString AddedNamedSlotContentType;
+	TestTrue(TEXT("umg.widget.add named slot content has slot_type"), (*AddedNamedSlotContentWidgetObject)->TryGetStringField(TEXT("slot_type"), AddedNamedSlotContentType));
+	TestEqual(TEXT("umg.widget.add named slot content slot_type"), AddedNamedSlotContentType, FString(TEXT("NamedSlot:Body")));
+	FString AddedNamedSlotNameField;
+	TestTrue(TEXT("umg.widget.add named slot content has named_slot_name"), (*AddedNamedSlotContentWidgetObject)->TryGetStringField(TEXT("named_slot_name"), AddedNamedSlotNameField));
+	TestEqual(TEXT("umg.widget.add named slot content named_slot_name"), AddedNamedSlotNameField, FString(TEXT("Body")));
+
+	FString ReparentNamedSlotContentResponseJson;
+	bool bReparentNamedSlotContentSuccess = false;
+	const FString ReparentNamedSlotContentParamsJson = FString::Printf(
+		TEXT("{\"object_path\":\"%s\",\"widget_ref\":{\"name\":\"%s\"},\"new_parent_ref\":{\"name\":\"RootCanvas\"},\"compile_on_success\":false}"),
+		*WidgetBlueprintPath,
+		*AddedNamedSlotContentName);
+	const FString ReparentNamedSlotContentRequestJson = MakeRequestEnvelope(TEXT("umg.widget.reparent"), ReparentNamedSlotContentParamsJson, false);
+	TestTrue(TEXT("Execute umg.widget.reparent for named slot content"), ExecuteMCPRequest(ReparentNamedSlotContentRequestJson, ReparentNamedSlotContentResponseJson, bReparentNamedSlotContentSuccess));
+	TestTrue(TEXT("umg.widget.reparent named slot content status should be success"), bReparentNamedSlotContentSuccess);
+
+	TSharedPtr<FJsonObject> ReparentNamedSlotContentResponseObject;
+	TestTrue(TEXT("Parse umg.widget.reparent named slot content response"), ParseJsonObject(ReparentNamedSlotContentResponseJson, ReparentNamedSlotContentResponseObject));
+	const TSharedPtr<FJsonObject>* ReparentNamedSlotContentResultObject = nullptr;
+	TestTrue(TEXT("umg.widget.reparent named slot content has result"), ReparentNamedSlotContentResponseObject->TryGetObjectField(TEXT("result"), ReparentNamedSlotContentResultObject));
+	bool bNamedSlotMoved = false;
+	TestTrue(TEXT("umg.widget.reparent named slot content has moved"), (*ReparentNamedSlotContentResultObject)->TryGetBoolField(TEXT("moved"), bNamedSlotMoved));
+	TestTrue(TEXT("umg.widget.reparent named slot content moved should be true"), bNamedSlotMoved);
+
+	FString RemoveNamedSlotContentResponseJson;
+	bool bRemoveNamedSlotContentSuccess = false;
+	const FString RemoveNamedSlotContentParamsJson = FString::Printf(
+		TEXT("{\"object_path\":\"%s\",\"widget_ref\":{\"name\":\"%s\"},\"compile_on_success\":false}"),
+		*WidgetBlueprintPath,
+		*AddedNamedSlotContentName);
+	const FString RemoveNamedSlotContentRequestJson = MakeRequestEnvelope(TEXT("umg.widget.remove"), RemoveNamedSlotContentParamsJson, false);
+	TestTrue(TEXT("Execute umg.widget.remove named slot content request"), ExecuteMCPRequest(RemoveNamedSlotContentRequestJson, RemoveNamedSlotContentResponseJson, bRemoveNamedSlotContentSuccess));
+	TestTrue(TEXT("umg.widget.remove named slot content status should be success"), bRemoveNamedSlotContentSuccess);
+
+	FString RemoveNamedSlotHostResponseJson;
+	bool bRemoveNamedSlotHostSuccess = false;
+	const FString RemoveNamedSlotHostParamsJson = FString::Printf(
+		TEXT("{\"object_path\":\"%s\",\"widget_ref\":{\"name\":\"%s\"},\"compile_on_success\":false}"),
+		*WidgetBlueprintPath,
+		*AddedNamedSlotHostName);
+	const FString RemoveNamedSlotHostRequestJson = MakeRequestEnvelope(TEXT("umg.widget.remove"), RemoveNamedSlotHostParamsJson, false);
+	TestTrue(TEXT("Execute umg.widget.remove named slot host request"), ExecuteMCPRequest(RemoveNamedSlotHostRequestJson, RemoveNamedSlotHostResponseJson, bRemoveNamedSlotHostSuccess));
+	TestTrue(TEXT("umg.widget.remove named slot host status should be success"), bRemoveNamedSlotHostSuccess);
+
 	FString RemoveButtonResponseJson;
 	bool bRemoveButtonSuccess = false;
 	const FString RemoveButtonParamsJson = FString::Printf(
@@ -1065,6 +1146,8 @@ bool FMCPUMGToolsAutomationTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("verify umg.tree.get has nodes"), (*VerifyTreeResultObject)->TryGetArrayField(TEXT("nodes"), VerifyNodes));
 	bool bFoundRemovedContainer = false;
 	bool bFoundRemovedButton = false;
+	bool bFoundRemovedNamedSlotHost = false;
+	bool bFoundRemovedNamedSlotContent = false;
 	if (VerifyNodes != nullptr)
 	{
 		for (const TSharedPtr<FJsonValue>& NodeValue : *VerifyNodes)
@@ -1077,10 +1160,14 @@ bool FMCPUMGToolsAutomationTest::RunTest(const FString& Parameters)
 			NodeValue->AsObject()->TryGetStringField(TEXT("name"), NodeName);
 			bFoundRemovedContainer |= NodeName == AddedContainerName;
 			bFoundRemovedButton |= NodeName == AddedButtonName;
+			bFoundRemovedNamedSlotHost |= NodeName == AddedNamedSlotHostName;
+			bFoundRemovedNamedSlotContent |= NodeName == AddedNamedSlotContentName;
 		}
 	}
 	TestFalse(TEXT("Removed container should not be present"), bFoundRemovedContainer);
 	TestFalse(TEXT("Removed button should not be present"), bFoundRemovedButton);
+	TestFalse(TEXT("Removed named slot host should not be present"), bFoundRemovedNamedSlotHost);
+	TestFalse(TEXT("Removed named slot content should not be present"), bFoundRemovedNamedSlotContent);
 	return true;
 }
 

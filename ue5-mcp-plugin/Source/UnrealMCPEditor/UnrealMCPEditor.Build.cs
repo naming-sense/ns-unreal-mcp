@@ -29,10 +29,17 @@ public class UnrealMCPEditor : ModuleRules
                 "WebSocketNetworking",
                 "Kismet",
                 "KismetCompiler",
+                "MovieScene",
+                "MovieSceneTracks",
                 "Slate",
                 "SlateCore",
                 "UMG",
                 "UMGEditor"
             });
+
+        if (Target.Platform == UnrealTargetPlatform.Win64)
+        {
+            PrivateDependencyModuleNames.Add("LiveCoding");
+        }
     }
 }

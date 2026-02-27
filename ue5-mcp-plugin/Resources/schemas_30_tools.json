@@ -77,6 +77,88 @@
       "additionalProperties": true
     }
   },
+  "editor.livecoding.compile": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "ensure_enabled_for_session": {
+          "type": "boolean",
+          "default": true
+        },
+        "wait_for_completion": {
+          "type": "boolean",
+          "default": true
+        },
+        "show_console": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "supported": {
+          "type": "boolean"
+        },
+        "dry_run": {
+          "type": "boolean"
+        },
+        "ensure_enabled_for_session": {
+          "type": "boolean"
+        },
+        "wait_for_completion": {
+          "type": "boolean"
+        },
+        "show_console": {
+          "type": "boolean"
+        },
+        "module_loaded": {
+          "type": "boolean"
+        },
+        "started_before": {
+          "type": "boolean"
+        },
+        "enabled_for_session_before": {
+          "type": "boolean"
+        },
+        "started_after": {
+          "type": "boolean"
+        },
+        "enabled_for_session_after": {
+          "type": "boolean"
+        },
+        "was_compiling": {
+          "type": "boolean"
+        },
+        "is_compiling": {
+          "type": "boolean"
+        },
+        "compile_requested": {
+          "type": "boolean"
+        },
+        "compile_call_accepted": {
+          "type": "boolean"
+        },
+        "compile_result": {
+          "type": "string"
+        },
+        "enable_error": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "supported",
+        "dry_run",
+        "module_loaded",
+        "compile_requested",
+        "compile_call_accepted",
+        "compile_result"
+      ],
+      "additionalProperties": false
+    }
+  },
   "asset.find": {
     "params_schema": {
       "type": "object",
@@ -1053,6 +1135,12 @@
               },
               "flags": {
                 "type": "object"
+              },
+              "slot_summary": {
+                "type": "object"
+              },
+              "layout_summary": {
+                "type": "object"
               }
             },
             "required": [
@@ -1145,6 +1233,15 @@
           ]
         },
         "properties": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "metadata": {
+          "type": "object"
+        },
+        "style": {
           "type": "array",
           "items": {
             "type": "object"
@@ -1673,6 +1770,9 @@
         "widget_name": {
           "type": "string"
         },
+        "named_slot_name": {
+          "type": "string"
+        },
         "parent_ref": {
           "type": "object",
           "properties": {
@@ -1777,6 +1877,9 @@
               "type": "string"
             },
             "slot_type": {
+              "type": "string"
+            },
+            "named_slot_name": {
               "type": "string"
             }
           },
@@ -1924,6 +2027,9 @@
             }
           }
         },
+        "named_slot_name": {
+          "type": "string"
+        },
         "set_as_root": {
           "type": "boolean",
           "default": false
@@ -2011,6 +2117,9 @@
           "type": "string"
         },
         "slot_type": {
+          "type": "string"
+        },
+        "named_slot_name": {
           "type": "string"
         },
         "slot_changed_properties": {
@@ -3833,6 +3942,1265 @@
         "saved_config_files",
         "verified",
         "touched_packages"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "object.patch.v2": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
+        },
+        "patch": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "op": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "value": {},
+              "from": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "path"
+            ]
+          }
+        },
+        "transaction": {
+          "type": "object",
+          "properties": {
+            "label": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "required": [
+        "target",
+        "patch"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "changed_properties": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "touched_packages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "changed_properties",
+        "touched_packages"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "umg.slot.inspect": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "object_path": {
+          "type": "string"
+        },
+        "widget_ref": {
+          "type": "object",
+          "properties": {
+            "widget_id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          }
+        },
+        "depth": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 5,
+          "default": 2
+        },
+        "include": {
+          "type": "object",
+          "properties": {
+            "layout": {
+              "type": "boolean",
+              "default": true
+            },
+            "anchors": {
+              "type": "boolean",
+              "default": true
+            },
+            "padding": {
+              "type": "boolean",
+              "default": true
+            },
+            "alignment": {
+              "type": "boolean",
+              "default": true
+            },
+            "zorder": {
+              "type": "boolean",
+              "default": true
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "object_path",
+        "widget_ref"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "widget": {
+          "type": "object"
+        },
+        "slot": {
+          "type": "object"
+        },
+        "layout_summary": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "widget",
+        "slot",
+        "layout_summary"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "umg.widget.patch.v2": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "object_path": {
+          "type": "string"
+        },
+        "widget_ref": {
+          "type": "object",
+          "properties": {
+            "widget_id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          }
+        },
+        "patch": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "op": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "value": {}
+            },
+            "required": [
+              "op",
+              "path"
+            ]
+          }
+        },
+        "compile_on_success": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "required": [
+        "object_path",
+        "widget_ref",
+        "patch"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "changed_properties": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "compile": {
+          "type": "object"
+        },
+        "touched_packages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "changed_properties",
+        "touched_packages"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "umg.slot.patch.v2": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "object_path": {
+          "type": "string"
+        },
+        "widget_ref": {
+          "type": "object",
+          "properties": {
+            "widget_id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          }
+        },
+        "patch": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "op": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "value": {}
+            },
+            "required": [
+              "op",
+              "path"
+            ]
+          }
+        }
+      },
+      "required": [
+        "object_path",
+        "widget_ref",
+        "patch"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "changed_properties": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "touched_packages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "changed_properties",
+        "touched_packages"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "umg.animation.list": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "object_path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "object_path"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "animations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "object_path": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "object_path"
+            ]
+          }
+        },
+        "animation_count": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "animations",
+        "animation_count"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "umg.animation.create": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "object_path": {
+          "type": "string"
+        },
+        "animation_name": {
+          "type": "string"
+        },
+        "overwrite": {
+          "type": "boolean",
+          "default": false
+        },
+        "compile_on_success": {
+          "type": "boolean",
+          "default": true
+        },
+        "save": {
+          "type": "object",
+          "properties": {
+            "auto_save": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        }
+      },
+      "required": [
+        "object_path",
+        "animation_name"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "created": {
+          "type": "boolean"
+        },
+        "reused": {
+          "type": "boolean"
+        },
+        "dry_run": {
+          "type": "boolean"
+        },
+        "animation_name": {
+          "type": "string"
+        },
+        "animation_object_path": {
+          "type": "string"
+        },
+        "compile": {
+          "type": "object"
+        },
+        "touched_packages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "created",
+        "reused",
+        "dry_run",
+        "animation_name",
+        "animation_object_path",
+        "touched_packages"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "umg.animation.remove": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "object_path": {
+          "type": "string"
+        },
+        "animation_name": {
+          "type": "string"
+        },
+        "compile_on_success": {
+          "type": "boolean",
+          "default": true
+        },
+        "save": {
+          "type": "object",
+          "properties": {
+            "auto_save": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        }
+      },
+      "required": [
+        "object_path",
+        "animation_name"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "dry_run": {
+          "type": "boolean"
+        },
+        "removed_count": {
+          "type": "integer"
+        },
+        "removed": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "compile": {
+          "type": "object"
+        },
+        "touched_packages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "dry_run",
+        "removed_count",
+        "removed",
+        "touched_packages"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "umg.animation.track.add": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "object_path": {
+          "type": "string"
+        },
+        "animation_name": {
+          "type": "string"
+        },
+        "widget_ref": {
+          "type": "object",
+          "properties": {
+            "widget_id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          }
+        },
+        "property_path": {
+          "type": "string"
+        },
+        "compile_on_success": {
+          "type": "boolean",
+          "default": true
+        },
+        "save": {
+          "type": "object",
+          "properties": {
+            "auto_save": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "object_path",
+        "animation_name",
+        "widget_ref",
+        "property_path"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "dry_run": {
+          "type": "boolean"
+        },
+        "binding_created": {
+          "type": "boolean"
+        },
+        "track_added": {
+          "type": "boolean"
+        },
+        "section_added": {
+          "type": "boolean"
+        },
+        "track_kind": {
+          "type": "string"
+        },
+        "property_path": {
+          "type": "string"
+        },
+        "channel": {
+          "type": "string"
+        },
+        "widget_name": {
+          "type": "string"
+        },
+        "animation_object_path": {
+          "type": "string"
+        },
+        "binding_guid": {
+          "type": "string"
+        },
+        "compile": {
+          "type": "object"
+        },
+        "touched_packages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "dry_run",
+        "track_added",
+        "section_added",
+        "track_kind",
+        "property_path",
+        "channel",
+        "touched_packages"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "umg.animation.key.set": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "object_path": {
+          "type": "string"
+        },
+        "animation_name": {
+          "type": "string"
+        },
+        "widget_ref": {
+          "type": "object",
+          "properties": {
+            "widget_id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          }
+        },
+        "property_path": {
+          "type": "string"
+        },
+        "frame": {
+          "type": "number"
+        },
+        "time_seconds": {
+          "type": "number"
+        },
+        "value": {
+          "type": "number"
+        },
+        "interpolation": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "smart_auto",
+            "linear",
+            "constant",
+            "user",
+            "break"
+          ]
+        },
+        "compile_on_success": {
+          "type": "boolean",
+          "default": true
+        },
+        "save": {
+          "type": "object",
+          "properties": {
+            "auto_save": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "object_path",
+        "animation_name",
+        "widget_ref",
+        "property_path",
+        "value"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "dry_run": {
+          "type": "boolean"
+        },
+        "binding_created": {
+          "type": "boolean"
+        },
+        "track_added": {
+          "type": "boolean"
+        },
+        "section_added": {
+          "type": "boolean"
+        },
+        "key_set": {
+          "type": "boolean"
+        },
+        "frame": {
+          "type": "number"
+        },
+        "time_seconds": {
+          "type": "number"
+        },
+        "value": {
+          "type": "number"
+        },
+        "interpolation": {
+          "type": "string"
+        },
+        "track_kind": {
+          "type": "string"
+        },
+        "property_path": {
+          "type": "string"
+        },
+        "channel": {
+          "type": "string"
+        },
+        "widget_name": {
+          "type": "string"
+        },
+        "animation_object_path": {
+          "type": "string"
+        },
+        "binding_guid": {
+          "type": "string"
+        },
+        "compile": {
+          "type": "object"
+        },
+        "touched_packages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "dry_run",
+        "key_set",
+        "frame",
+        "time_seconds",
+        "value",
+        "property_path",
+        "channel",
+        "touched_packages"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "umg.animation.key.remove": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "object_path": {
+          "type": "string"
+        },
+        "animation_name": {
+          "type": "string"
+        },
+        "widget_ref": {
+          "type": "object",
+          "properties": {
+            "widget_id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          }
+        },
+        "property_path": {
+          "type": "string"
+        },
+        "frame": {
+          "type": "number"
+        },
+        "time_seconds": {
+          "type": "number"
+        },
+        "compile_on_success": {
+          "type": "boolean",
+          "default": true
+        },
+        "save": {
+          "type": "object",
+          "properties": {
+            "auto_save": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "object_path",
+        "animation_name",
+        "widget_ref",
+        "property_path"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "dry_run": {
+          "type": "boolean"
+        },
+        "removed_count": {
+          "type": "integer"
+        },
+        "track_found": {
+          "type": "boolean"
+        },
+        "section_found": {
+          "type": "boolean"
+        },
+        "frame": {
+          "type": "number"
+        },
+        "time_seconds": {
+          "type": "number"
+        },
+        "track_kind": {
+          "type": "string"
+        },
+        "property_path": {
+          "type": "string"
+        },
+        "channel": {
+          "type": "string"
+        },
+        "widget_name": {
+          "type": "string"
+        },
+        "animation_object_path": {
+          "type": "string"
+        },
+        "binding_guid": {
+          "type": "string"
+        },
+        "compile": {
+          "type": "object"
+        },
+        "touched_packages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "dry_run",
+        "removed_count",
+        "frame",
+        "time_seconds",
+        "property_path",
+        "channel",
+        "touched_packages"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "umg.binding.list": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "object_path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "object_path"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "bindings": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "index": {
+                "type": "integer"
+              },
+              "object_name": {
+                "type": "string"
+              },
+              "property_name": {
+                "type": "string"
+              },
+              "function_name": {
+                "type": "string"
+              },
+              "source_path": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "index",
+              "object_name",
+              "property_name",
+              "function_name"
+            ]
+          }
+        },
+        "binding_count": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "bindings",
+        "binding_count"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "umg.binding.set": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "object_path": {
+          "type": "string"
+        },
+        "widget_ref": {
+          "type": "object",
+          "properties": {
+            "widget_id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          }
+        },
+        "object_name": {
+          "type": "string"
+        },
+        "property_name": {
+          "type": "string"
+        },
+        "function_name": {
+          "type": "string"
+        },
+        "replace": {
+          "type": "boolean",
+          "default": true
+        },
+        "compile_on_success": {
+          "type": "boolean",
+          "default": true
+        },
+        "save": {
+          "type": "object",
+          "properties": {
+            "auto_save": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        }
+      },
+      "required": [
+        "object_path",
+        "property_name",
+        "function_name"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "bound": {
+          "type": "boolean"
+        },
+        "dry_run": {
+          "type": "boolean"
+        },
+        "object_name": {
+          "type": "string"
+        },
+        "property_name": {
+          "type": "string"
+        },
+        "function_name": {
+          "type": "string"
+        },
+        "binding_index": {
+          "type": "integer"
+        },
+        "compile": {
+          "type": "object"
+        },
+        "touched_packages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "bound",
+        "dry_run",
+        "object_name",
+        "property_name",
+        "function_name",
+        "binding_index",
+        "touched_packages"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "umg.binding.clear": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "object_path": {
+          "type": "string"
+        },
+        "widget_ref": {
+          "type": "object",
+          "properties": {
+            "widget_id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          }
+        },
+        "object_name": {
+          "type": "string"
+        },
+        "property_name": {
+          "type": "string"
+        },
+        "function_name": {
+          "type": "string"
+        },
+        "compile_on_success": {
+          "type": "boolean",
+          "default": true
+        },
+        "save": {
+          "type": "object",
+          "properties": {
+            "auto_save": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        }
+      },
+      "required": [
+        "object_path"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "dry_run": {
+          "type": "boolean"
+        },
+        "removed_count": {
+          "type": "integer"
+        },
+        "removed": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "compile": {
+          "type": "object"
+        },
+        "touched_packages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "dry_run",
+        "removed_count",
+        "removed",
+        "touched_packages"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "umg.widget.event.bind": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "object_path": {
+          "type": "string"
+        },
+        "widget_ref": {
+          "type": "object",
+          "properties": {
+            "widget_id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          }
+        },
+        "event_name": {
+          "type": "string"
+        },
+        "function_name": {
+          "type": "string"
+        },
+        "compile_on_success": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "required": [
+        "object_path",
+        "widget_ref",
+        "event_name",
+        "function_name"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "bound": {
+          "type": "boolean"
+        },
+        "dry_run": {
+          "type": "boolean"
+        },
+        "object_name": {
+          "type": "string"
+        },
+        "property_name": {
+          "type": "string"
+        },
+        "function_name": {
+          "type": "string"
+        },
+        "binding_index": {
+          "type": "integer"
+        },
+        "compile": {
+          "type": "object"
+        },
+        "touched_packages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "bound",
+        "dry_run",
+        "object_name",
+        "property_name",
+        "function_name",
+        "binding_index",
+        "touched_packages"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "umg.widget.event.unbind": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "object_path": {
+          "type": "string"
+        },
+        "widget_ref": {
+          "type": "object",
+          "properties": {
+            "widget_id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          }
+        },
+        "event_name": {
+          "type": "string"
+        },
+        "function_name": {
+          "type": "string"
+        },
+        "compile_on_success": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "required": [
+        "object_path",
+        "widget_ref"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "dry_run": {
+          "type": "boolean"
+        },
+        "removed_count": {
+          "type": "integer"
+        },
+        "removed": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "compile": {
+          "type": "object"
+        },
+        "touched_packages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "dry_run",
+        "removed_count",
+        "removed",
+        "touched_packages"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "umg.graph.summary": {
+    "params_schema": {
+      "type": "object",
+      "properties": {
+        "object_path": {
+          "type": "string"
+        },
+        "include_names": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "required": [
+        "object_path"
+      ],
+      "additionalProperties": false
+    },
+    "result_schema": {
+      "type": "object",
+      "properties": {
+        "ubergraph": {
+          "type": "object"
+        },
+        "function_graphs": {
+          "type": "object"
+        },
+        "delegate_graphs": {
+          "type": "object"
+        },
+        "macro_graphs": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "ubergraph",
+        "function_graphs",
+        "delegate_graphs",
+        "macro_graphs"
       ],
       "additionalProperties": false
     }

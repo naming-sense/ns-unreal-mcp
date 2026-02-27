@@ -26,6 +26,12 @@ namespace MCPObjectUtils
 		TArray<FString>& OutChangedProperties,
 		FMCPDiagnostic& OutDiagnostic);
 
+	UNREALMCPEDITOR_API bool ApplyPatchV2(
+		UObject* TargetObject,
+		const TArray<TSharedPtr<FJsonValue>>* PatchOperations,
+		TArray<FString>& OutChangedProperties,
+		FMCPDiagnostic& OutDiagnostic);
+
 	UNREALMCPEDITOR_API FString BuildActorPath(const AActor* Actor);
 	UNREALMCPEDITOR_API void AppendTouchedPackage(UObject* TargetObject, TArray<FString>& InOutTouchedPackages);
 }

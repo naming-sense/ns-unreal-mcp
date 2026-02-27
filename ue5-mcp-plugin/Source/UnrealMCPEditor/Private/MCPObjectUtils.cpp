@@ -438,6 +438,439 @@ namespace
 		return false;
 	}
 
+	bool TryParsePathIndex(const FString& Token, int32& OutIndex)
+	{
+		if (Token.IsEmpty())
+		{
+			return false;
+		}
+
+		TCHAR* EndPtr = nullptr;
+		const int64 ParsedValue = FCString::Strtoi64(*Token, &EndPtr, 10);
+		if (EndPtr == nullptr || *EndPtr != TEXT('\0') || ParsedValue < 0 || ParsedValue > MAX_int32)
+		{
+			return false;
+		}
+
+		OutIndex = static_cast<int32>(ParsedValue);
+		return true;
+	}
+
+	bool SetMapKeyFromToken(FProperty* KeyProperty, void* KeyPtr, const FString& Token, FMCPDiagnostic& OutDiagnostic)
+	{
+		if (FStrProperty* StrProperty = CastField<FStrProperty>(KeyProperty))
+		{
+			StrProperty->SetPropertyValue(KeyPtr, Token);
+			return true;
+		}
+
+		if (FNameProperty* NameProperty = CastField<FNameProperty>(KeyProperty))
+		{
+			NameProperty->SetPropertyValue(KeyPtr, FName(*Token));
+			return true;
+		}
+
+		if (FTextProperty* TextProperty = CastField<FTextProperty>(KeyProperty))
+		{
+			TextProperty->SetPropertyValue(KeyPtr, FText::FromString(Token));
+			return true;
+		}
+
+		if (FNumericProperty* NumericProperty = CastField<FNumericProperty>(KeyProperty))
+		{
+			const double NumberValue = FCString::Atod(*Token);
+			if (NumericProperty->IsInteger())
+			{
+				NumericProperty->SetIntPropertyValue(KeyPtr, static_cast<int64>(NumberValue));
+			}
+			else
+			{
+				NumericProperty->SetFloatingPointPropertyValue(KeyPtr, NumberValue);
+			}
+			return true;
+		}
+
+		OutDiagnostic.Code = MCPErrorCodes::SERIALIZE_UNSUPPORTED_TYPE;
+		OutDiagnostic.Message = TEXT("Map key type is not supported for v2 patch path traversal.");
+		OutDiagnostic.Detail = KeyProperty->GetCPPType();
+		return false;
+	}
+
+	bool MapKeyMatchesToken(FProperty* KeyProperty, void* KeyPtr, const FString& Token)
+	{
+		if (const FStrProperty* StrProperty = CastField<FStrProperty>(KeyProperty))
+		{
+			return StrProperty->GetPropertyValue(KeyPtr).Equals(Token, ESearchCase::CaseSensitive);
+		}
+		if (const FNameProperty* NameProperty = CastField<FNameProperty>(KeyProperty))
+		{
+			return NameProperty->GetPropertyValue(KeyPtr).ToString().Equals(Token, ESearchCase::IgnoreCase);
+		}
+		if (const FTextProperty* TextProperty = CastField<FTextProperty>(KeyProperty))
+		{
+			return TextProperty->GetPropertyValue(KeyPtr).ToString().Equals(Token, ESearchCase::CaseSensitive);
+		}
+		if (const FNumericProperty* NumericProperty = CastField<FNumericProperty>(KeyProperty))
+		{
+			const double NumberValue = FCString::Atod(*Token);
+			if (NumericProperty->IsInteger())
+			{
+				return NumericProperty->GetSignedIntPropertyValue(KeyPtr) == static_cast<int64>(NumberValue);
+			}
+			return FMath::IsNearlyEqual(NumericProperty->GetFloatingPointPropertyValue(KeyPtr), NumberValue);
+		}
+
+		FString ExportedKey;
+		KeyProperty->ExportTextItem_Direct(ExportedKey, KeyPtr, nullptr, nullptr, PPF_None);
+		return ExportedKey.Equals(Token, ESearchCase::CaseSensitive)
+			|| ExportedKey.Equals(Token, ESearchCase::IgnoreCase);
+	}
+
+	bool ApplyPatchV2Recursive(
+		FProperty* CurrentProperty,
+		void* CurrentValuePtr,
+		const TArray<FString>& PathTokens,
+		const int32 TokenIndex,
+		const FString& Operation,
+		const TSharedPtr<FJsonValue>& ValueJson,
+		TArray<FString>& OutChangedProperties,
+		const FString& RootPropertyName,
+		FMCPDiagnostic& OutDiagnostic)
+	{
+		if (CurrentProperty == nullptr || CurrentValuePtr == nullptr)
+		{
+			OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+			OutDiagnostic.Message = TEXT("Patch path resolution failed.");
+			return false;
+		}
+
+		const bool bAtLeaf = TokenIndex >= PathTokens.Num();
+		const bool bIsRemove = Operation.Equals(TEXT("remove"), ESearchCase::IgnoreCase);
+		const bool bIsReplace = Operation.Equals(TEXT("replace"), ESearchCase::IgnoreCase) || Operation.Equals(TEXT("add"), ESearchCase::IgnoreCase) || Operation.Equals(TEXT("merge"), ESearchCase::IgnoreCase);
+		const bool bIsInc = Operation.Equals(TEXT("inc"), ESearchCase::IgnoreCase);
+		const bool bIsTest = Operation.Equals(TEXT("test"), ESearchCase::IgnoreCase);
+
+		if (bAtLeaf)
+		{
+			if (bIsRemove)
+			{
+				CurrentProperty->DestroyValue(CurrentValuePtr);
+				CurrentProperty->InitializeValue(CurrentValuePtr);
+				OutChangedProperties.AddUnique(RootPropertyName);
+				return true;
+			}
+
+			if (bIsInc)
+			{
+				FNumericProperty* NumericProperty = CastField<FNumericProperty>(CurrentProperty);
+				if (NumericProperty == nullptr)
+				{
+					OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+					OutDiagnostic.Message = TEXT("inc operation requires numeric property.");
+					OutDiagnostic.Detail = CurrentProperty->GetName();
+					return false;
+				}
+
+				double Delta = 0.0;
+				if (!ValueJson.IsValid() || !ValueJson->TryGetNumber(Delta))
+				{
+					OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+					OutDiagnostic.Message = TEXT("inc operation requires numeric value.");
+					OutDiagnostic.Detail = CurrentProperty->GetName();
+					return false;
+				}
+
+				if (NumericProperty->IsInteger())
+				{
+					const int64 Updated = NumericProperty->GetSignedIntPropertyValue(CurrentValuePtr) + static_cast<int64>(Delta);
+					NumericProperty->SetIntPropertyValue(CurrentValuePtr, Updated);
+				}
+				else
+				{
+					const double Updated = NumericProperty->GetFloatingPointPropertyValue(CurrentValuePtr) + Delta;
+					NumericProperty->SetFloatingPointPropertyValue(CurrentValuePtr, Updated);
+				}
+
+				OutChangedProperties.AddUnique(RootPropertyName);
+				return true;
+			}
+
+			if (bIsTest)
+			{
+				if (!ValueJson.IsValid())
+				{
+					OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+					OutDiagnostic.Message = TEXT("test operation requires value.");
+					OutDiagnostic.Detail = CurrentProperty->GetName();
+					return false;
+				}
+
+				FString CurrentText;
+				FString TestText;
+				CurrentProperty->ExportTextItem_Direct(CurrentText, CurrentValuePtr, nullptr, nullptr, PPF_None);
+				void* ScratchValue = FMemory::Malloc(CurrentProperty->ElementSize, CurrentProperty->GetMinAlignment());
+				CurrentProperty->InitializeValue(ScratchValue);
+				const bool bConverted = JsonValueToProperty(CurrentProperty, ScratchValue, ValueJson, OutDiagnostic);
+				if (bConverted)
+				{
+					CurrentProperty->ExportTextItem_Direct(TestText, ScratchValue, nullptr, nullptr, PPF_None);
+				}
+				CurrentProperty->DestroyValue(ScratchValue);
+				FMemory::Free(ScratchValue);
+				if (!bConverted)
+				{
+					return false;
+				}
+
+				if (!CurrentText.Equals(TestText, ESearchCase::CaseSensitive))
+				{
+					OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+					OutDiagnostic.Message = TEXT("test operation failed.");
+					OutDiagnostic.Detail = RootPropertyName;
+					return false;
+				}
+				return true;
+			}
+
+			if (!bIsReplace)
+			{
+				OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+				OutDiagnostic.Message = TEXT("Unsupported patch operation.");
+				OutDiagnostic.Detail = Operation;
+				return false;
+			}
+
+			if (!ValueJson.IsValid())
+			{
+				OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+				OutDiagnostic.Message = TEXT("Patch operation requires value for add/replace/merge.");
+				OutDiagnostic.Detail = CurrentProperty->GetName();
+				return false;
+			}
+
+			if (!JsonValueToProperty(CurrentProperty, CurrentValuePtr, ValueJson, OutDiagnostic))
+			{
+				if (OutDiagnostic.Code.IsEmpty())
+				{
+					OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+					OutDiagnostic.Message = TEXT("Failed to convert patch value for property.");
+					OutDiagnostic.Detail = CurrentProperty->GetName();
+				}
+				return false;
+			}
+
+			OutChangedProperties.AddUnique(RootPropertyName);
+			return true;
+		}
+
+		const FString& CurrentToken = PathTokens[TokenIndex];
+
+		if (FStructProperty* StructProperty = CastField<FStructProperty>(CurrentProperty))
+		{
+			FProperty* ChildProperty = StructProperty->Struct != nullptr
+				? StructProperty->Struct->FindPropertyByName(FName(*CurrentToken))
+				: nullptr;
+			if (ChildProperty == nullptr)
+			{
+				OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+				OutDiagnostic.Message = TEXT("Patch path does not match a struct field.");
+				OutDiagnostic.Detail = CurrentToken;
+				return false;
+			}
+
+			void* ChildValuePtr = ChildProperty->ContainerPtrToValuePtr<void>(CurrentValuePtr);
+			return ApplyPatchV2Recursive(
+				ChildProperty,
+				ChildValuePtr,
+				PathTokens,
+				TokenIndex + 1,
+				Operation,
+				ValueJson,
+				OutChangedProperties,
+				RootPropertyName,
+				OutDiagnostic);
+		}
+
+		if (FArrayProperty* ArrayProperty = CastField<FArrayProperty>(CurrentProperty))
+		{
+			FScriptArrayHelper ArrayHelper(ArrayProperty, CurrentValuePtr);
+			if (CurrentToken.Equals(TEXT("-"), ESearchCase::CaseSensitive)
+				&& (Operation.Equals(TEXT("add"), ESearchCase::IgnoreCase) || Operation.Equals(TEXT("replace"), ESearchCase::IgnoreCase))
+				&& TokenIndex == PathTokens.Num() - 1)
+			{
+				const int32 NewIndex = ArrayHelper.AddValue();
+				void* ElementPtr = ArrayHelper.GetRawPtr(NewIndex);
+				if (!JsonValueToProperty(ArrayProperty->Inner, ElementPtr, ValueJson, OutDiagnostic))
+				{
+					return false;
+				}
+				OutChangedProperties.AddUnique(RootPropertyName);
+				return true;
+			}
+
+			int32 ElementIndex = INDEX_NONE;
+			if (!TryParsePathIndex(CurrentToken, ElementIndex))
+			{
+				OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+				OutDiagnostic.Message = TEXT("Array path token must be a non-negative integer index.");
+				OutDiagnostic.Detail = CurrentToken;
+				return false;
+			}
+
+			const bool bCanAppend = Operation.Equals(TEXT("add"), ESearchCase::IgnoreCase) || Operation.Equals(TEXT("replace"), ESearchCase::IgnoreCase) || Operation.Equals(TEXT("merge"), ESearchCase::IgnoreCase);
+			if (ElementIndex >= ArrayHelper.Num())
+			{
+				if (!bCanAppend || ElementIndex != ArrayHelper.Num())
+				{
+					OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+					OutDiagnostic.Message = TEXT("Array index is out of range.");
+					OutDiagnostic.Detail = CurrentToken;
+					return false;
+				}
+				ArrayHelper.AddValue();
+			}
+
+			if (TokenIndex == PathTokens.Num() - 1 && bIsRemove)
+			{
+				ArrayHelper.RemoveValues(ElementIndex, 1);
+				OutChangedProperties.AddUnique(RootPropertyName);
+				return true;
+			}
+
+			void* ElementPtr = ArrayHelper.GetRawPtr(ElementIndex);
+			return ApplyPatchV2Recursive(
+				ArrayProperty->Inner,
+				ElementPtr,
+				PathTokens,
+				TokenIndex + 1,
+				Operation,
+				ValueJson,
+				OutChangedProperties,
+				RootPropertyName,
+				OutDiagnostic);
+		}
+
+		if (FMapProperty* MapProperty = CastField<FMapProperty>(CurrentProperty))
+		{
+			FScriptMapHelper MapHelper(MapProperty, CurrentValuePtr);
+			int32 PairIndex = INDEX_NONE;
+			for (int32 Index = 0; Index < MapHelper.GetMaxIndex(); ++Index)
+			{
+				if (!MapHelper.IsValidIndex(Index))
+				{
+					continue;
+				}
+
+				void* KeyPtr = MapHelper.GetKeyPtr(Index);
+				if (MapKeyMatchesToken(MapProperty->KeyProp, KeyPtr, CurrentToken))
+				{
+					PairIndex = Index;
+					break;
+				}
+			}
+
+			const bool bAllowCreate = Operation.Equals(TEXT("add"), ESearchCase::IgnoreCase) || Operation.Equals(TEXT("replace"), ESearchCase::IgnoreCase) || Operation.Equals(TEXT("merge"), ESearchCase::IgnoreCase);
+			if (PairIndex == INDEX_NONE && bAllowCreate)
+			{
+				PairIndex = MapHelper.AddDefaultValue_Invalid_NeedsRehash();
+				void* KeyPtr = MapHelper.GetKeyPtr(PairIndex);
+				if (!SetMapKeyFromToken(MapProperty->KeyProp, KeyPtr, CurrentToken, OutDiagnostic))
+				{
+					MapHelper.RemoveAt(PairIndex);
+					return false;
+				}
+				MapHelper.Rehash();
+			}
+
+			if (PairIndex == INDEX_NONE)
+			{
+				OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+				OutDiagnostic.Message = TEXT("Map key is not found.");
+				OutDiagnostic.Detail = CurrentToken;
+				return false;
+			}
+
+			if (TokenIndex == PathTokens.Num() - 1 && bIsRemove)
+			{
+				MapHelper.RemoveAt(PairIndex);
+				OutChangedProperties.AddUnique(RootPropertyName);
+				return true;
+			}
+
+			void* MapValuePtr = MapHelper.GetValuePtr(PairIndex);
+			return ApplyPatchV2Recursive(
+				MapProperty->ValueProp,
+				MapValuePtr,
+				PathTokens,
+				TokenIndex + 1,
+				Operation,
+				ValueJson,
+				OutChangedProperties,
+				RootPropertyName,
+				OutDiagnostic);
+		}
+
+		if (FSetProperty* SetProperty = CastField<FSetProperty>(CurrentProperty))
+		{
+			FScriptSetHelper SetHelper(SetProperty, CurrentValuePtr);
+			if (TokenIndex < PathTokens.Num() - 1)
+			{
+				OutDiagnostic.Code = MCPErrorCodes::SERIALIZE_UNSUPPORTED_TYPE;
+				OutDiagnostic.Message = TEXT("Nested set traversal is not supported.");
+				OutDiagnostic.Detail = CurrentToken;
+				return false;
+			}
+
+			if (bIsRemove)
+			{
+				for (int32 Index = 0; Index < SetHelper.GetMaxIndex(); ++Index)
+				{
+					if (!SetHelper.IsValidIndex(Index))
+					{
+						continue;
+					}
+					FString ExportedValue;
+					SetProperty->ElementProp->ExportTextItem_Direct(ExportedValue, SetHelper.GetElementPtr(Index), nullptr, nullptr, PPF_None);
+					if (ExportedValue.Equals(CurrentToken, ESearchCase::CaseSensitive) || ExportedValue.Equals(CurrentToken, ESearchCase::IgnoreCase))
+					{
+						SetHelper.RemoveAt(Index);
+						OutChangedProperties.AddUnique(RootPropertyName);
+						return true;
+					}
+				}
+
+				OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+				OutDiagnostic.Message = TEXT("Set element is not found.");
+				OutDiagnostic.Detail = CurrentToken;
+				return false;
+			}
+
+			if (Operation.Equals(TEXT("add"), ESearchCase::IgnoreCase) || Operation.Equals(TEXT("replace"), ESearchCase::IgnoreCase))
+			{
+				const int32 NewIndex = SetHelper.AddDefaultValue_Invalid_NeedsRehash();
+				void* ElementPtr = SetHelper.GetElementPtr(NewIndex);
+				if (!JsonValueToProperty(SetProperty->ElementProp, ElementPtr, ValueJson, OutDiagnostic))
+				{
+					SetHelper.RemoveAt(NewIndex);
+					return false;
+				}
+				SetHelper.Rehash();
+				OutChangedProperties.AddUnique(RootPropertyName);
+				return true;
+			}
+
+			OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+			OutDiagnostic.Message = TEXT("Unsupported operation for set property.");
+			OutDiagnostic.Detail = Operation;
+			return false;
+		}
+
+		OutDiagnostic.Code = MCPErrorCodes::SERIALIZE_UNSUPPORTED_TYPE;
+		OutDiagnostic.Message = TEXT("Patch path traversal is unsupported for this property type.");
+		OutDiagnostic.Detail = CurrentProperty->GetCPPType();
+		return false;
+	}
+
 	AActor* ResolveActorByPath(UWorld* World, const FString& ActorPath, const FString& ActorGuid)
 	{
 		if (World == nullptr)
@@ -749,6 +1182,111 @@ bool MCPObjectUtils::ApplyPatch(
 		}
 
 		OutChangedProperties.AddUnique(PropertyName);
+	}
+
+	return true;
+}
+
+bool MCPObjectUtils::ApplyPatchV2(
+	UObject* TargetObject,
+	const TArray<TSharedPtr<FJsonValue>>* PatchOperations,
+	TArray<FString>& OutChangedProperties,
+	FMCPDiagnostic& OutDiagnostic)
+{
+	OutChangedProperties.Reset();
+
+	if (TargetObject == nullptr || PatchOperations == nullptr)
+	{
+		OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+		OutDiagnostic.Message = TEXT("Patch target and patch operations are required.");
+		return false;
+	}
+
+	for (const TSharedPtr<FJsonValue>& PatchValue : *PatchOperations)
+	{
+		if (!PatchValue.IsValid() || PatchValue->Type != EJson::Object)
+		{
+			OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+			OutDiagnostic.Message = TEXT("Patch entry must be a JSON object.");
+			return false;
+		}
+
+		const TSharedPtr<FJsonObject> PatchObject = PatchValue->AsObject();
+		FString Operation;
+		FString Path;
+		PatchObject->TryGetStringField(TEXT("op"), Operation);
+		PatchObject->TryGetStringField(TEXT("path"), Path);
+
+		if (Operation.IsEmpty() || Path.IsEmpty())
+		{
+			OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+			OutDiagnostic.Message = TEXT("Patch entry requires op and path.");
+			return false;
+		}
+
+		TArray<FString> Tokens;
+		Path.ParseIntoArray(Tokens, TEXT("/"), true);
+		if (Tokens.Num() == 0)
+		{
+			OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+			OutDiagnostic.Message = TEXT("Patch path is invalid.");
+			OutDiagnostic.Detail = Path;
+			return false;
+		}
+
+		for (FString& Token : Tokens)
+		{
+			Token = DecodePointerToken(Token);
+		}
+
+		const FString RootPropertyName = Tokens[0];
+		FProperty* RootProperty = TargetObject->GetClass()->FindPropertyByName(FName(*RootPropertyName));
+		if (RootProperty == nullptr)
+		{
+			OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+			OutDiagnostic.Message = TEXT("Patch path does not match a property.");
+			OutDiagnostic.Detail = Path;
+			return false;
+		}
+
+		if (!RootProperty->HasAnyPropertyFlags(CPF_Edit))
+		{
+			OutDiagnostic.Code = MCPErrorCodes::PROPERTY_NOT_EDITABLE;
+			OutDiagnostic.Message = TEXT("Property is not editable.");
+			OutDiagnostic.Detail = RootPropertyName;
+			return false;
+		}
+
+		void* RootValuePtr = RootProperty->ContainerPtrToValuePtr<void>(TargetObject);
+		const TSharedPtr<FJsonValue>* ValueJson = PatchObject->Values.Find(TEXT("value"));
+		const bool bNeedsValue =
+			Operation.Equals(TEXT("add"), ESearchCase::IgnoreCase)
+			|| Operation.Equals(TEXT("replace"), ESearchCase::IgnoreCase)
+			|| Operation.Equals(TEXT("merge"), ESearchCase::IgnoreCase)
+			|| Operation.Equals(TEXT("inc"), ESearchCase::IgnoreCase)
+			|| Operation.Equals(TEXT("test"), ESearchCase::IgnoreCase);
+
+		if (bNeedsValue && (ValueJson == nullptr || !ValueJson->IsValid()))
+		{
+			OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+			OutDiagnostic.Message = TEXT("Patch operation requires value.");
+			OutDiagnostic.Detail = Path;
+			return false;
+		}
+
+		if (!ApplyPatchV2Recursive(
+			RootProperty,
+			RootValuePtr,
+			Tokens,
+			1,
+			Operation,
+			bNeedsValue ? *ValueJson : nullptr,
+			OutChangedProperties,
+			RootPropertyName,
+			OutDiagnostic))
+		{
+			return false;
+		}
 	}
 
 	return true;
