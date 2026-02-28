@@ -947,7 +947,8 @@ TArray<FString> UMCPToolRegistrySubsystem::GetCapabilities() const
 		TEXT("event_stream_v1"),
 		TEXT("observability_metrics_v1"),
 		TEXT("event_stream_ws_push_v1"),
-		TEXT("live_coding_compile_v1")
+		TEXT("live_coding_compile_v1"),
+		TEXT("umg_widget_event_k2_v1")
 	};
 }
 

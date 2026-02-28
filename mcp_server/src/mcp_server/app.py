@@ -18,6 +18,7 @@ from mcp_server.metrics import RuntimeMetrics
 from mcp_server.request_broker import RequestBroker
 from mcp_server.tool_catalog import ToolCatalog
 from mcp_server.tool_passthrough import CatalogGuardError, MCPPassThroughService, UnknownToolError
+from mcp_server.umg_orchestrator import UMGOrchestrationService
 from mcp_server.ue_transport import UeWsTransport
 from mcp_server.ws_endpoint import (
     WsEndpointCandidate,
@@ -110,6 +111,7 @@ async def run(
         fail_on_schema_change=config.catalog.fail_on_schema_change,
         metrics=metrics,
     )
+    umg_orchestration = UMGOrchestrationService(pass_through)
 
     stop_event = asyncio.Event()
     metrics_task: asyncio.Task[None] | None = None
@@ -173,6 +175,7 @@ async def run(
                 "schema_hash": pass_through.schema_hash,
                 "last_refresh_ms": pass_through.last_refresh_ms,
                 "tools": pass_through.list_tools_as_dict(),
+                "virtual_tools": umg_orchestration.list_virtual_tools(),
             }
             print(json.dumps(payload, ensure_ascii=False))
             _maybe_print_metrics(
@@ -185,32 +188,46 @@ async def run(
         if call_tool:
             try:
                 if stream_events:
-                    def _print_event(event: dict[str, object]) -> None:
-                        print(
-                            json.dumps(
-                                {
-                                    "type": "event",
-                                    "event": event,
-                                },
-                                ensure_ascii=False,
-                            ),
-                            flush=True,
+                    if umg_orchestration.is_virtual_tool(call_tool):
+                        call_result = await umg_orchestration.call_virtual_tool(
+                            tool_name=call_tool,
+                            arguments=call_tool_params or {},
+                            request_id=f"cli-{call_tool}",
                         )
+                    else:
+                        def _print_event(event: dict[str, object]) -> None:
+                            print(
+                                json.dumps(
+                                    {
+                                        "type": "event",
+                                        "event": event,
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                                flush=True,
+                            )
 
-                    call_result = await pass_through.call_tool_stream(
-                        tool=call_tool,
-                        params=call_tool_params or {},
-                        context=call_tool_context or {},
-                        timeout_ms=call_tool_timeout_ms,
-                        on_event=_print_event,
-                    )
+                        call_result = await pass_through.call_tool_stream(
+                            tool=call_tool,
+                            params=call_tool_params or {},
+                            context=call_tool_context or {},
+                            timeout_ms=call_tool_timeout_ms,
+                            on_event=_print_event,
+                        )
                 else:
-                    call_result = await pass_through.call_tool(
-                        tool=call_tool,
-                        params=call_tool_params or {},
-                        context=call_tool_context or {},
-                        timeout_ms=call_tool_timeout_ms,
-                    )
+                    if umg_orchestration.is_virtual_tool(call_tool):
+                        call_result = await umg_orchestration.call_virtual_tool(
+                            tool_name=call_tool,
+                            arguments=call_tool_params or {},
+                            request_id=f"cli-{call_tool}",
+                        )
+                    else:
+                        call_result = await pass_through.call_tool(
+                            tool=call_tool,
+                            params=call_tool_params or {},
+                            context=call_tool_context or {},
+                            timeout_ms=call_tool_timeout_ms,
+                        )
             except UnknownToolError as exc:
                 LOGGER.error("%s", exc)
                 _print_error_payload(

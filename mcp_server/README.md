@@ -39,9 +39,11 @@ UnrealMCP UE 5.7 플러그인과 AI Agent를 연결하는 MCP 서버 구현 디�
   - `python examples/agent_tool_client.py --config configs/config.yaml --tool mat.instance.params.get --params-json '{"object_path":"/Game/Materials/MI_Test.MI_Test"}'`
 - 이벤트 스트리밍 호출:
   - `python examples/agent_tool_client.py --config configs/config.yaml --tool system.health --stream-events`
+- 서버 오케스트레이션 helper 호출(virtual tool):
+  - `python examples/agent_tool_client.py --config configs/config.yaml --tool umg.workflow.compose --params-json '{"object_path":"/Game/UI/WBP_Test.WBP_Test","actions":[{"kind":"widget.patch","args":{"widget_ref":{"name":"RootCanvas"},"patch":[{"op":"replace","path":"/RenderOpacity","value":0.75}]}}]}'`
 
-## E2E 스모크 러너(mat/niagara/umg + asset lifecycle)
-- 자동 asset.find 탐색 + 4개 시나리오 실행(`material`, `niagara`, `umg`, `asset_lifecycle`):
+## E2E 스모크 러너(mat/niagara/umg + umg_extended + asset lifecycle)
+- 자동 asset.find 탐색 + 5개 시나리오 실행(`material`, `niagara`, `umg`, `umg_extended`, `asset_lifecycle`):
   - `python examples/e2e_smoke_runner.py --config configs/config.yaml --stream-events`
 - 경로 직접 지정 + 전체 필수 검증:
   - `python examples/e2e_smoke_runner.py --config configs/config.yaml --material-path "/Game/Materials/MI_Test.MI_Test" --niagara-path "/Game/VFX/NS_Test.NS_Test" --umg-path "/Game/UI/WBP_Test.WBP_Test" --require-all`
@@ -51,6 +53,8 @@ UnrealMCP UE 5.7 플러그인과 AI Agent를 연결하는 MCP 서버 구현 디�
   - `python examples/e2e_smoke_runner.py --config configs/config.yaml --skip-asset-lifecycle`
 - asset lifecycle 결과 에셋 유지(기본은 정리/삭제):
   - `python examples/e2e_smoke_runner.py --config configs/config.yaml --asset-lifecycle-keep-assets`
+- `umg_extended`는 `umg.widget.inspect`, `umg.slot.inspect`, `umg.binding.list`, `umg.animation.list`, `umg.graph.summary` 및
+  가능한 경우 `umg.widget.event.bind/unbind`까지 검증합니다.
 - 출력은 단일 JSON 요약이며 `scenarios[*]`에 `status/duration_ms/event_count/summary`가 기록됩니다.
 - 실제 툴 결과(JSON payload)까지 보고 싶으면 `--include-result`를 추가합니다(출력이 커질 수 있음).
 

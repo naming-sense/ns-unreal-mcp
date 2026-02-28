@@ -4143,6 +4143,15 @@
         "compile_on_success": {
           "type": "boolean",
           "default": true
+        },
+        "save": {
+          "type": "object",
+          "properties": {
+            "auto_save": {
+              "type": "boolean",
+              "default": false
+            }
+          }
         }
       },
       "required": [
@@ -4912,6 +4921,12 @@
         "binding_index": {
           "type": "integer"
         },
+        "already_bound": {
+          "type": "boolean"
+        },
+        "binding_kind": {
+          "type": "string"
+        },
         "compile": {
           "type": "object"
         },
@@ -5041,6 +5056,15 @@
         "compile_on_success": {
           "type": "boolean",
           "default": true
+        },
+        "save": {
+          "type": "object",
+          "properties": {
+            "auto_save": {
+              "type": "boolean",
+              "default": false
+            }
+          }
         }
       },
       "required": [

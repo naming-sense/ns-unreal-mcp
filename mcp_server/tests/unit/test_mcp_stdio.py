@@ -27,6 +27,7 @@ from mcp_server.tool_passthrough import UnknownToolError
 class FakePassThrough:
     def __init__(self) -> None:
         self.call_requests: list[dict[str, Any]] = []
+        self.capabilities: tuple[str, ...] = ()
         self._tools = [
             ToolDefinition(
                 name="system.health",
@@ -41,6 +42,12 @@ class FakePassThrough:
 
     def list_tools(self) -> list[ToolDefinition]:
         return self._tools
+
+    def has_capability(self, capability: str) -> bool:
+        return capability in self.capabilities
+
+    def add_tool(self, tool: ToolDefinition) -> None:
+        self._tools.append(tool)
 
     async def call_tool(
         self,
@@ -167,9 +174,9 @@ async def test_initialize_then_tools_list() -> None:
     )
 
     tools = list_response["result"]["tools"]
-    assert len(tools) == 1
-    assert tools[0]["name"] == "system.health"
-    assert tools[0]["annotations"]["readOnlyHint"] is True
+    tool_names = {tool["name"] for tool in tools}
+    assert "system.health" in tool_names
+    assert "umg.workflow.compose" in tool_names
 
 
 @pytest.mark.asyncio
@@ -261,6 +268,59 @@ async def test_tools_call_rejects_non_object_arguments() -> None:
     )
 
     assert response["error"]["code"] == JSONRPC_INVALID_PARAMS
+
+
+@pytest.mark.asyncio
+async def test_tools_call_virtual_umg_workflow_compose() -> None:
+    fake = FakePassThrough()
+    fake.add_tool(
+        ToolDefinition(
+            name="umg.widget.patch",
+            domain="umg",
+            version="1.0.0",
+            enabled=True,
+            write=True,
+            params_schema={"type": "object"},
+            result_schema={"type": "object"},
+        )
+    )
+
+    dispatcher = MCPRequestDispatcher(fake)  # type: ignore[arg-type]
+    await dispatcher.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "2025-03-26"},
+        }
+    )
+
+    response = await dispatcher.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "tools/call",
+            "params": {
+                "name": "umg.workflow.compose",
+                "arguments": {
+                    "object_path": "/Game/UI/WBP_Test.WBP_Test",
+                    "actions": [
+                        {
+                            "kind": "widget.patch",
+                            "args": {
+                                "widget_ref": {"name": "RootCanvas"},
+                                "patch": [{"op": "replace", "path": "/RenderOpacity", "value": 0.5}],
+                            },
+                        }
+                    ],
+                },
+            },
+        }
+    )
+
+    assert response["result"]["isError"] is False
+    assert response["result"]["structuredContent"]["status"] == "ok"
+    assert fake.call_requests[-1]["tool"] == "umg.widget.patch"
 
 
 def test_build_endpoint_listing_payload_includes_selector_hint(tmp_path: Path) -> None:

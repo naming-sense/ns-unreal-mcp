@@ -10,6 +10,7 @@
 #include "Components/Widget.h"
 #include "Engine/Blueprint.h"
 #include "EdGraph/EdGraph.h"
+#include "K2Node_ComponentBoundEvent.h"
 #include "UObject/UnrealType.h"
 #include "WidgetBlueprint.h"
 #include "UObject/UObjectIterator.h"
@@ -1001,6 +1002,7 @@ bool FMCPToolsUMGReadHandler::HandleGraphSummary(const FMCPRequestEnvelope& Requ
 		FArrayProperty* ArrayProperty = FindFProperty<FArrayProperty>(Blueprint->GetClass(), PropertyName);
 		int32 Count = 0;
 		int32 NodeCount = 0;
+		int32 BoundEventCount = 0;
 		TArray<TSharedPtr<FJsonValue>> Names;
 		if (ArrayProperty != nullptr && ArrayProperty->Inner->IsA<FObjectPropertyBase>())
 		{
@@ -1018,6 +1020,13 @@ bool FMCPToolsUMGReadHandler::HandleGraphSummary(const FMCPRequestEnvelope& Requ
 
 				++Count;
 				NodeCount += Graph->Nodes.Num();
+				for (const UEdGraphNode* Node : Graph->Nodes)
+				{
+					if (Cast<UK2Node_ComponentBoundEvent>(Node) != nullptr)
+					{
+						++BoundEventCount;
+					}
+				}
 				if (bIncludeNames)
 				{
 					Names.Add(MakeShared<FJsonValueString>(Graph->GetName()));
@@ -1027,6 +1036,7 @@ bool FMCPToolsUMGReadHandler::HandleGraphSummary(const FMCPRequestEnvelope& Requ
 
 		OutSummary->SetNumberField(TEXT("graph_count"), Count);
 		OutSummary->SetNumberField(TEXT("node_count"), NodeCount);
+		OutSummary->SetNumberField(TEXT("bound_event_count"), BoundEventCount);
 		if (bIncludeNames)
 		{
 			OutSummary->SetArrayField(TEXT("names"), Names);

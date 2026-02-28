@@ -5,6 +5,8 @@
 #include "Tools/Common/MCPToolCommonJson.h"
 #include "Blueprint/WidgetTree.h"
 #include "Components/Widget.h"
+#include "EdGraph/EdGraph.h"
+#include "K2Node_ComponentBoundEvent.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/KismetEditorUtilities.h"
 #include "ScopedTransaction.h"
@@ -201,6 +203,75 @@ namespace
 
 		OutArrayPtr = OutArrayProperty->ContainerPtrToValuePtr<void>(WidgetBlueprint);
 		return OutArrayPtr != nullptr;
+	}
+
+	FObjectProperty* FindWidgetVariableProperty(UWidgetBlueprint* WidgetBlueprint, const UWidget* Widget)
+	{
+		if (WidgetBlueprint == nullptr || Widget == nullptr)
+		{
+			return nullptr;
+		}
+
+		const FName WidgetName = Widget->GetFName();
+		if (WidgetName.IsNone())
+		{
+			return nullptr;
+		}
+
+		if (WidgetBlueprint->SkeletonGeneratedClass != nullptr)
+		{
+			if (FObjectProperty* SkeletonProperty = FindFProperty<FObjectProperty>(WidgetBlueprint->SkeletonGeneratedClass, WidgetName))
+			{
+				return SkeletonProperty;
+			}
+		}
+
+		if (WidgetBlueprint->GeneratedClass != nullptr)
+		{
+			if (FObjectProperty* GeneratedProperty = FindFProperty<FObjectProperty>(WidgetBlueprint->GeneratedClass, WidgetName))
+			{
+				return GeneratedProperty;
+			}
+		}
+
+		return nullptr;
+	}
+
+	FString ResolveEventFunctionName(const UK2Node_ComponentBoundEvent* EventNode)
+	{
+		if (EventNode == nullptr)
+		{
+			return FString();
+		}
+
+		if (!EventNode->CustomFunctionName.IsNone())
+		{
+			return EventNode->CustomFunctionName.ToString();
+		}
+
+		return EventNode->GetFunctionName().ToString();
+	}
+
+	void GatherWidgetDelegateEventNames(UClass* WidgetClass, TArray<FString>& OutEventNames)
+	{
+		OutEventNames.Reset();
+		if (WidgetClass == nullptr)
+		{
+			return;
+		}
+
+		for (TFieldIterator<FMulticastDelegateProperty> It(WidgetClass, EFieldIteratorFlags::IncludeSuper); It; ++It)
+		{
+			const FMulticastDelegateProperty* DelegateProperty = *It;
+			if (DelegateProperty == nullptr)
+			{
+				continue;
+			}
+
+			OutEventNames.Add(DelegateProperty->GetName());
+		}
+
+		OutEventNames.Sort();
 	}
 }
 
@@ -480,8 +551,19 @@ bool FMCPToolsUMGBindingHandler::HandleWidgetEventBind(
 		return false;
 	}
 
+	FString ObjectPath;
+	const TSharedPtr<FJsonObject>* WidgetRef = nullptr;
 	FString EventName;
+	FString FunctionName;
+	bool bCompileOnSuccess = true;
+	bool bAutoSave = false;
+	Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
+	Request.Params->TryGetObjectField(TEXT("widget_ref"), WidgetRef);
 	Request.Params->TryGetStringField(TEXT("event_name"), EventName);
+	Request.Params->TryGetStringField(TEXT("function_name"), FunctionName);
+	Request.Params->TryGetBoolField(TEXT("compile_on_success"), bCompileOnSuccess);
+	ParseAutoSaveOption(Request.Params, bAutoSave);
+
 	if (EventName.IsEmpty())
 	{
 		FMCPDiagnostic Diagnostic;
@@ -491,26 +573,169 @@ bool FMCPToolsUMGBindingHandler::HandleWidgetEventBind(
 		OutResult.Status = EMCPResponseStatus::Error;
 		return false;
 	}
-
-	FMCPRequestEnvelope DelegatedRequest = Request;
-	DelegatedRequest.Tool = TEXT("umg.binding.set");
-	DelegatedRequest.Params = MakeShared<FJsonObject>();
-	FString ObjectPath;
-	Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
-	DelegatedRequest.Params->SetStringField(TEXT("object_path"), ObjectPath);
-	const TSharedPtr<FJsonObject>* WidgetRef = nullptr;
-	if (Request.Params->TryGetObjectField(TEXT("widget_ref"), WidgetRef) && WidgetRef != nullptr && WidgetRef->IsValid())
+	if (ObjectPath.IsEmpty() || WidgetRef == nullptr || !WidgetRef->IsValid() || FunctionName.IsEmpty())
 	{
-		DelegatedRequest.Params->SetObjectField(TEXT("widget_ref"), *WidgetRef);
+		FMCPDiagnostic Diagnostic;
+		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+		Diagnostic.Message = TEXT("object_path, widget_ref, event_name, and function_name are required for umg.widget.event.bind.");
+		OutResult.Diagnostics.Add(Diagnostic);
+		OutResult.Status = EMCPResponseStatus::Error;
+		return false;
 	}
-	DelegatedRequest.Params->SetStringField(TEXT("property_name"), EventName);
-	FString FunctionName;
-	Request.Params->TryGetStringField(TEXT("function_name"), FunctionName);
-	DelegatedRequest.Params->SetStringField(TEXT("function_name"), FunctionName);
-	bool bCompileOnSuccess = true;
-	Request.Params->TryGetBoolField(TEXT("compile_on_success"), bCompileOnSuccess);
-	DelegatedRequest.Params->SetBoolField(TEXT("compile_on_success"), bCompileOnSuccess);
-	return HandleBindingSet(DelegatedRequest, OutResult, SavePackageByName);
+
+	UWidgetBlueprint* WidgetBlueprint = LoadWidgetBlueprintByPath(ObjectPath);
+	UWidget* Widget = ResolveWidgetFromRef(WidgetBlueprint, WidgetRef);
+	if (WidgetBlueprint == nullptr || Widget == nullptr)
+	{
+		FMCPDiagnostic Diagnostic;
+		Diagnostic.Code = MCPErrorCodes::OBJECT_NOT_FOUND;
+		Diagnostic.Message = TEXT("Widget blueprint or widget_ref target not found.");
+		Diagnostic.Detail = FString::Printf(TEXT("object_path=%s"), *ObjectPath);
+		OutResult.Diagnostics.Add(Diagnostic);
+		OutResult.Status = EMCPResponseStatus::Error;
+		return false;
+	}
+
+	const FName EventNameFName(*EventName);
+	FMulticastDelegateProperty* DelegateProperty = FindFProperty<FMulticastDelegateProperty>(Widget->GetClass(), EventNameFName);
+	if (DelegateProperty == nullptr)
+	{
+		TArray<FString> SupportedEvents;
+		GatherWidgetDelegateEventNames(Widget->GetClass(), SupportedEvents);
+
+		FMCPDiagnostic Diagnostic;
+		Diagnostic.Code = TEXT("MCP.UMG.EVENT.NOT_SUPPORTED");
+		Diagnostic.Message = TEXT("event_name is not a multicast delegate on the target widget class.");
+		Diagnostic.Detail = FString::Printf(TEXT("widget=%s class=%s event=%s"), *Widget->GetName(), *Widget->GetClass()->GetPathName(), *EventName);
+		Diagnostic.Suggestion = SupportedEvents.Num() > 0
+			? FString::Printf(TEXT("Use one of supported events: %s"), *FString::Join(SupportedEvents, TEXT(", ")))
+			: TEXT("Target widget class does not expose bindable multicast delegate events.");
+		OutResult.Diagnostics.Add(Diagnostic);
+		OutResult.Status = EMCPResponseStatus::Error;
+		return false;
+	}
+
+	FObjectProperty* ComponentProperty = FindWidgetVariableProperty(WidgetBlueprint, Widget);
+	if (ComponentProperty == nullptr)
+	{
+		FMCPDiagnostic Diagnostic;
+		Diagnostic.Code = TEXT("MCP.UMG.WIDGET_VARIABLE_REQUIRED");
+		Diagnostic.Message = TEXT("Target widget must be exposed as variable to bind blueprint events.");
+		Diagnostic.Detail = FString::Printf(TEXT("widget=%s"), *Widget->GetName());
+		Diagnostic.Suggestion = TEXT("Enable 'Is Variable' for the widget and retry.");
+		OutResult.Diagnostics.Add(Diagnostic);
+		OutResult.Status = EMCPResponseStatus::Error;
+		return false;
+	}
+
+	TArray<UK2Node_ComponentBoundEvent*> ExistingNodes;
+	FKismetEditorUtilities::FindAllBoundEventsForComponent(WidgetBlueprint, ComponentProperty->GetFName(), ExistingNodes);
+
+	UK2Node_ComponentBoundEvent* MatchingNode = nullptr;
+	bool bEventAlreadyBound = false;
+	for (UK2Node_ComponentBoundEvent* CandidateNode : ExistingNodes)
+	{
+		if (CandidateNode == nullptr || CandidateNode->DelegatePropertyName != DelegateProperty->GetFName())
+		{
+			continue;
+		}
+
+		bEventAlreadyBound = true;
+		const FString CandidateFunctionName = ResolveEventFunctionName(CandidateNode);
+		if (CandidateFunctionName.Equals(FunctionName, ESearchCase::IgnoreCase))
+		{
+			MatchingNode = CandidateNode;
+			break;
+		}
+	}
+
+	const bool bAlreadyBoundBefore = MatchingNode != nullptr || bEventAlreadyBound;
+	if (MatchingNode == nullptr && bEventAlreadyBound)
+	{
+		FMCPDiagnostic Diagnostic;
+		Diagnostic.Code = MCPErrorCodes::IDEMPOTENCY_CONFLICT;
+		Diagnostic.Message = TEXT("event_name already bound to another function on this widget.");
+		Diagnostic.Detail = FString::Printf(TEXT("widget=%s event=%s function=%s"), *Widget->GetName(), *EventName, *FunctionName);
+		Diagnostic.Suggestion = TEXT("Use umg.widget.event.unbind first, then bind desired function.");
+		OutResult.Diagnostics.Add(Diagnostic);
+		OutResult.Status = EMCPResponseStatus::Error;
+		return false;
+	}
+
+	if (!Request.Context.bDryRun && MatchingNode == nullptr)
+	{
+		FScopedTransaction Transaction(FText::FromString(TEXT("MCP UMG Widget Event Bind")));
+		WidgetBlueprint->Modify();
+
+		FKismetEditorUtilities::CreateNewBoundEventForClass(
+			Widget->GetClass(),
+			DelegateProperty->GetFName(),
+			WidgetBlueprint,
+			ComponentProperty);
+
+		MatchingNode = const_cast<UK2Node_ComponentBoundEvent*>(
+			FKismetEditorUtilities::FindBoundEventForComponent(
+				WidgetBlueprint,
+				DelegateProperty->GetFName(),
+				ComponentProperty->GetFName()));
+
+		if (MatchingNode == nullptr)
+		{
+			FMCPDiagnostic Diagnostic;
+			Diagnostic.Code = TEXT("MCP.UMG.EVENT.BIND_FAILED");
+			Diagnostic.Message = TEXT("Failed to create component bound event node.");
+			Diagnostic.Detail = FString::Printf(TEXT("widget=%s event=%s"), *Widget->GetName(), *EventName);
+			OutResult.Diagnostics.Add(Diagnostic);
+			OutResult.Status = EMCPResponseStatus::Error;
+			return false;
+		}
+
+		MatchingNode->Modify();
+		MatchingNode->CustomFunctionName = FName(*FunctionName);
+		MatchingNode->bOverrideFunction = false;
+
+		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WidgetBlueprint);
+		WidgetBlueprint->MarkPackageDirty();
+	}
+
+	const FString ResolvedFunctionName = MatchingNode != nullptr
+		? ResolveEventFunctionName(MatchingNode)
+		: FunctionName;
+
+	TSharedRef<FJsonObject> CompileObject = MakeShared<FJsonObject>();
+	if (bCompileOnSuccess && !Request.Context.bDryRun)
+	{
+		FKismetEditorUtilities::CompileBlueprint(WidgetBlueprint);
+		CompileObject->SetStringField(TEXT("status"), TEXT("requested"));
+	}
+	else
+	{
+		CompileObject->SetStringField(TEXT("status"), TEXT("skipped"));
+	}
+
+	MCPObjectUtils::AppendTouchedPackage(WidgetBlueprint, OutResult.TouchedPackages);
+	bool bAllSaved = true;
+	if (!Request.Context.bDryRun && bAutoSave)
+	{
+		for (const FString& PackageName : OutResult.TouchedPackages)
+		{
+			bAllSaved &= SavePackageByName(PackageName, OutResult);
+		}
+	}
+
+	OutResult.ResultObject = MakeShared<FJsonObject>();
+	OutResult.ResultObject->SetBoolField(TEXT("bound"), !Request.Context.bDryRun);
+	OutResult.ResultObject->SetBoolField(TEXT("dry_run"), Request.Context.bDryRun);
+	OutResult.ResultObject->SetStringField(TEXT("object_name"), Widget->GetName());
+	OutResult.ResultObject->SetStringField(TEXT("property_name"), DelegateProperty->GetFName().ToString());
+	OutResult.ResultObject->SetStringField(TEXT("function_name"), ResolvedFunctionName);
+	OutResult.ResultObject->SetNumberField(TEXT("binding_index"), -1);
+	OutResult.ResultObject->SetBoolField(TEXT("already_bound"), bAlreadyBoundBefore);
+	OutResult.ResultObject->SetStringField(TEXT("binding_kind"), TEXT("k2_component_bound_event"));
+	OutResult.ResultObject->SetObjectField(TEXT("compile"), CompileObject);
+	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), MCPToolCommonJson::ToJsonStringArray(OutResult.TouchedPackages));
+	OutResult.Status = bAllSaved ? EMCPResponseStatus::Ok : EMCPResponseStatus::Partial;
+	return true;
 }
 
 bool FMCPToolsUMGBindingHandler::HandleWidgetEventUnbind(
@@ -528,31 +753,142 @@ bool FMCPToolsUMGBindingHandler::HandleWidgetEventUnbind(
 		return false;
 	}
 
-	FMCPRequestEnvelope DelegatedRequest = Request;
-	DelegatedRequest.Tool = TEXT("umg.binding.clear");
-	DelegatedRequest.Params = MakeShared<FJsonObject>();
 	FString ObjectPath;
-	Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
-	DelegatedRequest.Params->SetStringField(TEXT("object_path"), ObjectPath);
 	const TSharedPtr<FJsonObject>* WidgetRef = nullptr;
-	if (Request.Params->TryGetObjectField(TEXT("widget_ref"), WidgetRef) && WidgetRef != nullptr && WidgetRef->IsValid())
-	{
-		DelegatedRequest.Params->SetObjectField(TEXT("widget_ref"), *WidgetRef);
-	}
 	FString EventName;
-	Request.Params->TryGetStringField(TEXT("event_name"), EventName);
-	if (!EventName.IsEmpty())
-	{
-		DelegatedRequest.Params->SetStringField(TEXT("property_name"), EventName);
-	}
 	FString FunctionName;
-	Request.Params->TryGetStringField(TEXT("function_name"), FunctionName);
-	if (!FunctionName.IsEmpty())
-	{
-		DelegatedRequest.Params->SetStringField(TEXT("function_name"), FunctionName);
-	}
 	bool bCompileOnSuccess = true;
+	bool bAutoSave = false;
+	Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
+	Request.Params->TryGetObjectField(TEXT("widget_ref"), WidgetRef);
+	Request.Params->TryGetStringField(TEXT("event_name"), EventName);
+	Request.Params->TryGetStringField(TEXT("function_name"), FunctionName);
 	Request.Params->TryGetBoolField(TEXT("compile_on_success"), bCompileOnSuccess);
-	DelegatedRequest.Params->SetBoolField(TEXT("compile_on_success"), bCompileOnSuccess);
-	return HandleBindingClear(DelegatedRequest, OutResult, SavePackageByName);
+	ParseAutoSaveOption(Request.Params, bAutoSave);
+
+	if (ObjectPath.IsEmpty() || WidgetRef == nullptr || !WidgetRef->IsValid())
+	{
+		FMCPDiagnostic Diagnostic;
+		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
+		Diagnostic.Message = TEXT("object_path and widget_ref are required for umg.widget.event.unbind.");
+		OutResult.Diagnostics.Add(Diagnostic);
+		OutResult.Status = EMCPResponseStatus::Error;
+		return false;
+	}
+
+	UWidgetBlueprint* WidgetBlueprint = LoadWidgetBlueprintByPath(ObjectPath);
+	UWidget* Widget = ResolveWidgetFromRef(WidgetBlueprint, WidgetRef);
+	if (WidgetBlueprint == nullptr || Widget == nullptr)
+	{
+		FMCPDiagnostic Diagnostic;
+		Diagnostic.Code = MCPErrorCodes::OBJECT_NOT_FOUND;
+		Diagnostic.Message = TEXT("Widget blueprint or widget_ref target not found.");
+		Diagnostic.Detail = FString::Printf(TEXT("object_path=%s"), *ObjectPath);
+		OutResult.Diagnostics.Add(Diagnostic);
+		OutResult.Status = EMCPResponseStatus::Error;
+		return false;
+	}
+
+	FObjectProperty* ComponentProperty = FindWidgetVariableProperty(WidgetBlueprint, Widget);
+	if (ComponentProperty == nullptr)
+	{
+		OutResult.ResultObject = MakeShared<FJsonObject>();
+		OutResult.ResultObject->SetBoolField(TEXT("dry_run"), Request.Context.bDryRun);
+		OutResult.ResultObject->SetNumberField(TEXT("removed_count"), 0);
+		OutResult.ResultObject->SetArrayField(TEXT("removed"), TArray<TSharedPtr<FJsonValue>>());
+		OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), TArray<TSharedPtr<FJsonValue>>());
+		OutResult.Status = EMCPResponseStatus::Ok;
+		return true;
+	}
+
+	const FName EventNameFilter = EventName.IsEmpty() ? NAME_None : FName(*EventName);
+	const bool bHasFunctionFilter = !FunctionName.IsEmpty();
+
+	TArray<UK2Node_ComponentBoundEvent*> ExistingNodes;
+	FKismetEditorUtilities::FindAllBoundEventsForComponent(WidgetBlueprint, ComponentProperty->GetFName(), ExistingNodes);
+
+	TArray<UK2Node_ComponentBoundEvent*> RemoveNodes;
+	TArray<TSharedPtr<FJsonValue>> RemovedEntries;
+	for (UK2Node_ComponentBoundEvent* Node : ExistingNodes)
+	{
+		if (Node == nullptr)
+		{
+			continue;
+		}
+
+		if (!EventNameFilter.IsNone() && Node->DelegatePropertyName != EventNameFilter)
+		{
+			continue;
+		}
+
+		const FString NodeFunctionName = ResolveEventFunctionName(Node);
+		if (bHasFunctionFilter && !NodeFunctionName.Equals(FunctionName, ESearchCase::IgnoreCase))
+		{
+			continue;
+		}
+
+		TSharedRef<FJsonObject> RemovedObject = MakeShared<FJsonObject>();
+		RemovedObject->SetStringField(TEXT("object_name"), Widget->GetName());
+		RemovedObject->SetStringField(TEXT("event_name"), Node->DelegatePropertyName.ToString());
+		RemovedObject->SetStringField(TEXT("function_name"), NodeFunctionName);
+		RemovedEntries.Add(MakeShared<FJsonValueObject>(RemovedObject));
+
+		RemoveNodes.Add(Node);
+	}
+
+	if (!Request.Context.bDryRun && RemoveNodes.Num() > 0)
+	{
+		FScopedTransaction Transaction(FText::FromString(TEXT("MCP UMG Widget Event Unbind")));
+		WidgetBlueprint->Modify();
+
+		for (UK2Node_ComponentBoundEvent* Node : RemoveNodes)
+		{
+			if (Node == nullptr)
+			{
+				continue;
+			}
+
+			UEdGraph* Graph = Node->GetGraph();
+			if (Graph != nullptr)
+			{
+				Graph->Modify();
+			}
+
+			Node->Modify();
+			Node->DestroyNode();
+		}
+
+		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WidgetBlueprint);
+		WidgetBlueprint->MarkPackageDirty();
+	}
+
+	TSharedRef<FJsonObject> CompileObject = MakeShared<FJsonObject>();
+	if (bCompileOnSuccess && !Request.Context.bDryRun)
+	{
+		FKismetEditorUtilities::CompileBlueprint(WidgetBlueprint);
+		CompileObject->SetStringField(TEXT("status"), TEXT("requested"));
+	}
+	else
+	{
+		CompileObject->SetStringField(TEXT("status"), TEXT("skipped"));
+	}
+
+	MCPObjectUtils::AppendTouchedPackage(WidgetBlueprint, OutResult.TouchedPackages);
+	bool bAllSaved = true;
+	if (!Request.Context.bDryRun && bAutoSave)
+	{
+		for (const FString& PackageName : OutResult.TouchedPackages)
+		{
+			bAllSaved &= SavePackageByName(PackageName, OutResult);
+		}
+	}
+
+	OutResult.ResultObject = MakeShared<FJsonObject>();
+	OutResult.ResultObject->SetBoolField(TEXT("dry_run"), Request.Context.bDryRun);
+	OutResult.ResultObject->SetNumberField(TEXT("removed_count"), RemoveNodes.Num());
+	OutResult.ResultObject->SetArrayField(TEXT("removed"), RemovedEntries);
+	OutResult.ResultObject->SetObjectField(TEXT("compile"), CompileObject);
+	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), MCPToolCommonJson::ToJsonStringArray(OutResult.TouchedPackages));
+	OutResult.Status = bAllSaved ? EMCPResponseStatus::Ok : EMCPResponseStatus::Partial;
+	return true;
 }

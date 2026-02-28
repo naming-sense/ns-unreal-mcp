@@ -67,6 +67,7 @@ class FakeFacade:
                 result={
                     "protocol_version": "unreal-mcp/1.0",
                     "schema_hash": self.tools_list_schema_hash,
+                    "capabilities": ["core_tools_v1", "umg_widget_event_k2_v1"],
                     "tools": self.tools_list_tools,
                 },
                 diagnostics={},
@@ -117,6 +118,7 @@ async def test_tool_catalog_refresh_from_tools_list() -> None:
 
     assert catalog.protocol_version == "unreal-mcp/1.0"
     assert catalog.schema_hash == "hash-001"
+    assert catalog.capabilities == ("core_tools_v1", "umg_widget_event_k2_v1")
     assert catalog.get_tool("system.health") is not None
 
 
@@ -134,6 +136,7 @@ async def test_pass_through_calls_tool_and_preserves_error_status() -> None:
     )
     await service.start()
     try:
+        assert service.has_capability("core_tools_v1")
         result = await service.call_tool(
             tool="system.health",
             params={"a": 1},

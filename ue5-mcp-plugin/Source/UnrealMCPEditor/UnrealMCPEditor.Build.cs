@@ -24,6 +24,7 @@ public class UnrealMCPEditor : ModuleRules
             {
                 "AssetRegistry",
                 "AssetTools",
+                "BlueprintGraph",
                 "EngineSettings",
                 "Projects",
                 "WebSocketNetworking",

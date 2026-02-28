@@ -22,6 +22,7 @@ class ToolCatalog:
         self._tools_by_name: dict[str, ToolDefinition] = {}
         self._schema_hash: str = ""
         self._protocol_version: str = "unreal-mcp/1.0"
+        self._capabilities: tuple[str, ...] = ()
 
     @property
     def schema_hash(self) -> str:
@@ -35,6 +36,10 @@ class ToolCatalog:
     def tools(self) -> list[ToolDefinition]:
         return sorted(self._tools_by_name.values(), key=lambda x: x.name)
 
+    @property
+    def capabilities(self) -> tuple[str, ...]:
+        return self._capabilities
+
     def get_tool(self, name: str) -> ToolDefinition | None:
         return self._tools_by_name.get(name)
 
@@ -46,6 +51,7 @@ class ToolCatalog:
 
         self._protocol_version = str(response.result.get("protocol_version", "unreal-mcp/1.0"))
         self._schema_hash = str(response.result.get("schema_hash", ""))
+        self._capabilities = _normalize_capabilities(response.result.get("capabilities"))
         self._tools_by_name.clear()
 
         for tool_value in response.result.get("tools", []):
@@ -69,3 +75,20 @@ class ToolCatalog:
                 if isinstance(tool_value.get("result_schema"), dict)
                 else None,
             )
+
+
+def _normalize_capabilities(raw_value: Any) -> tuple[str, ...]:
+    if not isinstance(raw_value, list):
+        return ()
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for entry in raw_value:
+        if not isinstance(entry, str):
+            continue
+        capability = entry.strip()
+        if not capability or capability in seen:
+            continue
+        seen.add(capability)
+        normalized.append(capability)
+    return tuple(normalized)

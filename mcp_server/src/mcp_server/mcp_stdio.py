@@ -17,6 +17,7 @@ from mcp_server.metrics import RuntimeMetrics
 from mcp_server.request_broker import RequestBroker
 from mcp_server.tool_catalog import ToolCatalog, ToolDefinition
 from mcp_server.tool_passthrough import CatalogGuardError, MCPPassThroughService, UnknownToolError
+from mcp_server.umg_orchestrator import UMGOrchestrationService
 from mcp_server.ue_transport import UeWsTransport
 from mcp_server.ws_endpoint import (
     WsEndpointCandidate,
@@ -241,8 +242,14 @@ def make_jsonrpc_result(request_id: str | int | None, result: dict[str, Any]) ->
 
 
 class MCPRequestDispatcher:
-    def __init__(self, pass_through: MCPPassThroughService) -> None:
+    def __init__(
+        self,
+        pass_through: MCPPassThroughService,
+        *,
+        umg_orchestration: UMGOrchestrationService | None = None,
+    ) -> None:
         self._pass_through = pass_through
+        self._umg_orchestration = umg_orchestration or UMGOrchestrationService(pass_through)
         self._initialized = False
 
     async def handle_request(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -332,6 +339,7 @@ class MCPRequestDispatcher:
             }
 
         tools = [self._build_mcp_tool(tool) for tool in self._pass_through.list_tools()]
+        tools.extend(self._umg_orchestration.list_virtual_tools())
         return {
             "tools": tools,
         }
@@ -359,11 +367,18 @@ class MCPRequestDispatcher:
 
         tool_request_id = f"mcp-{request_id}" if request_id is not None else None
         try:
-            result = await self._pass_through.call_tool(
-                tool=tool_name,
-                params=arguments,
-                request_id=tool_request_id,
-            )
+            if self._umg_orchestration.is_virtual_tool(tool_name):
+                result = await self._umg_orchestration.call_virtual_tool(
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    request_id=tool_request_id,
+                )
+            else:
+                result = await self._pass_through.call_tool(
+                    tool=tool_name,
+                    params=arguments,
+                    request_id=tool_request_id,
+                )
             is_error = result.status == "error" or not result.ok
             structured_content = {
                 "ok": result.ok,
@@ -389,6 +404,12 @@ class MCPRequestDispatcher:
                     ]
                 },
             }
+        except ValueError as exc:
+            return make_jsonrpc_error(
+                request_id,
+                JSONRPC_INVALID_PARAMS,
+                str(exc),
+            )
         except Exception as exc:
             LOGGER.exception("tools/call failed. tool=%s", tool_name)
             is_error = True

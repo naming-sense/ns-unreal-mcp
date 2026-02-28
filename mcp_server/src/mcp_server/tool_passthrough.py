@@ -82,6 +82,13 @@ class MCPPassThroughService:
     def schema_hash(self) -> str:
         return self._catalog.schema_hash
 
+    @property
+    def capabilities(self) -> tuple[str, ...]:
+        return self._catalog.capabilities
+
+    def has_capability(self, capability: str) -> bool:
+        return capability in self._catalog.capabilities
+
     async def start(self) -> None:
         await self.refresh_catalog()
         self._stop_event.clear()

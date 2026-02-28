@@ -6,6 +6,7 @@
 #include "Blueprint/UserWidget.h"
 #include "WidgetBlueprint.h"
 #include "Blueprint/WidgetTree.h"
+#include "Components/Button.h"
 #include "Components/CanvasPanel.h"
 #include "Components/TextBlock.h"
 #include "Editor.h"
@@ -169,6 +170,18 @@ namespace
 		{
 			TextWidget = WidgetBlueprint->WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(), TEXT("RuntimeTextWidget"));
 			RootCanvas->AddChild(TextWidget);
+		}
+
+		UButton* ButtonWidget = Cast<UButton>(WidgetBlueprint->WidgetTree->FindWidget(TEXT("RuntimeButtonWidget")));
+		if (ButtonWidget == nullptr)
+		{
+			ButtonWidget = WidgetBlueprint->WidgetTree->ConstructWidget<UButton>(UButton::StaticClass(), TEXT("RuntimeButtonWidget"));
+			ButtonWidget->bIsVariable = true;
+			RootCanvas->AddChild(ButtonWidget);
+		}
+		else
+		{
+			ButtonWidget->bIsVariable = true;
 		}
 
 		return WidgetBlueprint;
@@ -841,12 +854,22 @@ bool FMCPUMGToolsAutomationTest::RunTest(const FString& Parameters)
 		return false;
 	}
 
+	UWidget* EventTargetWidget = WidgetBlueprint->WidgetTree->FindWidget(TEXT("RuntimeButtonWidget"));
+	TestNotNull(TEXT("Create event target widget for umg tools"), EventTargetWidget);
+	if (EventTargetWidget == nullptr)
+	{
+		return false;
+	}
+
 	const FString WidgetBlueprintPath = WidgetBlueprint->GetPathName();
 	const FString TargetWidgetName = TargetWidget->GetName();
+	const FString EventTargetWidgetName = EventTargetWidget->GetName();
 
 	FString TreeResponseJson;
 	bool bTreeSuccess = false;
-	const FString TreeParamsJson = FString::Printf(TEXT("{\"object_path\":\"%s\",\"depth\":5}"), *WidgetBlueprintPath);
+	const FString TreeParamsJson = FString::Printf(
+		TEXT("{\"object_path\":\"%s\",\"depth\":5,\"include\":{\"slot_summary\":true,\"layout_summary\":true}}"),
+		*WidgetBlueprintPath);
 	const FString TreeRequestJson = MakeRequestEnvelope(TEXT("umg.tree.get"), TreeParamsJson);
 	TestTrue(TEXT("Execute umg.tree.get request"), ExecuteMCPRequest(TreeRequestJson, TreeResponseJson, bTreeSuccess));
 	TestTrue(TEXT("umg.tree.get status should be success"), bTreeSuccess);
@@ -859,6 +882,8 @@ bool FMCPUMGToolsAutomationTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("umg.tree.get result has nodes"), (*TreeResultObject)->TryGetArrayField(TEXT("nodes"), Nodes));
 
 	bool bFoundTargetWidget = false;
+	bool bFoundSlotSummaryOnTargetWidget = false;
+	bool bFoundLayoutSummaryOnTargetWidget = false;
 	for (const TSharedPtr<FJsonValue>& NodeValue : *Nodes)
 	{
 		if (!NodeValue.IsValid() || NodeValue->Type != EJson::Object)
@@ -872,15 +897,19 @@ bool FMCPUMGToolsAutomationTest::RunTest(const FString& Parameters)
 		if (NodeName == TargetWidgetName)
 		{
 			bFoundTargetWidget = true;
+			bFoundSlotSummaryOnTargetWidget = NodeObject->HasField(TEXT("slot_summary"));
+			bFoundLayoutSummaryOnTargetWidget = NodeObject->HasField(TEXT("layout_summary"));
 			break;
 		}
 	}
 	TestTrue(TEXT("umg.tree.get contains RuntimeTextWidget node"), bFoundTargetWidget);
+	TestTrue(TEXT("umg.tree.get includes slot_summary on target widget"), bFoundSlotSummaryOnTargetWidget);
+	TestTrue(TEXT("umg.tree.get includes layout_summary on target widget"), bFoundLayoutSummaryOnTargetWidget);
 
 	FString InspectResponseJson;
 	bool bInspectSuccess = false;
 	const FString InspectParamsJson = FString::Printf(
-		TEXT("{\"object_path\":\"%s\",\"widget_ref\":{\"name\":\"%s\"},\"depth\":1}"),
+		TEXT("{\"object_path\":\"%s\",\"widget_ref\":{\"name\":\"%s\"},\"depth\":1,\"include\":{\"properties\":true,\"metadata\":true,\"style\":true}}"),
 		*WidgetBlueprintPath,
 		*TargetWidgetName);
 	const FString InspectRequestJson = MakeRequestEnvelope(TEXT("umg.widget.inspect"), InspectParamsJson);
@@ -897,6 +926,8 @@ bool FMCPUMGToolsAutomationTest::RunTest(const FString& Parameters)
 	FString WidgetName;
 	TestTrue(TEXT("umg.widget.inspect widget has name"), (*WidgetObject)->TryGetStringField(TEXT("name"), WidgetName));
 	TestEqual(TEXT("umg.widget.inspect widget name"), WidgetName, TargetWidgetName);
+	TestTrue(TEXT("umg.widget.inspect returns metadata block"), (*InspectResultObject)->HasField(TEXT("metadata")));
+	TestTrue(TEXT("umg.widget.inspect returns style block"), (*InspectResultObject)->HasField(TEXT("style")));
 
 	FString WidgetPatchResponseJson;
 	bool bWidgetPatchSuccess = false;
@@ -939,6 +970,165 @@ bool FMCPUMGToolsAutomationTest::RunTest(const FString& Parameters)
 	const TArray<TSharedPtr<FJsonValue>>* SlotChangedProperties = nullptr;
 	TestTrue(TEXT("umg.slot.patch result has changed_properties"), (*SlotPatchResultObject)->TryGetArrayField(TEXT("changed_properties"), SlotChangedProperties));
 	TestTrue(TEXT("umg.slot.patch changed_properties includes Padding"), JsonArrayContainsString(SlotChangedProperties, TEXT("Padding")));
+
+	FString SlotInspectResponseJson;
+	bool bSlotInspectSuccess = false;
+	const FString SlotInspectParamsJson = FString::Printf(
+		TEXT("{\"object_path\":\"%s\",\"widget_ref\":{\"name\":\"%s\"},\"include\":{\"layout\":true,\"anchors\":true,\"padding\":true,\"alignment\":true,\"zorder\":true}}"),
+		*WidgetBlueprintPath,
+		*TargetWidgetName);
+	const FString SlotInspectRequestJson = MakeRequestEnvelope(TEXT("umg.slot.inspect"), SlotInspectParamsJson);
+	TestTrue(TEXT("Execute umg.slot.inspect request"), ExecuteMCPRequest(SlotInspectRequestJson, SlotInspectResponseJson, bSlotInspectSuccess));
+	TestTrue(TEXT("umg.slot.inspect status should be success"), bSlotInspectSuccess);
+
+	TSharedPtr<FJsonObject> SlotInspectResponseObject;
+	TestTrue(TEXT("Parse umg.slot.inspect response"), ParseJsonObject(SlotInspectResponseJson, SlotInspectResponseObject));
+	const TSharedPtr<FJsonObject>* SlotInspectResultObject = nullptr;
+	TestTrue(TEXT("umg.slot.inspect has result"), SlotInspectResponseObject->TryGetObjectField(TEXT("result"), SlotInspectResultObject));
+	const TSharedPtr<FJsonObject>* SlotInspectSlotObject = nullptr;
+	TestTrue(TEXT("umg.slot.inspect has slot"), (*SlotInspectResultObject)->TryGetObjectField(TEXT("slot"), SlotInspectSlotObject));
+	const TArray<TSharedPtr<FJsonValue>>* SlotInspectProperties = nullptr;
+	TestTrue(TEXT("umg.slot.inspect slot has properties"), (*SlotInspectSlotObject)->TryGetArrayField(TEXT("slot_properties"), SlotInspectProperties));
+	TestTrue(TEXT("umg.slot.inspect slot properties should not be empty"), SlotInspectProperties != nullptr && SlotInspectProperties->Num() > 0);
+	TestTrue(TEXT("umg.slot.inspect has layout_summary"), (*SlotInspectResultObject)->HasField(TEXT("layout_summary")));
+
+	FString BindingListResponseJson;
+	bool bBindingListSuccess = false;
+	const FString BindingListParamsJson = FString::Printf(TEXT("{\"object_path\":\"%s\"}"), *WidgetBlueprintPath);
+	const FString BindingListRequestJson = MakeRequestEnvelope(TEXT("umg.binding.list"), BindingListParamsJson);
+	TestTrue(TEXT("Execute umg.binding.list request"), ExecuteMCPRequest(BindingListRequestJson, BindingListResponseJson, bBindingListSuccess));
+	TestTrue(TEXT("umg.binding.list status should be success"), bBindingListSuccess);
+
+	TSharedPtr<FJsonObject> BindingListResponseObject;
+	TestTrue(TEXT("Parse umg.binding.list response"), ParseJsonObject(BindingListResponseJson, BindingListResponseObject));
+	const TSharedPtr<FJsonObject>* BindingListResultObject = nullptr;
+	TestTrue(TEXT("umg.binding.list has result"), BindingListResponseObject->TryGetObjectField(TEXT("result"), BindingListResultObject));
+	const TArray<TSharedPtr<FJsonValue>>* BindingValues = nullptr;
+	TestTrue(TEXT("umg.binding.list has bindings"), (*BindingListResultObject)->TryGetArrayField(TEXT("bindings"), BindingValues));
+
+	FString AnimationListResponseJson;
+	bool bAnimationListSuccess = false;
+	const FString AnimationListParamsJson = FString::Printf(TEXT("{\"object_path\":\"%s\"}"), *WidgetBlueprintPath);
+	const FString AnimationListRequestJson = MakeRequestEnvelope(TEXT("umg.animation.list"), AnimationListParamsJson);
+	TestTrue(TEXT("Execute umg.animation.list request"), ExecuteMCPRequest(AnimationListRequestJson, AnimationListResponseJson, bAnimationListSuccess));
+	TestTrue(TEXT("umg.animation.list status should be success"), bAnimationListSuccess);
+
+	TSharedPtr<FJsonObject> AnimationListResponseObject;
+	TestTrue(TEXT("Parse umg.animation.list response"), ParseJsonObject(AnimationListResponseJson, AnimationListResponseObject));
+	const TSharedPtr<FJsonObject>* AnimationListResultObject = nullptr;
+	TestTrue(TEXT("umg.animation.list has result"), AnimationListResponseObject->TryGetObjectField(TEXT("result"), AnimationListResultObject));
+	const TArray<TSharedPtr<FJsonValue>>* AnimationValues = nullptr;
+	TestTrue(TEXT("umg.animation.list has animations"), (*AnimationListResultObject)->TryGetArrayField(TEXT("animations"), AnimationValues));
+
+	auto ExtractUbergraphBoundEventCount = [&](const FString& InResponseJson, double& OutBoundEventCount) -> bool
+	{
+		TSharedPtr<FJsonObject> GraphSummaryResponseObject;
+		if (!ParseJsonObject(InResponseJson, GraphSummaryResponseObject))
+		{
+			return false;
+		}
+
+		const TSharedPtr<FJsonObject>* GraphSummaryResultObject = nullptr;
+		if (!GraphSummaryResponseObject->TryGetObjectField(TEXT("result"), GraphSummaryResultObject))
+		{
+			return false;
+		}
+
+		const TSharedPtr<FJsonObject>* UbergraphSummaryObject = nullptr;
+		if (!(*GraphSummaryResultObject)->TryGetObjectField(TEXT("ubergraph"), UbergraphSummaryObject))
+		{
+			return false;
+		}
+
+		return (*UbergraphSummaryObject)->TryGetNumberField(TEXT("bound_event_count"), OutBoundEventCount);
+	};
+
+	const FString EventFunctionName = FString::Printf(TEXT("HandleRuntimeButtonClicked_%s"), *FGuid::NewGuid().ToString(EGuidFormats::Digits).Left(8));
+	const FString EventName = TEXT("OnClicked");
+
+	FString EventPreClearResponseJson;
+	bool bEventPreClearSuccess = false;
+	const FString EventPreClearParamsJson = FString::Printf(
+		TEXT("{\"object_path\":\"%s\",\"widget_ref\":{\"name\":\"%s\"},\"event_name\":\"%s\",\"compile_on_success\":false}"),
+		*WidgetBlueprintPath,
+		*EventTargetWidgetName,
+		*EventName);
+	const FString EventPreClearRequestJson = MakeRequestEnvelope(TEXT("umg.widget.event.unbind"), EventPreClearParamsJson, false);
+	TestTrue(TEXT("Execute umg.widget.event.unbind pre-clear request"), ExecuteMCPRequest(EventPreClearRequestJson, EventPreClearResponseJson, bEventPreClearSuccess));
+	TestTrue(TEXT("umg.widget.event.unbind pre-clear status should be success"), bEventPreClearSuccess);
+
+	FString GraphSummaryBeforeResponseJson;
+	bool bGraphSummaryBeforeSuccess = false;
+	const FString GraphSummaryBeforeParamsJson = FString::Printf(TEXT("{\"object_path\":\"%s\",\"include_names\":false}"), *WidgetBlueprintPath);
+	const FString GraphSummaryBeforeRequestJson = MakeRequestEnvelope(TEXT("umg.graph.summary"), GraphSummaryBeforeParamsJson);
+	TestTrue(TEXT("Execute umg.graph.summary before bind"), ExecuteMCPRequest(GraphSummaryBeforeRequestJson, GraphSummaryBeforeResponseJson, bGraphSummaryBeforeSuccess));
+	TestTrue(TEXT("umg.graph.summary before bind should be success"), bGraphSummaryBeforeSuccess);
+
+	double BoundEventCountBefore = 0.0;
+	TestTrue(TEXT("umg.graph.summary before bind has bound_event_count"), ExtractUbergraphBoundEventCount(GraphSummaryBeforeResponseJson, BoundEventCountBefore));
+
+	FString EventBindResponseJson;
+	bool bEventBindSuccess = false;
+	const FString EventBindParamsJson = FString::Printf(
+		TEXT("{\"object_path\":\"%s\",\"widget_ref\":{\"name\":\"%s\"},\"event_name\":\"%s\",\"function_name\":\"%s\",\"compile_on_success\":false}"),
+		*WidgetBlueprintPath,
+		*EventTargetWidgetName,
+		*EventName,
+		*EventFunctionName);
+	const FString EventBindRequestJson = MakeRequestEnvelope(TEXT("umg.widget.event.bind"), EventBindParamsJson, false);
+	TestTrue(TEXT("Execute umg.widget.event.bind request"), ExecuteMCPRequest(EventBindRequestJson, EventBindResponseJson, bEventBindSuccess));
+	TestTrue(TEXT("umg.widget.event.bind status should be success"), bEventBindSuccess);
+
+	TSharedPtr<FJsonObject> EventBindResponseObject;
+	TestTrue(TEXT("Parse umg.widget.event.bind response"), ParseJsonObject(EventBindResponseJson, EventBindResponseObject));
+	const TSharedPtr<FJsonObject>* EventBindResultObject = nullptr;
+	TestTrue(TEXT("umg.widget.event.bind has result"), EventBindResponseObject->TryGetObjectField(TEXT("result"), EventBindResultObject));
+	FString EventBindFunctionNameResult;
+	TestTrue(TEXT("umg.widget.event.bind result has function_name"), (*EventBindResultObject)->TryGetStringField(TEXT("function_name"), EventBindFunctionNameResult));
+	TestEqual(TEXT("umg.widget.event.bind function_name should match"), EventBindFunctionNameResult, EventFunctionName);
+	FString EventBindingKind;
+	TestTrue(TEXT("umg.widget.event.bind result has binding_kind"), (*EventBindResultObject)->TryGetStringField(TEXT("binding_kind"), EventBindingKind));
+	TestEqual(TEXT("umg.widget.event.bind binding_kind should be k2"), EventBindingKind, FString(TEXT("k2_component_bound_event")));
+
+	FString GraphSummaryAfterBindResponseJson;
+	bool bGraphSummaryAfterBindSuccess = false;
+	const FString GraphSummaryAfterBindRequestJson = MakeRequestEnvelope(TEXT("umg.graph.summary"), GraphSummaryBeforeParamsJson);
+	TestTrue(TEXT("Execute umg.graph.summary after bind"), ExecuteMCPRequest(GraphSummaryAfterBindRequestJson, GraphSummaryAfterBindResponseJson, bGraphSummaryAfterBindSuccess));
+	TestTrue(TEXT("umg.graph.summary after bind should be success"), bGraphSummaryAfterBindSuccess);
+
+	double BoundEventCountAfterBind = 0.0;
+	TestTrue(TEXT("umg.graph.summary after bind has bound_event_count"), ExtractUbergraphBoundEventCount(GraphSummaryAfterBindResponseJson, BoundEventCountAfterBind));
+	TestTrue(TEXT("bound_event_count should not decrease right after bind"), BoundEventCountAfterBind >= BoundEventCountBefore);
+
+	FString EventUnbindResponseJson;
+	bool bEventUnbindSuccess = false;
+	const FString EventUnbindParamsJson = FString::Printf(
+		TEXT("{\"object_path\":\"%s\",\"widget_ref\":{\"name\":\"%s\"},\"event_name\":\"%s\",\"function_name\":\"%s\",\"compile_on_success\":false}"),
+		*WidgetBlueprintPath,
+		*EventTargetWidgetName,
+		*EventName,
+		*EventFunctionName);
+	const FString EventUnbindRequestJson = MakeRequestEnvelope(TEXT("umg.widget.event.unbind"), EventUnbindParamsJson, false);
+	TestTrue(TEXT("Execute umg.widget.event.unbind request"), ExecuteMCPRequest(EventUnbindRequestJson, EventUnbindResponseJson, bEventUnbindSuccess));
+	TestTrue(TEXT("umg.widget.event.unbind status should be success"), bEventUnbindSuccess);
+
+	TSharedPtr<FJsonObject> EventUnbindResponseObject;
+	TestTrue(TEXT("Parse umg.widget.event.unbind response"), ParseJsonObject(EventUnbindResponseJson, EventUnbindResponseObject));
+	const TSharedPtr<FJsonObject>* EventUnbindResultObject = nullptr;
+	TestTrue(TEXT("umg.widget.event.unbind has result"), EventUnbindResponseObject->TryGetObjectField(TEXT("result"), EventUnbindResultObject));
+	double EventRemovedCount = 0.0;
+	TestTrue(TEXT("umg.widget.event.unbind result has removed_count"), (*EventUnbindResultObject)->TryGetNumberField(TEXT("removed_count"), EventRemovedCount));
+	TestTrue(TEXT("umg.widget.event.unbind should remove at least one binding"), EventRemovedCount >= 1.0);
+
+	FString GraphSummaryAfterUnbindResponseJson;
+	bool bGraphSummaryAfterUnbindSuccess = false;
+	const FString GraphSummaryAfterUnbindRequestJson = MakeRequestEnvelope(TEXT("umg.graph.summary"), GraphSummaryBeforeParamsJson);
+	TestTrue(TEXT("Execute umg.graph.summary after unbind"), ExecuteMCPRequest(GraphSummaryAfterUnbindRequestJson, GraphSummaryAfterUnbindResponseJson, bGraphSummaryAfterUnbindSuccess));
+	TestTrue(TEXT("umg.graph.summary after unbind should be success"), bGraphSummaryAfterUnbindSuccess);
+
+	double BoundEventCountAfterUnbind = 0.0;
+	TestTrue(TEXT("umg.graph.summary after unbind has bound_event_count"), ExtractUbergraphBoundEventCount(GraphSummaryAfterUnbindResponseJson, BoundEventCountAfterUnbind));
+	TestTrue(TEXT("bound_event_count should not increase after unbind"), BoundEventCountAfterUnbind <= BoundEventCountAfterBind);
 
 	FString ClassListResponseJson;
 	bool bClassListSuccess = false;

@@ -34,7 +34,7 @@ class ScenarioSpec:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="E2E smoke runner for material/niagara/umg + asset lifecycle tools"
+        description="E2E smoke runner for material/niagara/umg(+extended) + asset lifecycle tools"
     )
     parser.add_argument("--config", type=Path, default=None, help="Path to YAML config")
     parser.add_argument("--log-level", type=str, default=None, help="Override log level")
@@ -210,6 +210,306 @@ def _build_success_summary(spec: ScenarioSpec, result: ToolCallResult) -> dict[s
 
 def _tool_is_available(pass_through: MCPPassThroughService, tool: str) -> bool:
     return any(defn.name == tool and defn.enabled for defn in pass_through.list_tools())
+
+
+def _find_umg_event_candidate(nodes: list[dict[str, Any]]) -> tuple[dict[str, Any], str] | None:
+    event_map: tuple[tuple[str, str], ...] = (
+        ("/Script/UMG.Button", "OnClicked"),
+        ("/Script/UMG.CheckBox", "OnCheckStateChanged"),
+        ("/Script/UMG.EditableText", "OnTextChanged"),
+        ("/Script/UMG.EditableTextBox", "OnTextChanged"),
+        ("/Script/UMG.ComboBoxString", "OnSelectionChanged"),
+        ("/Script/UMG.Slider", "OnValueChanged"),
+        ("/Script/UMG.SpinBox", "OnValueChanged"),
+    )
+    for class_path, event_name in event_map:
+        for node in nodes:
+            if node.get("class_path") == class_path and isinstance(node.get("name"), str) and node["name"]:
+                return node, event_name
+    return None
+
+
+async def _run_umg_extended_scenario(
+    *,
+    pass_through: MCPPassThroughService,
+    object_path: str,
+    timeout_ms: int | None,
+    stream_events: bool,
+    print_event_lines: bool,
+    include_result: bool,
+) -> dict[str, Any]:
+    required_tools = (
+        "umg.tree.get",
+        "umg.widget.inspect",
+        "umg.binding.list",
+        "umg.animation.list",
+        "umg.graph.summary",
+    )
+    missing_tools = [tool for tool in required_tools if not _tool_is_available(pass_through, tool)]
+    if missing_tools:
+        return {
+            "scenario": "umg_extended",
+            "status": "skipped",
+            "reason": f"required tools missing: {', '.join(missing_tools)}",
+            "missing_tools": missing_tools,
+        }
+
+    scenario_started = time.perf_counter()
+    scenario_events: list[dict[str, Any]] = []
+    steps: list[dict[str, Any]] = []
+
+    async def _invoke(step_name: str, tool: str, params: dict[str, Any]) -> ToolCallResult:
+        started = time.perf_counter()
+        step_events: list[dict[str, Any]] = []
+        try:
+            if stream_events:
+
+                def _on_event(event: dict[str, Any]) -> None:
+                    scenario_events.append(event)
+                    step_events.append(event)
+                    if print_event_lines:
+                        print(
+                            json.dumps(
+                                {
+                                    "type": "event",
+                                    "scenario": "umg_extended",
+                                    "step": step_name,
+                                    "event": event,
+                                },
+                                ensure_ascii=False,
+                            ),
+                            flush=True,
+                        )
+
+                result = await pass_through.call_tool_stream(
+                    tool=tool,
+                    params=params,
+                    timeout_ms=timeout_ms,
+                    on_event=_on_event,
+                )
+            else:
+                result = await pass_through.call_tool(
+                    tool=tool,
+                    params=params,
+                    timeout_ms=timeout_ms,
+                )
+        except Exception as exc:
+            duration_ms = int((time.perf_counter() - started) * 1000)
+            steps.append(
+                {
+                    "step": step_name,
+                    "tool": tool,
+                    "status": "error",
+                    "duration_ms": duration_ms,
+                    "event_count": len(step_events),
+                    "error": {"type": exc.__class__.__name__, "message": str(exc)},
+                }
+            )
+            raise
+
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        step_payload: dict[str, Any] = {
+            "step": step_name,
+            "tool": tool,
+            "request_id": result.request_id,
+            "status": result.status,
+            "duration_ms": duration_ms,
+            "event_count": len(step_events),
+            "diagnostics": result.diagnostics,
+        }
+        if include_result:
+            step_payload["result"] = result.result
+        steps.append(step_payload)
+        return result
+
+    try:
+        tree_result = await _invoke(
+            "tree.get",
+            "umg.tree.get",
+            {
+                "object_path": object_path,
+                "depth": 5,
+                "include": {
+                    "slot_summary": True,
+                    "layout_summary": True,
+                },
+            },
+        )
+        if not tree_result.ok or tree_result.status == "error":
+            raise RuntimeError("umg.tree.get failed in extended scenario")
+
+        nodes_raw = tree_result.result.get("nodes")
+        nodes: list[dict[str, Any]] = []
+        if isinstance(nodes_raw, list):
+            for node in nodes_raw:
+                if isinstance(node, dict):
+                    nodes.append(node)
+        if len(nodes) == 0:
+            raise RuntimeError("umg.tree.get returned no nodes")
+
+        target_node = nodes[0]
+        target_name = str(target_node.get("name", ""))
+        if not target_name:
+            raise RuntimeError("umg.tree.get node does not contain widget name")
+
+        inspect_result = await _invoke(
+            "widget.inspect",
+            "umg.widget.inspect",
+            {
+                "object_path": object_path,
+                "widget_ref": {"name": target_name},
+                "depth": 2,
+                "include": {
+                    "properties": True,
+                    "metadata": True,
+                    "style": True,
+                },
+            },
+        )
+        if not inspect_result.ok or inspect_result.status == "error":
+            raise RuntimeError("umg.widget.inspect failed in extended scenario")
+
+        slot_target = next(
+            (node for node in nodes if isinstance(node.get("slot_type"), str) and node["slot_type"]),
+            None,
+        )
+        if slot_target is not None and _tool_is_available(pass_through, "umg.slot.inspect"):
+            slot_result = await _invoke(
+                "slot.inspect",
+                "umg.slot.inspect",
+                {
+                    "object_path": object_path,
+                    "widget_ref": {"name": slot_target["name"]},
+                    "include": {
+                        "layout": True,
+                        "anchors": True,
+                        "padding": True,
+                        "alignment": True,
+                        "zorder": True,
+                    },
+                },
+            )
+            if not slot_result.ok or slot_result.status == "error":
+                raise RuntimeError("umg.slot.inspect failed in extended scenario")
+        else:
+            steps.append(
+                {
+                    "step": "slot.inspect",
+                    "tool": "umg.slot.inspect",
+                    "status": "skipped",
+                    "reason": "slot target not found or tool unavailable",
+                }
+            )
+
+        binding_list_result = await _invoke(
+            "binding.list",
+            "umg.binding.list",
+            {"object_path": object_path},
+        )
+        if not binding_list_result.ok or binding_list_result.status == "error":
+            raise RuntimeError("umg.binding.list failed in extended scenario")
+
+        animation_list_result = await _invoke(
+            "animation.list",
+            "umg.animation.list",
+            {"object_path": object_path},
+        )
+        if not animation_list_result.ok or animation_list_result.status == "error":
+            raise RuntimeError("umg.animation.list failed in extended scenario")
+
+        graph_summary_result = await _invoke(
+            "graph.summary",
+            "umg.graph.summary",
+            {"object_path": object_path, "include_names": False},
+        )
+        if not graph_summary_result.ok or graph_summary_result.status == "error":
+            raise RuntimeError("umg.graph.summary failed in extended scenario")
+
+        if _tool_is_available(pass_through, "umg.widget.event.bind") and _tool_is_available(
+            pass_through, "umg.widget.event.unbind"
+        ):
+            candidate = _find_umg_event_candidate(nodes)
+            if candidate is not None:
+                widget_node, event_name = candidate
+                function_name = f"HandleMcpE2E_{widget_node['name']}_{event_name}"
+                bind_result = await _invoke(
+                    "widget.event.bind",
+                    "umg.widget.event.bind",
+                    {
+                        "object_path": object_path,
+                        "widget_ref": {"name": widget_node["name"]},
+                        "event_name": event_name,
+                        "function_name": function_name,
+                        "compile_on_success": False,
+                    },
+                )
+                if not bind_result.ok or bind_result.status == "error":
+                    raise RuntimeError("umg.widget.event.bind failed in extended scenario")
+
+                post_bind_summary = await _invoke(
+                    "graph.summary.post_bind",
+                    "umg.graph.summary",
+                    {"object_path": object_path, "include_names": False},
+                )
+                if not post_bind_summary.ok or post_bind_summary.status == "error":
+                    raise RuntimeError("umg.graph.summary post_bind failed in extended scenario")
+
+                unbind_result = await _invoke(
+                    "widget.event.unbind",
+                    "umg.widget.event.unbind",
+                    {
+                        "object_path": object_path,
+                        "widget_ref": {"name": widget_node["name"]},
+                        "event_name": event_name,
+                        "function_name": function_name,
+                        "compile_on_success": False,
+                    },
+                )
+                if not unbind_result.ok or unbind_result.status == "error":
+                    raise RuntimeError("umg.widget.event.unbind failed in extended scenario")
+            else:
+                steps.append(
+                    {
+                        "step": "widget.event.bind",
+                        "tool": "umg.widget.event.bind",
+                        "status": "skipped",
+                        "reason": "no compatible delegate widget found in tree",
+                    }
+                )
+        else:
+            steps.append(
+                {
+                    "step": "widget.event.bind",
+                    "tool": "umg.widget.event.bind",
+                    "status": "skipped",
+                    "reason": "event bind tools are unavailable",
+                }
+            )
+
+    except Exception as exc:
+        return {
+            "scenario": "umg_extended",
+            "tool": "umg.workflow",
+            "object_path": object_path,
+            "status": "error",
+            "duration_ms": int((time.perf_counter() - scenario_started) * 1000),
+            "event_count": len(scenario_events),
+            "error": {"type": exc.__class__.__name__, "message": str(exc)},
+            "steps": steps,
+        }
+
+    return {
+        "scenario": "umg_extended",
+        "tool": "umg.workflow",
+        "object_path": object_path,
+        "status": "ok",
+        "duration_ms": int((time.perf_counter() - scenario_started) * 1000),
+        "event_count": len(scenario_events),
+        "summary": {
+            "step_count": len(steps),
+        },
+        "steps": steps,
+    }
 
 
 async def _run_asset_lifecycle_scenario(
@@ -499,6 +799,11 @@ async def run_e2e(
         "niagara": niagara_path,
         "umg": umg_path,
     }
+    resolved_paths: dict[str, str | None] = {
+        "material": None,
+        "niagara": None,
+        "umg": None,
+    }
 
     scenarios: list[dict[str, Any]] = []
     overall_ok = True
@@ -554,6 +859,7 @@ async def run_e2e(
                     overall_ok = False
                 continue
 
+            resolved_paths[spec.key] = object_path
             started = time.perf_counter()
             events: list[dict[str, Any]] = []
 
@@ -627,6 +933,22 @@ async def run_e2e(
             if include_result:
                 scenario_payload["result"] = result.result
             scenarios.append(scenario_payload)
+
+        resolved_umg_path = resolved_paths.get("umg")
+        if isinstance(resolved_umg_path, str) and resolved_umg_path:
+            umg_extended_result = await _run_umg_extended_scenario(
+                pass_through=pass_through,
+                object_path=resolved_umg_path,
+                timeout_ms=timeout_ms,
+                stream_events=stream_events,
+                print_event_lines=print_event_lines,
+                include_result=include_result,
+            )
+            scenarios.append(umg_extended_result)
+            if umg_extended_result.get("status") == "error":
+                overall_ok = False
+            if require_all and umg_extended_result.get("status") == "skipped":
+                overall_ok = False
 
         if not skip_asset_lifecycle:
             lifecycle_result = await _run_asset_lifecycle_scenario(
