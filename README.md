@@ -30,6 +30,15 @@ This is a single repo, but installation paths are split:
 2. Install MCP server
    - Keep `mcp_server/` in a stable path (example: `D:\Tools\ns-unreal-mcp\mcp_server`)
 
+## Local UE Project Sync
+
+Use local Unreal projects (for example `TestMcp`) as runtime validation targets only.
+
+- Linux/WSL:
+  - `./scripts/sync_plugin_to_testmcp.sh <UE_PROJECT_PATH>`
+- Windows PowerShell:
+  - `.\scripts\sync_plugin_to_testmcp.ps1 -ProjectDir <UE_PROJECT_PATH>`
+
 ## MCP Client Registration
 
 ### 1) Codex CLI
@@ -69,4 +78,5 @@ This is a single repo, but installation paths are split:
 - Runtime and operations: `mcp_server/docs/RUNBOOK.md`
 - Troubleshooting: `mcp_server/docs/TROUBLESHOOTING.md`
 - Multi-instance selector: `mcp_server/docs/MULTI_INSTANCE_SELECTOR.md`
+- Single-repo workflow: `docs/SINGLE_REPO_WORKFLOW.md`
 - Release notes: `RELEASE_NOTES_v0.1.3.md`

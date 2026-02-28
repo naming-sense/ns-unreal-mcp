@@ -73,3 +73,12 @@ Plugins/**/Intermediate/*
 
 # Cache files for the editor to use
 DerivedDataCache/*
+
+# Local Python environments / packaging artifacts
+.venv/
+*/.venv/
+*.egg-info/
+
+# Local UE validation projects (not part of distribution)
+TestMcp/
+LocalTestMcp/
