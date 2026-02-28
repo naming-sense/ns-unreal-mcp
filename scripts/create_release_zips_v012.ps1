@@ -1,5 +1,5 @@
 $ErrorActionPreference = 'Stop'
-$repo = 'D:\Codex-cli\ns-unreal-mcp-publish'
+$repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $version = 'v0.1.2'
 $assetsDir = Join-Path $repo 'release-assets'
 New-Item -ItemType Directory -Path $assetsDir -Force | Out-Null

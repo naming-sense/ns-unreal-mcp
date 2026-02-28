@@ -1,4 +1,4 @@
-# ns-unreal-mcp
+# GameDevMCP
 
 An all-in-one repository for the Unreal Editor MCP plugin and the Python MCP server bridge.
 
@@ -28,7 +28,7 @@ This is a single repo, but installation paths are split:
 1. Install plugin
    - `ue5-mcp-plugin/` → `<YourProject>/Plugins/ue5-mcp-plugin`
 2. Install MCP server
-   - Keep `mcp_server/` in a stable path (example: `D:\Tools\ns-unreal-mcp\mcp_server`)
+   - Keep `mcp_server/` in a stable path (example: `D:\Tools\GameDevMCP\mcp_server`)
 
 ## Local UE Project Sync
 

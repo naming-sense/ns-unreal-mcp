@@ -1,7 +1,13 @@
 $ErrorActionPreference = 'Stop'
 
-$repoRoot = 'D:\Codex-cli\ns-unreal-mcp-publish'
-$repoSlug = 'naming-sense/ns-unreal-mcp'
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$originUrl = (git -C $repoRoot remote get-url origin).Trim()
+if ($originUrl -match 'github\.com[:/](.+?)(?:\.git)?$') {
+    $repoSlug = $Matches[1]
+}
+else {
+    throw "Failed to parse GitHub repo slug from origin URL: $originUrl"
+}
 $tag = 'v0.1.0'
 $releaseName = 'v0.1.0'
 $releaseNotes = @'
@@ -45,7 +51,7 @@ $headers = @{
     Authorization = "Bearer $token"
     Accept = 'application/vnd.github+json'
     'X-GitHub-Api-Version' = '2022-11-28'
-    'User-Agent' = 'ns-unreal-mcp-release-script'
+    'User-Agent' = 'gamedevmcp-release-script'
 }
 
 $apiBase = "https://api.github.com/repos/$repoSlug"

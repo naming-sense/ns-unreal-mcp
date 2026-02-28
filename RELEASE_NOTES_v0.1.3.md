@@ -1,4 +1,4 @@
-# ns-unreal-mcp v0.1.3
+# GameDevMCP v0.1.3
 
 Release date: 2026-02-26
 

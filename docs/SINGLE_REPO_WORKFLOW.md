@@ -1,6 +1,6 @@
 # Single-Repository Workflow
 
-This repository (`ns-unreal-mcp`) is the single source of truth.
+This repository (`GameDevMCP`) is the single source of truth.
 
 ## Scope
 
