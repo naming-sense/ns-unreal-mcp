@@ -18,6 +18,7 @@
 #include "Misc/Guid.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformProcess.h"
+#include "Containers/Set.h"
 #include "Policies/CondensedJsonPrintPolicy.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
@@ -85,6 +86,129 @@ namespace
 		}
 
 		return 0;
+	}
+
+	uint16 ParsePortFromWsUrl(const FString& WsUrl)
+	{
+		if (WsUrl.IsEmpty())
+		{
+			return 0;
+		}
+
+		FString Authority = WsUrl;
+		Authority.RemoveFromStart(TEXT("ws://"), ESearchCase::IgnoreCase);
+		Authority.RemoveFromStart(TEXT("wss://"), ESearchCase::IgnoreCase);
+
+		int32 PathSeparatorIndex = INDEX_NONE;
+		if (Authority.FindChar(TEXT('/'), PathSeparatorIndex))
+		{
+			Authority = Authority.Left(PathSeparatorIndex);
+		}
+
+		FString PortToken;
+		if (Authority.StartsWith(TEXT("[")))
+		{
+			const int32 BracketPortIndex = Authority.Find(TEXT("]:"));
+			if (BracketPortIndex == INDEX_NONE)
+			{
+				return 0;
+			}
+
+			PortToken = Authority.Mid(BracketPortIndex + 2);
+		}
+		else
+		{
+			int32 LastColonIndex = INDEX_NONE;
+			if (!Authority.FindLastChar(TEXT(':'), LastColonIndex) || LastColonIndex <= 0 || LastColonIndex >= (Authority.Len() - 1))
+			{
+				return 0;
+			}
+
+			PortToken = Authority.Mid(LastColonIndex + 1);
+		}
+
+		if (PortToken.IsEmpty())
+		{
+			return 0;
+		}
+
+		const int32 ParsedPort = FCString::Atoi(*PortToken);
+		if (ParsedPort <= 0 || ParsedPort > 65535)
+		{
+			return 0;
+		}
+
+		return static_cast<uint16>(ParsedPort);
+	}
+
+	void CollectReservedPortsFromInstanceIndex(
+		const FString& IndexFilePath,
+		const int64 CurrentTimestampMs,
+		const int64 StaleTtlMs,
+		const int32 CurrentProcessId,
+		TSet<uint16>& OutReservedPorts)
+	{
+		FString ExistingIndexContent;
+		if (!FFileHelper::LoadFileToString(ExistingIndexContent, *IndexFilePath))
+		{
+			return;
+		}
+
+		TSharedPtr<FJsonObject> ExistingIndexRoot;
+		const TSharedRef<TJsonReader<>> IndexReader = TJsonReaderFactory<>::Create(ExistingIndexContent);
+		if (!FJsonSerializer::Deserialize(IndexReader, ExistingIndexRoot) || !ExistingIndexRoot.IsValid())
+		{
+			return;
+		}
+
+		const TArray<TSharedPtr<FJsonValue>>* ExistingInstances = nullptr;
+		if (!ExistingIndexRoot->TryGetArrayField(TEXT("instances"), ExistingInstances) || ExistingInstances == nullptr)
+		{
+			return;
+		}
+
+		for (const TSharedPtr<FJsonValue>& ExistingValue : *ExistingInstances)
+		{
+			if (!ExistingValue.IsValid() || ExistingValue->Type != EJson::Object)
+			{
+				continue;
+			}
+
+			const TSharedPtr<FJsonObject> ExistingInstance = ExistingValue->AsObject();
+			if (!ExistingInstance.IsValid())
+			{
+				continue;
+			}
+
+			const int64 ExistingHeartbeatAtMs = JsonObjectToInt64Field(ExistingInstance, TEXT("heartbeat_at_ms"));
+			if (ExistingHeartbeatAtMs > 0
+				&& (CurrentTimestampMs - ExistingHeartbeatAtMs) > StaleTtlMs)
+			{
+				continue;
+			}
+
+			const int32 ExistingProcessId = static_cast<int32>(JsonObjectToInt64Field(ExistingInstance, TEXT("process_id")));
+			if (ExistingProcessId > 0)
+			{
+				if (ExistingProcessId == CurrentProcessId)
+				{
+					continue;
+				}
+
+				if (!FPlatformProcess::IsApplicationRunning(static_cast<uint32>(ExistingProcessId)))
+				{
+					continue;
+				}
+			}
+
+			FString ExistingWsUrl;
+			ExistingInstance->TryGetStringField(TEXT("ws_url"), ExistingWsUrl);
+			const uint16 ExistingPort = ParsePortFromWsUrl(ExistingWsUrl);
+			if (ExistingPort > 0)
+			{
+				OutReservedPorts.Add(ExistingPort);
+			}
+		}
 	}
 
 	template<typename TWebSocketServer>
@@ -250,9 +374,34 @@ void UMCPWebSocketTransportSubsystem::StartServer()
 	IWebSocketNetworkingModule& WebSocketModule = FModuleManager::LoadModuleChecked<IWebSocketNetworkingModule>(TEXT("WebSocketNetworking"));
 
 	const uint32 StartPort = static_cast<uint32>(PreferredPort);
+	const int64 CurrentTimestampMs = GetCurrentUnixTimestampMs();
+	const int32 CurrentProcessId = FPlatformProcess::GetCurrentProcessId();
+	const FString IndexFilePath = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("UnrealMCP/instances/index.json"));
+	TSet<uint16> ReservedPorts;
+	CollectReservedPortsFromInstanceIndex(
+		IndexFilePath,
+		CurrentTimestampMs,
+		InstanceRegistryStaleTtlMs,
+		CurrentProcessId,
+		ReservedPorts);
 	for (int32 Attempt = 0; Attempt < MaxPortScan; ++Attempt)
 	{
 		const uint32 CandidatePort = StartPort + static_cast<uint32>(Attempt);
+		if (CandidatePort > 65535)
+		{
+			break;
+		}
+
+		if (ReservedPorts.Contains(static_cast<uint16>(CandidatePort)))
+		{
+			UE_LOG(
+				LogUnrealMCP,
+				Verbose,
+				TEXT("Skipping MCP WS port %u because active instance registry marks it in-use."),
+				CandidatePort);
+			continue;
+		}
+
 		TUniquePtr<IWebSocketServer> CandidateServer = WebSocketModule.CreateServer();
 		if (!CandidateServer.IsValid())
 		{

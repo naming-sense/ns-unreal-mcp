@@ -512,8 +512,14 @@ def _is_stale_instance_candidate(candidate: _EndpointCandidate) -> bool:
     return (now_ms - heartbeat) > _INSTANCE_HEARTBEAT_STALE_MS
 
 
-def _candidate_key(candidate: _EndpointCandidate) -> tuple[str]:
-    return (candidate.ws_url,)
+def _candidate_key(candidate: _EndpointCandidate) -> tuple[str, ...]:
+    if candidate.instance_id:
+        return ("instance_id", candidate.instance_id)
+    if candidate.process_id is not None:
+        return ("process_id", str(candidate.process_id), candidate.ws_url)
+    if candidate.descriptor_file:
+        return ("descriptor_file", candidate.descriptor_file)
+    return ("ws_url", candidate.ws_url)
 
 
 def _candidate_sort_key(candidate: _EndpointCandidate) -> tuple[int, int]:

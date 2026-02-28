@@ -32,6 +32,9 @@ class UeWsTransport:
         reconnect_initial_delay_s: float = 0.5,
         reconnect_max_delay_s: float = 10.0,
         metrics: "RuntimeMetrics | None" = None,
+        expected_instance_id: str | None = None,
+        expected_process_id: int | None = None,
+        expected_project_dir: str | None = None,
     ) -> None:
         self._ws_url = ws_url
         self._ws_url_candidates = self._build_ws_url_candidates(ws_url)
@@ -44,8 +47,24 @@ class UeWsTransport:
         self._reconnect_max_delay_s = reconnect_max_delay_s
         self._metrics = metrics
 
+        self._expected_instance_id = expected_instance_id.strip() if isinstance(expected_instance_id, str) and expected_instance_id.strip() else None
+        self._expected_process_id = expected_process_id if isinstance(expected_process_id, int) and expected_process_id > 0 else None
+        self._expected_project_dir = (
+            self._normalize_project_dir(expected_project_dir)
+            if isinstance(expected_project_dir, str) and expected_project_dir.strip()
+            else None
+        )
+        self._require_handshake_validation = any(
+            (
+                self._expected_instance_id is not None,
+                self._expected_process_id is not None,
+                self._expected_project_dir is not None,
+            )
+        )
+
         self._stop_event = asyncio.Event()
         self._connected_event = asyncio.Event()
+        self._handshake_valid_event = asyncio.Event()
         self._send_lock = asyncio.Lock()
         self._run_task: asyncio.Task[None] | None = None
         self._ws: Any | None = None
@@ -103,6 +122,8 @@ class UeWsTransport:
         session_id: str | None = None,
     ) -> UeResponse:
         await self.wait_until_connected(timeout_s=self._connect_timeout_s)
+        if self._require_handshake_validation:
+            await asyncio.wait_for(self._handshake_valid_event.wait(), timeout=self._connect_timeout_s)
         return await self._request_broker.send_request(
             send_json=self.send_json,
             tool=tool,
@@ -174,6 +195,7 @@ class UeWsTransport:
                 ]
 
             self._ws = ws
+            self._handshake_valid_event.clear()
             self._connected_event.set()
             reconnect_delay = self._reconnect_initial_delay_s
             LOGGER.info("Connected to UE WS transport: %s", connected_url)
@@ -193,6 +215,7 @@ class UeWsTransport:
                 ping_task.cancel()
                 await asyncio.gather(ping_task, return_exceptions=True)
                 self._connected_event.clear()
+                self._handshake_valid_event.clear()
                 self._ws = None
                 await self._request_broker.fail_all(ConnectionError("UE WS transport disconnected."))
                 if self._metrics is not None:
@@ -255,6 +278,15 @@ class UeWsTransport:
             return
 
         if msg_type == "mcp.transport.connected":
+            mismatch_reason = self._handshake_mismatch_reason(message)
+            if mismatch_reason is not None:
+                if self._metrics is not None:
+                    self._metrics.inc("ue_transport.handshake_mismatch")
+                raise ConnectionError(mismatch_reason)
+
+            if self._require_handshake_validation:
+                self._handshake_valid_event.set()
+
             LOGGER.info("UE transport handshake: %s", message)
             if self._metrics is not None:
                 self._metrics.inc("ue_transport.handshake")
@@ -363,3 +395,51 @@ class UeWsTransport:
                 pass
 
         return False
+
+    def _handshake_mismatch_reason(self, message: dict[str, Any]) -> str | None:
+        if not self._require_handshake_validation:
+            return None
+
+        actual_instance_id = message.get("instance_id")
+        if self._expected_instance_id is not None:
+            if not isinstance(actual_instance_id, str) or actual_instance_id != self._expected_instance_id:
+                return (
+                    "UE handshake instance mismatch: "
+                    f"expected={self._expected_instance_id} actual={actual_instance_id}"
+                )
+
+        actual_process_id = message.get("process_id")
+        if self._expected_process_id is not None:
+            try:
+                parsed_process_id = int(actual_process_id)
+            except Exception:
+                parsed_process_id = None
+            if parsed_process_id != self._expected_process_id:
+                return (
+                    "UE handshake process mismatch: "
+                    f"expected={self._expected_process_id} actual={actual_process_id}"
+                )
+
+        if self._expected_project_dir is not None:
+            actual_project_dir = message.get("project_dir")
+            normalized_actual_project_dir = (
+                self._normalize_project_dir(actual_project_dir)
+                if isinstance(actual_project_dir, str)
+                else None
+            )
+            if normalized_actual_project_dir != self._expected_project_dir:
+                return (
+                    "UE handshake project_dir mismatch: "
+                    f"expected={self._expected_project_dir} actual={normalized_actual_project_dir or actual_project_dir}"
+                )
+
+        return None
+
+    @staticmethod
+    def _normalize_project_dir(raw_value: str) -> str:
+        value = raw_value.strip().replace("\\", "/")
+        if len(value) >= 2 and value[1] == ":":
+            drive = value[0].lower()
+            suffix = value[2:].lstrip("/")
+            value = f"/mnt/{drive}/{suffix}"
+        return value.rstrip("/").lower()

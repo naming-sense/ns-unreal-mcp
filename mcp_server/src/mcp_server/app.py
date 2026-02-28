@@ -89,6 +89,9 @@ async def run(
         reconnect_initial_delay_s=config.ue.reconnect.initial_delay_s,
         reconnect_max_delay_s=config.ue.reconnect.max_delay_s,
         metrics=metrics,
+        expected_instance_id=endpoint_resolution.instance_id,
+        expected_process_id=endpoint_resolution.process_id,
+        expected_project_dir=endpoint_resolution.project_dir,
     )
     facade = MCPFacade(transport)
     health_monitor = HealthMonitor(facade)
