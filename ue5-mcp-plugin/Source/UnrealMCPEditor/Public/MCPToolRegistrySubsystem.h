@@ -52,6 +52,7 @@ public:
 
 private:
 	void RegisterBuiltInTools();
+	void RegisterBuiltInToolsImpl();
 	void RegisterTool(FMCPToolDefinition Definition);
 	void LoadSchemaBundle();
 	TSharedPtr<FJsonObject> FindSchemaObject(const FString& ToolName, const FString& SchemaKey) const;

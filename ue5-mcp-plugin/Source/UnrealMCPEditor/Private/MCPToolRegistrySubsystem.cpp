@@ -2,37 +2,39 @@
 
 #include "Algo/Unique.h"
 #include "Editor.h"
-#include "AssetRegistry/IAssetRegistry.h"
-#include "AssetRegistry/AssetRegistryModule.h"
-#include "AssetImportTask.h"
-#include "AssetToolsModule.h"
 #include "MCPChangeSetSubsystem.h"
 #include "MCPErrorCodes.h"
-#include "MCPEventStreamSubsystem.h"
 #include "MCPJobSubsystem.h"
 #include "MCPLog.h"
 #include "MCPObjectUtils.h"
 #include "MCPObservabilitySubsystem.h"
-#include "MCPPolicySubsystem.h"
-#include "MCPWebSocketTransportSubsystem.h"
+#include "Tools/Common/MCPToolCommonJson.h"
+#include "Tools/Common/MCPToolAssetUtils.h"
+#include "Tools/Common/MCPToolDiagnostics.h"
+#include "Tools/Common/MCPToolSchemaValidator.h"
+#include "Tools/Common/MCPToolSettingsUtils.h"
+#include "Tools/Common/MCPToolUMGUtils.h"
+#include "Tools/Asset/MCPToolsAssetLifecycleHandler.h"
+#include "Tools/Asset/MCPToolsAssetQueryHandler.h"
+#include "Tools/Core/MCPToolsCoreHandler.h"
+#include "Tools/Material/MCPToolsMaterialHandler.h"
+#include "Tools/Niagara/MCPToolsNiagaraHandler.h"
+#include "Tools/Object/MCPToolsObjectHandler.h"
+#include "Tools/Ops/MCPToolsOpsHandler.h"
+#include "Tools/UMG/MCPToolsUMGAnimationHandler.h"
+#include "Tools/UMG/MCPToolsUMGBindingHandler.h"
+#include "Tools/UMG/MCPToolsUMGReadHandler.h"
+#include "Tools/UMG/MCPToolsUMGStructureHandler.h"
+#include "Tools/World/MCPToolsWorldHandler.h"
+#include "Tools/Settings/MCPToolsSettingsGameModeHandler.h"
+#include "Tools/Settings/MCPToolsSettingsComposeHandler.h"
+#include "Tools/Settings/MCPToolsSettingsProjectHandler.h"
 #include "ScopedTransaction.h"
 #include "Engine/Selection.h"
-#include "Engine/Texture.h"
 #include "EngineUtils.h"
-#include "Factories/Factory.h"
 #include "Factories/FbxImportUI.h"
-#include "FileHelpers.h"
-#include "GameMapsSettings.h"
 #include "GameFramework/Actor.h"
-#include "GameFramework/Pawn.h"
-#include "GameFramework/HUD.h"
-#include "GameFramework/PlayerController.h"
-#include "GameFramework/GameStateBase.h"
-#include "GameFramework/PlayerState.h"
-#include "GameFramework/GameModeBase.h"
-#include "GameFramework/SpectatorPawn.h"
 #include "HAL/FileManager.h"
-#include "IAssetTools.h"
 #include "ObjectTools.h"
 #include "WidgetBlueprint.h"
 #include "Engine/Blueprint.h"
@@ -51,9 +53,6 @@
 #include "KeyParams.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/KismetEditorUtilities.h"
-#include "Materials/MaterialInstance.h"
-#include "Materials/MaterialInstanceConstant.h"
-#include "Materials/MaterialInterface.h"
 #include "MovieScene.h"
 #include "Sections/MovieSceneColorSection.h"
 #include "Sections/MovieSceneFloatSection.h"
@@ -65,7 +64,6 @@
 #include "Misc/Guid.h"
 #include "Misc/FileHelper.h"
 #include "Misc/ConfigCacheIni.h"
-#include "Misc/PackageName.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopeLock.h"
 #include "Misc/SecureHash.h"
@@ -76,22 +74,17 @@
 #include "UObject/ObjectRedirector.h"
 #include "UObject/GarbageCollection.h"
 #include "UObject/Package.h"
-#include "UObject/SoftObjectPath.h"
 #include "UObject/UnrealType.h"
 #include "UObject/UObjectGlobals.h"
 #include "UObject/UObjectIterator.h"
 #include <type_traits>
 #include <utility>
 
-#if PLATFORM_WINDOWS && __has_include("ILiveCodingModule.h")
-#include "ILiveCodingModule.h"
-#define MCP_WITH_LIVE_CODING 1
-#else
-#define MCP_WITH_LIVE_CODING 0
-#endif
-
 namespace
 {
+	using MCPToolCommonJson::ParseCursor;
+	using MCPToolCommonJson::ToJsonStringArray;
+
 	FString HashToHexSha1(const FString& Input)
 	{
 		FTCHARToUTF8 Utf8Data(*Input);
@@ -112,524 +105,54 @@ namespace
 		return ToolName;
 	}
 
-	int32 ParseCursor(const TSharedPtr<FJsonObject>& Params)
-	{
-		if (!Params.IsValid())
-		{
-			return 0;
-		}
-
-		FString CursorString;
-		if (Params->TryGetStringField(TEXT("cursor"), CursorString))
-		{
-			return FCString::Atoi(*CursorString);
-		}
-
-		double CursorNumber = 0;
-		if (Params->TryGetNumberField(TEXT("cursor"), CursorNumber))
-		{
-			return static_cast<int32>(CursorNumber);
-		}
-
-		return 0;
-	}
-
-#if MCP_WITH_LIVE_CODING
-	FString LiveCodingCompileResultToString(const ELiveCodingCompileResult Result)
-	{
-		switch (Result)
-		{
-		case ELiveCodingCompileResult::Success:
-			return TEXT("success");
-		case ELiveCodingCompileResult::NoChanges:
-			return TEXT("no_changes");
-		case ELiveCodingCompileResult::InProgress:
-			return TEXT("in_progress");
-		case ELiveCodingCompileResult::CompileStillActive:
-			return TEXT("compile_still_active");
-		case ELiveCodingCompileResult::NotStarted:
-			return TEXT("not_started");
-		case ELiveCodingCompileResult::Failure:
-			return TEXT("failure");
-		case ELiveCodingCompileResult::Cancelled:
-			return TEXT("cancelled");
-		default:
-			break;
-		}
-
-		return TEXT("unknown");
-	}
-#endif
-
-	int32 AddFloatKeyWithInterpolation(
-		FMovieSceneFloatChannel* Channel,
-		const FFrameNumber FrameNumber,
-		const float Value,
-		const EMovieSceneKeyInterpolation Interpolation)
-	{
-		if (Channel == nullptr)
-		{
-			return INDEX_NONE;
-		}
-
-		switch (Interpolation)
-		{
-		case EMovieSceneKeyInterpolation::Constant:
-			return Channel->AddConstantKey(FrameNumber, Value);
-		case EMovieSceneKeyInterpolation::Linear:
-			return Channel->AddLinearKey(FrameNumber, Value);
-		case EMovieSceneKeyInterpolation::Auto:
-		case EMovieSceneKeyInterpolation::SmartAuto:
-			return Channel->AddCubicKey(FrameNumber, Value, RCTM_Auto);
-		case EMovieSceneKeyInterpolation::User:
-		case EMovieSceneKeyInterpolation::Break:
-			return Channel->AddCubicKey(FrameNumber, Value, RCTM_User);
-		default:
-			break;
-		}
-
-		return Channel->AddCubicKey(FrameNumber, Value, RCTM_Auto);
-	}
-
-	FString GetJsonTypeName(const EJson JsonType)
-	{
-		switch (JsonType)
-		{
-		case EJson::String:
-			return TEXT("string");
-		case EJson::Number:
-			return TEXT("number");
-		case EJson::Boolean:
-			return TEXT("boolean");
-		case EJson::Array:
-			return TEXT("array");
-		case EJson::Object:
-			return TEXT("object");
-		case EJson::Null:
-			return TEXT("null");
-		default:
-			return TEXT("none");
-		}
-	}
-
-	bool JsonValuesEquivalent(const TSharedPtr<FJsonValue>& Left, const TSharedPtr<FJsonValue>& Right)
-	{
-		if (!Left.IsValid() || !Right.IsValid() || Left->Type != Right->Type)
-		{
-			return false;
-		}
-
-		switch (Left->Type)
-		{
-		case EJson::String:
-		{
-			FString LeftString;
-			FString RightString;
-			return Left->TryGetString(LeftString) && Right->TryGetString(RightString) && LeftString == RightString;
-		}
-		case EJson::Number:
-		{
-			double LeftNumber = 0.0;
-			double RightNumber = 0.0;
-			return Left->TryGetNumber(LeftNumber) && Right->TryGetNumber(RightNumber) && FMath::IsNearlyEqual(LeftNumber, RightNumber);
-		}
-		case EJson::Boolean:
-		{
-			bool bLeftBool = false;
-			bool bRightBool = false;
-			return Left->TryGetBool(bLeftBool) && Right->TryGetBool(bRightBool) && bLeftBool == bRightBool;
-		}
-		case EJson::Null:
-			return true;
-		default:
-			return false;
-		}
-	}
-
-	bool ValidateJsonValueAgainstSchema(
-		const TSharedPtr<FJsonValue>& JsonValue,
-		const TSharedPtr<FJsonObject>& SchemaObject,
-		const FString& Path,
-		FString& OutError)
-	{
-		if (!SchemaObject.IsValid())
-		{
-			return true;
-		}
-
-		const TArray<TSharedPtr<FJsonValue>>* EnumValues = nullptr;
-		if (SchemaObject->TryGetArrayField(TEXT("enum"), EnumValues) && EnumValues != nullptr && EnumValues->Num() > 0)
-		{
-			bool bMatched = false;
-			for (const TSharedPtr<FJsonValue>& EnumValue : *EnumValues)
-			{
-				if (JsonValuesEquivalent(JsonValue, EnumValue))
-				{
-					bMatched = true;
-					break;
-				}
-			}
-
-			if (!bMatched)
-			{
-				OutError = FString::Printf(TEXT("%s does not match enum constraints."), *Path);
-				return false;
-			}
-		}
-
-		FString ExpectedType;
-		SchemaObject->TryGetStringField(TEXT("type"), ExpectedType);
-		if (ExpectedType.IsEmpty())
-		{
-			return true;
-		}
-
-		if (ExpectedType.Equals(TEXT("object"), ESearchCase::IgnoreCase))
-		{
-			if (!JsonValue.IsValid() || JsonValue->Type != EJson::Object)
-			{
-				OutError = FString::Printf(TEXT("%s expected object but got %s."), *Path, *GetJsonTypeName(JsonValue.IsValid() ? JsonValue->Type : EJson::None));
-				return false;
-			}
-
-			const TSharedPtr<FJsonObject> ValueObject = JsonValue->AsObject();
-			const TSharedPtr<FJsonObject>* PropertiesObject = nullptr;
-			const bool bHasProperties = SchemaObject->TryGetObjectField(TEXT("properties"), PropertiesObject) && PropertiesObject != nullptr && PropertiesObject->IsValid();
-			bool bAllowAdditionalProperties = true;
-			if (SchemaObject->HasField(TEXT("additionalProperties")))
-			{
-				SchemaObject->TryGetBoolField(TEXT("additionalProperties"), bAllowAdditionalProperties);
-			}
-
-			const TArray<TSharedPtr<FJsonValue>>* RequiredFields = nullptr;
-			if (SchemaObject->TryGetArrayField(TEXT("required"), RequiredFields) && RequiredFields != nullptr)
-			{
-				for (const TSharedPtr<FJsonValue>& RequiredFieldValue : *RequiredFields)
-				{
-					FString RequiredField;
-					if (RequiredFieldValue.IsValid() && RequiredFieldValue->TryGetString(RequiredField) && !ValueObject->HasField(RequiredField))
-					{
-						OutError = FString::Printf(TEXT("%s/%s is required."), *Path, *RequiredField);
-						return false;
-					}
-				}
-			}
-
-			for (const TPair<FString, TSharedPtr<FJsonValue>>& Entry : ValueObject->Values)
-			{
-				const TSharedPtr<FJsonObject>* PropertySchema = nullptr;
-				const bool bHasPropertySchema = bHasProperties && (*PropertiesObject)->TryGetObjectField(Entry.Key, PropertySchema) && PropertySchema != nullptr && PropertySchema->IsValid();
-				if (bHasPropertySchema)
-				{
-					const FString ChildPath = FString::Printf(TEXT("%s/%s"), *Path, *Entry.Key);
-					if (!ValidateJsonValueAgainstSchema(Entry.Value, *PropertySchema, ChildPath, OutError))
-					{
-						return false;
-					}
-				}
-				else if (!bAllowAdditionalProperties)
-				{
-					OutError = FString::Printf(TEXT("%s/%s is not allowed by schema."), *Path, *Entry.Key);
-					return false;
-				}
-			}
-
-			return true;
-		}
-
-		if (ExpectedType.Equals(TEXT("array"), ESearchCase::IgnoreCase))
-		{
-			if (!JsonValue.IsValid() || JsonValue->Type != EJson::Array)
-			{
-				OutError = FString::Printf(TEXT("%s expected array but got %s."), *Path, *GetJsonTypeName(JsonValue.IsValid() ? JsonValue->Type : EJson::None));
-				return false;
-			}
-
-			const TArray<TSharedPtr<FJsonValue>>& ValueArray = JsonValue->AsArray();
-			double MinItems = 0.0;
-			if (SchemaObject->TryGetNumberField(TEXT("minItems"), MinItems) && ValueArray.Num() < static_cast<int32>(MinItems))
-			{
-				OutError = FString::Printf(TEXT("%s expected at least %d items."), *Path, static_cast<int32>(MinItems));
-				return false;
-			}
-
-			double MaxItems = 0.0;
-			if (SchemaObject->TryGetNumberField(TEXT("maxItems"), MaxItems) && ValueArray.Num() > static_cast<int32>(MaxItems))
-			{
-				OutError = FString::Printf(TEXT("%s expected at most %d items."), *Path, static_cast<int32>(MaxItems));
-				return false;
-			}
-
-			const TSharedPtr<FJsonObject>* ItemSchemaObject = nullptr;
-			if (SchemaObject->TryGetObjectField(TEXT("items"), ItemSchemaObject) && ItemSchemaObject != nullptr && ItemSchemaObject->IsValid())
-			{
-				for (int32 Index = 0; Index < ValueArray.Num(); ++Index)
-				{
-					const FString ChildPath = FString::Printf(TEXT("%s[%d]"), *Path, Index);
-					if (!ValidateJsonValueAgainstSchema(ValueArray[Index], *ItemSchemaObject, ChildPath, OutError))
-					{
-						return false;
-					}
-				}
-			}
-
-			return true;
-		}
-
-		if (ExpectedType.Equals(TEXT("string"), ESearchCase::IgnoreCase))
-		{
-			FString ValueString;
-			if (!JsonValue.IsValid() || !JsonValue->TryGetString(ValueString))
-			{
-				OutError = FString::Printf(TEXT("%s expected string but got %s."), *Path, *GetJsonTypeName(JsonValue.IsValid() ? JsonValue->Type : EJson::None));
-				return false;
-			}
-
-			double MinLength = 0.0;
-			if (SchemaObject->TryGetNumberField(TEXT("minLength"), MinLength) && ValueString.Len() < static_cast<int32>(MinLength))
-			{
-				OutError = FString::Printf(TEXT("%s expected minimum length %d."), *Path, static_cast<int32>(MinLength));
-				return false;
-			}
-
-			double MaxLength = 0.0;
-			if (SchemaObject->TryGetNumberField(TEXT("maxLength"), MaxLength) && ValueString.Len() > static_cast<int32>(MaxLength))
-			{
-				OutError = FString::Printf(TEXT("%s expected maximum length %d."), *Path, static_cast<int32>(MaxLength));
-				return false;
-			}
-
-			return true;
-		}
-
-		if (ExpectedType.Equals(TEXT("number"), ESearchCase::IgnoreCase) || ExpectedType.Equals(TEXT("integer"), ESearchCase::IgnoreCase))
-		{
-			double ValueNumber = 0.0;
-			if (!JsonValue.IsValid() || !JsonValue->TryGetNumber(ValueNumber))
-			{
-				OutError = FString::Printf(TEXT("%s expected %s but got %s."), *Path, *ExpectedType, *GetJsonTypeName(JsonValue.IsValid() ? JsonValue->Type : EJson::None));
-				return false;
-			}
-
-			if (ExpectedType.Equals(TEXT("integer"), ESearchCase::IgnoreCase) &&
-				FMath::Abs(ValueNumber - FMath::RoundToDouble(ValueNumber)) > KINDA_SMALL_NUMBER)
-			{
-				OutError = FString::Printf(TEXT("%s expected integer value."), *Path);
-				return false;
-			}
-
-			double Minimum = 0.0;
-			if (SchemaObject->TryGetNumberField(TEXT("minimum"), Minimum) && ValueNumber < Minimum)
-			{
-				OutError = FString::Printf(TEXT("%s expected value >= %g."), *Path, Minimum);
-				return false;
-			}
-
-			double Maximum = 0.0;
-			if (SchemaObject->TryGetNumberField(TEXT("maximum"), Maximum) && ValueNumber > Maximum)
-			{
-				OutError = FString::Printf(TEXT("%s expected value <= %g."), *Path, Maximum);
-				return false;
-			}
-
-			return true;
-		}
-
-		if (ExpectedType.Equals(TEXT("boolean"), ESearchCase::IgnoreCase))
-		{
-			bool bValue = false;
-			if (!JsonValue.IsValid() || !JsonValue->TryGetBool(bValue))
-			{
-				OutError = FString::Printf(TEXT("%s expected boolean but got %s."), *Path, *GetJsonTypeName(JsonValue.IsValid() ? JsonValue->Type : EJson::None));
-				return false;
-			}
-			return true;
-		}
-
-		if (ExpectedType.Equals(TEXT("null"), ESearchCase::IgnoreCase))
-		{
-			if (!JsonValue.IsValid() || JsonValue->Type != EJson::Null)
-			{
-				OutError = FString::Printf(TEXT("%s expected null but got %s."), *Path, *GetJsonTypeName(JsonValue.IsValid() ? JsonValue->Type : EJson::None));
-				return false;
-			}
-		}
-
-		return true;
-	}
-
-	bool MatchesAnyClassPath(const TSet<FString>& AllowedClassPaths, const FString& ClassPath)
-	{
-		return AllowedClassPaths.Num() == 0 || AllowedClassPaths.Contains(ClassPath);
-	}
-
 	FString NormalizePackageNameFromInput(const FString& InputPath)
 	{
-		FString PackageName = InputPath;
-		if (FPackageName::IsValidObjectPath(InputPath) || InputPath.Contains(TEXT(".")))
-		{
-			const FString ObjectPathPackage = FPackageName::ObjectPathToPackageName(InputPath);
-			if (!ObjectPathPackage.IsEmpty())
-			{
-				PackageName = ObjectPathPackage;
-			}
-		}
-		return PackageName;
+		return MCPToolAssetUtils::NormalizePackageNameFromInput(InputPath);
 	}
 
 	UPackage* ResolvePackageByName(const FString& InputPath)
 	{
-		const FString PackageName = NormalizePackageNameFromInput(InputPath);
-		if (PackageName.IsEmpty())
-		{
-			return nullptr;
-		}
-
-		UPackage* Package = FindPackage(nullptr, *PackageName);
-		if (Package == nullptr)
-		{
-			Package = LoadPackage(nullptr, *PackageName, LOAD_None);
-		}
-
-		return Package;
+		return MCPToolAssetUtils::ResolvePackageByName(InputPath);
 	}
 
 	FString BuildPackageName(const FString& PackagePath, const FString& AssetName)
 	{
-		if (PackagePath.IsEmpty() || AssetName.IsEmpty())
-		{
-			return FString();
-		}
-		return FString::Printf(TEXT("%s/%s"), *PackagePath, *AssetName);
+		return MCPToolAssetUtils::BuildPackageName(PackagePath, AssetName);
 	}
 
 	FString BuildObjectPath(const FString& PackagePath, const FString& AssetName)
 	{
-		if (PackagePath.IsEmpty() || AssetName.IsEmpty())
-		{
-			return FString();
-		}
-		return FString::Printf(TEXT("%s/%s.%s"), *PackagePath, *AssetName, *AssetName);
+		return MCPToolAssetUtils::BuildObjectPath(PackagePath, AssetName);
 	}
 
 	bool IsValidAssetDestination(const FString& PackagePath, const FString& AssetName)
 	{
-		if (!FPackageName::IsValidLongPackageName(PackagePath))
-		{
-			return false;
-		}
-
-		const FString ObjectPath = BuildObjectPath(PackagePath, AssetName);
-		return !ObjectPath.IsEmpty() && FPackageName::IsValidObjectPath(ObjectPath);
+		return MCPToolAssetUtils::IsValidAssetDestination(PackagePath, AssetName);
 	}
 
-		UObject* ResolveObjectByPath(const FString& ObjectPath)
-		{
-			if (ObjectPath.IsEmpty())
-			{
-				return nullptr;
-			}
-
-			UObject* Object = FindObject<UObject>(nullptr, *ObjectPath);
-			if (Object == nullptr)
-			{
-				Object = LoadObject<UObject>(nullptr, *ObjectPath, nullptr, LOAD_NoWarn | LOAD_Quiet);
-			}
-			return Object;
-		}
+	UObject* ResolveObjectByPath(const FString& ObjectPath)
+	{
+		return MCPToolAssetUtils::ResolveObjectByPath(ObjectPath);
+	}
 
 	UClass* ResolveClassByPath(const FString& ClassPath)
 	{
-		if (ClassPath.IsEmpty())
-		{
-			return nullptr;
-		}
-
-		UClass* ClassObject = FindObject<UClass>(nullptr, *ClassPath);
-		if (ClassObject != nullptr)
-		{
-			return ClassObject;
-		}
-
-		const FString WrappedClassPath = FString::Printf(TEXT("Class'%s'"), *ClassPath);
-		ClassObject = LoadObject<UClass>(nullptr, *WrappedClassPath);
-		if (ClassObject != nullptr)
-		{
-			return ClassObject;
-		}
-
-		ClassObject = LoadObject<UClass>(nullptr, *ClassPath);
-		if (ClassObject != nullptr)
-		{
-			return ClassObject;
-		}
-
-		const int32 DotIndex = ClassPath.Find(TEXT("."), ESearchCase::IgnoreCase, ESearchDir::FromEnd);
-		if (DotIndex != INDEX_NONE && DotIndex + 1 < ClassPath.Len())
-		{
-			const FString ClassName = ClassPath.Mid(DotIndex + 1);
-			ClassObject = FindFirstObject<UClass>(*ClassName, EFindFirstObjectOptions::None, ELogVerbosity::NoLogging);
-		}
-
-		return ClassObject;
+		return MCPToolAssetUtils::ResolveClassByPath(ClassPath);
 	}
 
 	bool ParseAutoSaveOption(const TSharedPtr<FJsonObject>& Params, bool& bOutAutoSave)
 	{
-		bOutAutoSave = false;
-		if (!Params.IsValid())
-		{
-			return true;
-		}
-
-		const TSharedPtr<FJsonObject>* SaveObject = nullptr;
-		if (Params->TryGetObjectField(TEXT("save"), SaveObject) && SaveObject != nullptr && SaveObject->IsValid())
-		{
-			(*SaveObject)->TryGetBoolField(TEXT("auto_save"), bOutAutoSave);
-		}
-		return true;
+		return MCPToolSettingsUtils::ParseAutoSaveOption(Params, bOutAutoSave);
 	}
-
-	struct FMCPSettingsSaveOptions
-	{
-		bool bSaveConfig = true;
-		bool bFlushIni = true;
-		bool bReloadVerify = true;
-	};
 
 	bool ParseSettingsSaveOptions(const TSharedPtr<FJsonObject>& Params, FMCPSettingsSaveOptions& OutOptions)
 	{
-		OutOptions = FMCPSettingsSaveOptions();
-		if (!Params.IsValid())
-		{
-			return true;
-		}
-
-		const TSharedPtr<FJsonObject>* SaveObject = nullptr;
-		if (Params->TryGetObjectField(TEXT("save"), SaveObject) && SaveObject != nullptr && SaveObject->IsValid())
-		{
-			(*SaveObject)->TryGetBoolField(TEXT("save_config"), OutOptions.bSaveConfig);
-			(*SaveObject)->TryGetBoolField(TEXT("flush_ini"), OutOptions.bFlushIni);
-			(*SaveObject)->TryGetBoolField(TEXT("reload_verify"), OutOptions.bReloadVerify);
-		}
-
-		return true;
+		return MCPToolSettingsUtils::ParseSettingsSaveOptions(Params, OutOptions);
 	}
 
 	FString ParseTransactionLabel(const TSharedPtr<FJsonObject>& Params, const FString& DefaultLabel)
 	{
-		if (!Params.IsValid())
-		{
-			return DefaultLabel;
-		}
-
-		FString TransactionLabel = DefaultLabel;
-		const TSharedPtr<FJsonObject>* TransactionObject = nullptr;
-		if (Params->TryGetObjectField(TEXT("transaction"), TransactionObject) && TransactionObject != nullptr && TransactionObject->IsValid())
-		{
-			(*TransactionObject)->TryGetStringField(TEXT("label"), TransactionLabel);
-		}
-		return TransactionLabel;
+		return MCPToolSettingsUtils::ParseTransactionLabel(Params, DefaultLabel);
 	}
 
 	bool ParseTopLevelPatchProperties(
@@ -826,331 +349,56 @@ namespace
 		return true;
 	}
 
-	bool TryInspectSettingsPropertyValue(
-		UObject* ConfigObject,
-		const FString& PropertyName,
-		const int32 Depth,
-		TSharedPtr<FJsonValue>& OutValue)
-	{
-		OutValue.Reset();
-		if (ConfigObject == nullptr || PropertyName.IsEmpty())
-		{
-			return false;
-		}
-
-		TSharedRef<FJsonObject> FiltersObject = MakeShared<FJsonObject>();
-		FiltersObject->SetBoolField(TEXT("only_editable"), false);
-		FiltersObject->SetBoolField(TEXT("include_transient"), true);
-		FiltersObject->SetStringField(TEXT("property_name_glob"), PropertyName);
-
-		TArray<TSharedPtr<FJsonValue>> Properties;
-		MCPObjectUtils::InspectObject(ConfigObject, FiltersObject, Depth, Properties);
-		for (const TSharedPtr<FJsonValue>& PropertyValue : Properties)
-		{
-			if (!PropertyValue.IsValid() || PropertyValue->Type != EJson::Object)
-			{
-				continue;
-			}
-
-			const TSharedPtr<FJsonObject> PropertyObject = PropertyValue->AsObject();
-			FString CandidateName;
-			PropertyObject->TryGetStringField(TEXT("name"), CandidateName);
-			if (!CandidateName.Equals(PropertyName, ESearchCase::IgnoreCase))
-			{
-				continue;
-			}
-
-			if (const TSharedPtr<FJsonValue>* ValueField = PropertyObject->Values.Find(TEXT("value")); ValueField != nullptr && (*ValueField).IsValid())
-			{
-				OutValue = *ValueField;
-				return true;
-			}
-		}
-
-		return false;
-	}
-
 	FString GetSettingsStringProperty(UObject* ConfigObject, const FString& PropertyName)
 	{
-		TSharedPtr<FJsonValue> PropertyValue;
-		if (TryInspectSettingsPropertyValue(ConfigObject, PropertyName, 3, PropertyValue) && PropertyValue.IsValid())
-		{
-			FString StringValue;
-			if (PropertyValue->TryGetString(StringValue))
-			{
-				return StringValue;
-			}
-		}
-		return FString();
+		return MCPToolSettingsUtils::GetSettingsStringProperty(ConfigObject, PropertyName);
 	}
 
 	bool GetGameModeMapOverrideRawArray(UObject* ConfigObject, TArray<TSharedPtr<FJsonValue>>& OutRawArray)
 	{
-		OutRawArray.Reset();
-		TSharedPtr<FJsonValue> PropertyValue;
-		if (!TryInspectSettingsPropertyValue(ConfigObject, TEXT("GameModeMapPrefixes"), 5, PropertyValue) || !PropertyValue.IsValid())
-		{
-			return true;
-		}
-
-		if (PropertyValue->Type != EJson::Array)
-		{
-			return false;
-		}
-
-		OutRawArray = PropertyValue->AsArray();
-		return true;
+		return MCPToolSettingsUtils::GetGameModeMapOverrideRawArray(ConfigObject, OutRawArray);
 	}
 
 	bool TryGetMapOverrideGameModeClassPath(const TSharedPtr<FJsonObject>& RawEntry, FString& OutClassPath)
 	{
-		OutClassPath.Reset();
-		if (!RawEntry.IsValid())
-		{
-			return false;
-		}
-
-		if (RawEntry->TryGetStringField(TEXT("GameMode"), OutClassPath) && !OutClassPath.IsEmpty())
-		{
-			return true;
-		}
-		if (RawEntry->TryGetStringField(TEXT("game_mode"), OutClassPath) && !OutClassPath.IsEmpty())
-		{
-			return true;
-		}
-
-		auto ExtractFromSoftClassObject = [&OutClassPath](const TSharedPtr<FJsonObject>& SoftClassObject) -> bool
-		{
-			if (!SoftClassObject.IsValid())
-			{
-				return false;
-			}
-
-			if (SoftClassObject->TryGetStringField(TEXT("AssetPath"), OutClassPath) && !OutClassPath.IsEmpty())
-			{
-				return true;
-			}
-
-			const TSharedPtr<FJsonObject>* AssetPathObject = nullptr;
-			if (SoftClassObject->TryGetObjectField(TEXT("AssetPath"), AssetPathObject) &&
-				AssetPathObject != nullptr &&
-				(*AssetPathObject).IsValid())
-			{
-				FString PackageName;
-				FString AssetName;
-				(*AssetPathObject)->TryGetStringField(TEXT("PackageName"), PackageName);
-				(*AssetPathObject)->TryGetStringField(TEXT("AssetName"), AssetName);
-				if (!PackageName.IsEmpty() && !AssetName.IsEmpty())
-				{
-					OutClassPath = FString::Printf(TEXT("%s.%s"), *PackageName, *AssetName);
-					return true;
-				}
-			}
-
-			return false;
-		};
-
-		const TSharedPtr<FJsonObject>* SoftClassObject = nullptr;
-		if (RawEntry->TryGetObjectField(TEXT("GameMode"), SoftClassObject) &&
-			SoftClassObject != nullptr &&
-			ExtractFromSoftClassObject(*SoftClassObject))
-		{
-			return true;
-		}
-
-		if (RawEntry->TryGetObjectField(TEXT("game_mode"), SoftClassObject) &&
-			SoftClassObject != nullptr &&
-			ExtractFromSoftClassObject(*SoftClassObject))
-		{
-			return true;
-		}
-
-		return false;
+		return MCPToolSettingsUtils::TryGetMapOverrideGameModeClassPath(RawEntry, OutClassPath);
 	}
 
 	TSharedRef<FJsonValueObject> BuildSoftClassPathJsonValue(const FString& ClassPath)
 	{
-		TSharedRef<FJsonObject> SoftClassObject = MakeShared<FJsonObject>();
-
-		FString NormalizedClassPath = ClassPath;
-		NormalizedClassPath.TrimStartAndEndInline();
-		if (NormalizedClassPath.StartsWith(TEXT("Class'")) && NormalizedClassPath.EndsWith(TEXT("'")))
-		{
-			NormalizedClassPath = NormalizedClassPath.Mid(6, NormalizedClassPath.Len() - 7);
-		}
-
-		FString PackageName = TEXT("None");
-		FString AssetName = TEXT("None");
-		if (!NormalizedClassPath.IsEmpty())
-		{
-			FString LeftPart;
-			FString RightPart;
-			if (NormalizedClassPath.Split(TEXT("."), &LeftPart, &RightPart, ESearchCase::CaseSensitive, ESearchDir::FromEnd))
-			{
-				if (!LeftPart.IsEmpty())
-				{
-					PackageName = LeftPart;
-				}
-				if (!RightPart.IsEmpty())
-				{
-					AssetName = RightPart;
-				}
-			}
-			else
-			{
-				PackageName = NormalizedClassPath;
-				AssetName = FPackageName::GetShortName(NormalizedClassPath);
-			}
-		}
-
-		TSharedRef<FJsonObject> AssetPathObject = MakeShared<FJsonObject>();
-		AssetPathObject->SetStringField(TEXT("PackageName"), PackageName);
-		AssetPathObject->SetStringField(TEXT("AssetName"), AssetName);
-
-		SoftClassObject->SetObjectField(TEXT("AssetPath"), AssetPathObject);
-		SoftClassObject->SetStringField(TEXT("SubPathString"), TEXT(""));
-		return MakeShared<FJsonValueObject>(SoftClassObject);
+		return MCPToolSettingsUtils::BuildSoftClassPathJsonValue(ClassPath);
 	}
 
 	TArray<TSharedPtr<FJsonValue>> BuildMapOverrideEntriesFromRaw(const TArray<TSharedPtr<FJsonValue>>& RawArray)
 	{
-		TArray<TSharedPtr<FJsonValue>> Entries;
-		for (const TSharedPtr<FJsonValue>& RawEntryValue : RawArray)
-		{
-			if (!RawEntryValue.IsValid() || RawEntryValue->Type != EJson::Object)
-			{
-				continue;
-			}
-
-			const TSharedPtr<FJsonObject> RawEntry = RawEntryValue->AsObject();
-			FString MapKey;
-			FString GameModeClassPath;
-			RawEntry->TryGetStringField(TEXT("Name"), MapKey);
-			if (MapKey.IsEmpty())
-			{
-				RawEntry->TryGetStringField(TEXT("name"), MapKey);
-			}
-			TryGetMapOverrideGameModeClassPath(RawEntry, GameModeClassPath);
-
-			if (MapKey.IsEmpty())
-			{
-				continue;
-			}
-
-			TSharedRef<FJsonObject> EntryObject = MakeShared<FJsonObject>();
-			EntryObject->SetStringField(TEXT("map_key"), MapKey);
-			EntryObject->SetStringField(TEXT("game_mode_class_path"), GameModeClassPath);
-			Entries.Add(MakeShared<FJsonValueObject>(EntryObject));
-		}
-		return Entries;
+		return MCPToolSettingsUtils::BuildMapOverrideEntriesFromRaw(RawArray);
 	}
 
 	bool ResolveGameModeClassPath(const FString& GameModeClassPath, FString& OutResolvedPath, FMCPDiagnostic& OutDiagnostic)
 	{
-		OutResolvedPath = GameModeClassPath;
-		if (GameModeClassPath.IsEmpty())
-		{
-			return true;
-		}
-
-		UClass* ResolvedClass = ResolveClassByPath(GameModeClassPath);
-		if (ResolvedClass == nullptr || !ResolvedClass->IsChildOf(AGameModeBase::StaticClass()))
-		{
-			OutDiagnostic.Code = MCPErrorCodes::GAMEMODE_CLASS_INVALID;
-			OutDiagnostic.Message = TEXT("game_mode_class_path is invalid.");
-			OutDiagnostic.Detail = GameModeClassPath;
-			OutDiagnostic.Suggestion = TEXT("Provide a class path that resolves to AGameModeBase subclass.");
-			return false;
-		}
-
-		OutResolvedPath = ResolvedClass->GetPathName();
-		return true;
+		return MCPToolSettingsUtils::ResolveGameModeClassPath(
+			GameModeClassPath,
+			[](const FString& RequestedPath)
+			{
+				return ResolveClassByPath(RequestedPath);
+			},
+			OutResolvedPath,
+			OutDiagnostic);
 	}
 
 	bool ParseStringArrayField(const TSharedPtr<FJsonObject>& Params, const FString& FieldName, TArray<FString>& OutValues)
 	{
-		OutValues.Reset();
-		if (!Params.IsValid())
-		{
-			return false;
-		}
-
-		const TArray<TSharedPtr<FJsonValue>>* Values = nullptr;
-		if (!Params->TryGetArrayField(FieldName, Values) || Values == nullptr)
-		{
-			return false;
-		}
-
-		for (const TSharedPtr<FJsonValue>& Value : *Values)
-		{
-			FString Text;
-			if (Value.IsValid() && Value->TryGetString(Text) && !Text.IsEmpty())
-			{
-				OutValues.Add(Text);
-			}
-		}
-
-		return true;
+		return MCPToolSettingsUtils::ParseStringArrayField(Params, FieldName, OutValues);
 	}
 
 	bool SavePackageByName(const FString& PackageName, FMCPToolExecutionResult& OutResult)
 	{
-		UPackage* PackageToSave = ResolvePackageByName(PackageName);
-		if (PackageToSave == nullptr)
-		{
-			FMCPDiagnostic Diagnostic;
-			Diagnostic.Code = MCPErrorCodes::OBJECT_NOT_FOUND;
-			Diagnostic.Severity = TEXT("warning");
-			Diagnostic.Message = TEXT("Package was not found while saving asset lifecycle result.");
-			Diagnostic.Detail = PackageName;
-			OutResult.Diagnostics.Add(Diagnostic);
-			return false;
-		}
-
-		const TArray<UPackage*> PackagesToSave{ PackageToSave };
-		const bool bSaved = UEditorLoadingAndSavingUtils::SavePackages(PackagesToSave, true);
-		if (!bSaved)
-		{
-			FMCPDiagnostic Diagnostic;
-			Diagnostic.Code = MCPErrorCodes::SAVE_FAILED;
-			Diagnostic.Severity = TEXT("warning");
-			Diagnostic.Message = TEXT("Package save failed.");
-			Diagnostic.Detail = PackageName;
-			Diagnostic.bRetriable = true;
-			OutResult.Diagnostics.Add(Diagnostic);
-			return false;
-		}
-
-		return true;
-	}
-
-	TArray<TSharedPtr<FJsonValue>> ToJsonStringArray(const TArray<FString>& Values)
-	{
-		TArray<TSharedPtr<FJsonValue>> OutValues;
-		OutValues.Reserve(Values.Num());
-		for (const FString& Value : Values)
-		{
-			OutValues.Add(MakeShared<FJsonValueString>(Value));
-		}
-		return OutValues;
+		return MCPToolAssetUtils::SavePackageByName(PackageName, OutResult);
 	}
 
 	FString BuildGeneratedClassPathFromObjectPath(const FString& ObjectPath)
 	{
-		if (ObjectPath.IsEmpty())
-		{
-			return FString();
-		}
-
-		int32 DotIndex = INDEX_NONE;
-		if (!ObjectPath.FindLastChar(TEXT('.'), DotIndex) || DotIndex + 1 >= ObjectPath.Len())
-		{
-			return FString::Printf(TEXT("%s_C"), *ObjectPath);
-		}
-
-		const FString Left = ObjectPath.Left(DotIndex + 1);
-		const FString Right = ObjectPath.Mid(DotIndex + 1);
-		return FString::Printf(TEXT("%s%s_C"), *Left, *Right);
+		return MCPToolAssetUtils::BuildGeneratedClassPathFromObjectPath(ObjectPath);
 	}
 
 	struct FMCPBlueprintCreateOptions
@@ -1418,1526 +666,64 @@ namespace
 		return true;
 	}
 
-	UWorld* GetEditorWorld()
-	{
-		if (GEditor == nullptr)
-		{
-			return nullptr;
-		}
-		return GEditor->GetEditorWorldContext().World();
-	}
-
-	AActor* FindActorByReference(UWorld* World, const FString& ActorReference)
-	{
-		if (World == nullptr || ActorReference.IsEmpty())
-		{
-			return nullptr;
-		}
-
-		FString RequestedLabel = ActorReference;
-		int32 DotIndex = INDEX_NONE;
-		if (ActorReference.FindLastChar(TEXT('.'), DotIndex) && DotIndex + 1 < ActorReference.Len())
-		{
-			RequestedLabel = ActorReference.Mid(DotIndex + 1);
-		}
-
-		for (TActorIterator<AActor> It(World); It; ++It)
-		{
-			AActor* Actor = *It;
-			if (Actor == nullptr)
-			{
-				continue;
-			}
-
-			if (MCPObjectUtils::BuildActorPath(Actor).Equals(ActorReference, ESearchCase::IgnoreCase) ||
-				Actor->GetPathName().Equals(ActorReference, ESearchCase::IgnoreCase) ||
-				Actor->GetActorLabel().Equals(ActorReference, ESearchCase::IgnoreCase) ||
-				Actor->GetActorLabel().Equals(RequestedLabel, ESearchCase::IgnoreCase))
-			{
-				return Actor;
-			}
-		}
-
-		return nullptr;
-	}
-
-	bool IsKindAllowed(const TSet<FString>& AllowedKinds, const FString& Kind)
-	{
-		return AllowedKinds.Num() == 0 || AllowedKinds.Contains(Kind);
-	}
-
-	bool JsonToLinearColor(const TSharedPtr<FJsonValue>& Value, FLinearColor& OutColor)
-	{
-		if (!Value.IsValid())
-		{
-			return false;
-		}
-
-		if (Value->Type == EJson::Array)
-		{
-			const TArray<TSharedPtr<FJsonValue>>& Elements = Value->AsArray();
-			if (Elements.Num() >= 3)
-			{
-				double R = 0;
-				double G = 0;
-				double B = 0;
-				double A = 1.0;
-				if (Elements[0]->TryGetNumber(R) && Elements[1]->TryGetNumber(G) && Elements[2]->TryGetNumber(B))
-				{
-					if (Elements.Num() >= 4)
-					{
-						Elements[3]->TryGetNumber(A);
-					}
-					OutColor = FLinearColor(static_cast<float>(R), static_cast<float>(G), static_cast<float>(B), static_cast<float>(A));
-					return true;
-				}
-			}
-		}
-
-		if (Value->Type == EJson::Object)
-		{
-			const TSharedPtr<FJsonObject> ColorObject = Value->AsObject();
-			double R = 0;
-			double G = 0;
-			double B = 0;
-			double A = 1.0;
-			if (ColorObject->TryGetNumberField(TEXT("r"), R) &&
-				ColorObject->TryGetNumberField(TEXT("g"), G) &&
-				ColorObject->TryGetNumberField(TEXT("b"), B))
-			{
-				ColorObject->TryGetNumberField(TEXT("a"), A);
-				OutColor = FLinearColor(static_cast<float>(R), static_cast<float>(G), static_cast<float>(B), static_cast<float>(A));
-				return true;
-			}
-		}
-
-		return false;
-	}
-
 	UWidgetBlueprint* LoadWidgetBlueprintByPath(const FString& ObjectPath)
 	{
-		if (ObjectPath.IsEmpty())
-		{
-			return nullptr;
-		}
-
-		return LoadObject<UWidgetBlueprint>(nullptr, *ObjectPath);
+		return MCPToolUMGUtils::LoadWidgetBlueprintByPath(ObjectPath);
 	}
 
 	UWidget* ResolveWidgetFromRef(UWidgetBlueprint* WidgetBlueprint, const TSharedPtr<FJsonObject>* WidgetRefObject)
 	{
-		if (WidgetBlueprint == nullptr || WidgetBlueprint->WidgetTree == nullptr || WidgetRefObject == nullptr || !WidgetRefObject->IsValid())
-		{
-			return nullptr;
-		}
-
-		FString WidgetId;
-		FString WidgetName;
-		(*WidgetRefObject)->TryGetStringField(TEXT("widget_id"), WidgetId);
-		(*WidgetRefObject)->TryGetStringField(TEXT("name"), WidgetName);
-
-		TArray<FString> CandidateNames;
-		if (!WidgetName.IsEmpty())
-		{
-			CandidateNames.AddUnique(WidgetName);
-		}
-
-		if (!WidgetId.IsEmpty())
-		{
-			if (WidgetId.StartsWith(TEXT("name:")))
-			{
-				CandidateNames.AddUnique(WidgetId.RightChop(5));
-			}
-			else
-			{
-				FGuid ParsedGuid;
-				if (!FGuid::Parse(WidgetId, ParsedGuid))
-				{
-					CandidateNames.AddUnique(WidgetId);
-				}
-			}
-		}
-
-		if (CandidateNames.Num() == 0)
-		{
-			return nullptr;
-		}
-
-		TArray<UWidget*> AllWidgets;
-		WidgetBlueprint->WidgetTree->GetAllWidgets(AllWidgets);
-		for (UWidget* Widget : AllWidgets)
-		{
-			if (Widget == nullptr)
-			{
-				continue;
-			}
-
-			for (const FString& CandidateName : CandidateNames)
-			{
-				if (Widget->GetName().Equals(CandidateName, ESearchCase::IgnoreCase))
-				{
-					return Widget;
-				}
-			}
-		}
-
-		return nullptr;
+		return MCPToolUMGUtils::ResolveWidgetFromRef(WidgetBlueprint, WidgetRefObject);
 	}
 
 	FString GetWidgetStableId(const UWidgetBlueprint* WidgetBlueprint, const UWidget* Widget)
 	{
-		if (WidgetBlueprint == nullptr || Widget == nullptr)
-		{
-			return TEXT("");
-		}
-
-		return FString::Printf(TEXT("name:%s"), *Widget->GetName());
+		return MCPToolUMGUtils::GetWidgetStableId(WidgetBlueprint, Widget);
 	}
-
-	template <typename T, typename = void>
-	struct THasWidgetVariableGuidMap : std::false_type
-	{
-	};
-
-	template <typename T>
-	struct THasWidgetVariableGuidMap<T, std::void_t<decltype(std::declval<T>().WidgetVariableNameToGuidMap)>> : std::true_type
-	{
-	};
-
-	template <typename T, typename = void>
-	struct THasOnVariableAdded : std::false_type
-	{
-	};
-
-	template <typename T>
-	struct THasOnVariableAdded<T, std::void_t<decltype(std::declval<T*>()->OnVariableAdded(FName()))>> : std::true_type
-	{
-	};
-
-	template <typename T, typename = void>
-	struct THasOnVariableRemoved : std::false_type
-	{
-	};
-
-	template <typename T>
-	struct THasOnVariableRemoved<T, std::void_t<decltype(std::declval<T*>()->OnVariableRemoved(FName()))>> : std::true_type
-	{
-	};
-
-	template <typename T, typename = void>
-	struct THasGetInheritedAvailableNamedSlots : std::false_type
-	{
-	};
-
-	template <typename T>
-	struct THasGetInheritedAvailableNamedSlots<T, std::void_t<decltype(std::declval<const T*>()->GetInheritedAvailableNamedSlots())>> : std::true_type
-	{
-	};
 
 	void CollectWidgetSubtreeVariableNames(UWidget* Widget, TArray<FName>& OutVariableNames)
 	{
-		if (Widget == nullptr)
-		{
-			return;
-		}
-
-		OutVariableNames.AddUnique(Widget->GetFName());
-
-		if (UPanelWidget* PanelWidget = Cast<UPanelWidget>(Widget))
-		{
-			const int32 ChildCount = PanelWidget->GetChildrenCount();
-			for (int32 ChildIndex = 0; ChildIndex < ChildCount; ++ChildIndex)
-			{
-				CollectWidgetSubtreeVariableNames(PanelWidget->GetChildAt(ChildIndex), OutVariableNames);
-			}
-		}
-		else if (UContentWidget* ContentWidget = Cast<UContentWidget>(Widget))
-		{
-			CollectWidgetSubtreeVariableNames(ContentWidget->GetContent(), OutVariableNames);
-		}
-
-		if (INamedSlotInterface* NamedSlotHost = Cast<INamedSlotInterface>(Widget))
-		{
-			TArray<FName> SlotNames;
-			NamedSlotHost->GetSlotNames(SlotNames);
-			for (const FName& SlotName : SlotNames)
-			{
-				CollectWidgetSubtreeVariableNames(NamedSlotHost->GetContentForSlot(SlotName), OutVariableNames);
-			}
-		}
+		MCPToolUMGUtils::CollectWidgetSubtreeVariableNames(Widget, OutVariableNames);
 	}
 
 	void RemoveWidgetGuidEntry(UWidgetBlueprint* WidgetBlueprint, const FName WidgetName)
 	{
-		if (WidgetBlueprint == nullptr || WidgetName.IsNone())
-		{
-			return;
-		}
-
-		if constexpr (THasWidgetVariableGuidMap<UWidgetBlueprint>::value)
-		{
-			if (!WidgetBlueprint->WidgetVariableNameToGuidMap.Contains(WidgetName))
-			{
-				return;
-			}
-		}
-
-		if constexpr (THasOnVariableRemoved<UWidgetBlueprint>::value)
-		{
-			WidgetBlueprint->OnVariableRemoved(WidgetName);
-		}
-		else if constexpr (THasWidgetVariableGuidMap<UWidgetBlueprint>::value)
-		{
-			WidgetBlueprint->WidgetVariableNameToGuidMap.Remove(WidgetName);
-		}
+		MCPToolUMGUtils::RemoveWidgetGuidEntry(WidgetBlueprint, WidgetName);
 	}
 
 	void EnsureWidgetGuidMap(UWidgetBlueprint* WidgetBlueprint)
 	{
-		(void)WidgetBlueprint;
+		MCPToolUMGUtils::EnsureWidgetGuidMap(WidgetBlueprint);
 	}
 
 	void EnsureWidgetGuidEntry(UWidgetBlueprint* WidgetBlueprint, UWidget* Widget)
 	{
-		if (WidgetBlueprint == nullptr || Widget == nullptr)
-		{
-			return;
-		}
-
-		const FName WidgetName = Widget->GetFName();
-		if (WidgetName.IsNone())
-		{
-			return;
-		}
-
-		if constexpr (THasWidgetVariableGuidMap<UWidgetBlueprint>::value)
-		{
-			if (WidgetBlueprint->WidgetVariableNameToGuidMap.Contains(WidgetName))
-			{
-				return;
-			}
-		}
-
-		if constexpr (THasOnVariableAdded<UWidgetBlueprint>::value)
-		{
-			WidgetBlueprint->OnVariableAdded(WidgetName);
-		}
-		else if constexpr (THasWidgetVariableGuidMap<UWidgetBlueprint>::value)
-		{
-			WidgetBlueprint->WidgetVariableNameToGuidMap.Add(WidgetName, FGuid::NewGuid());
-		}
-	}
-
-	void CollectChangedPropertiesFromPatchOperations(
-		const TArray<TSharedPtr<FJsonValue>>* PatchOperations,
-		TArray<FString>& OutChangedProperties)
-	{
-		OutChangedProperties.Reset();
-		if (PatchOperations == nullptr)
-		{
-			return;
-		}
-
-		for (const TSharedPtr<FJsonValue>& PatchValue : *PatchOperations)
-		{
-			if (!PatchValue.IsValid() || PatchValue->Type != EJson::Object)
-			{
-				continue;
-			}
-
-			const TSharedPtr<FJsonObject> PatchObject = PatchValue->AsObject();
-			FString PropertyPath;
-			PatchObject->TryGetStringField(TEXT("path"), PropertyPath);
-			TArray<FString> Tokens;
-			PropertyPath.ParseIntoArray(Tokens, TEXT("/"), true);
-			if (Tokens.Num() >= 1)
-			{
-				OutChangedProperties.AddUnique(Tokens[0]);
-			}
-		}
-	}
-
-	bool TryExportFieldAsText(const UStruct* OwnerStruct, const void* OwnerData, const FString& FieldName, FString& OutText)
-	{
-		if (OwnerStruct == nullptr || OwnerData == nullptr || FieldName.IsEmpty())
-		{
-			return false;
-		}
-
-		FProperty* Property = OwnerStruct->FindPropertyByName(FName(*FieldName));
-		if (Property == nullptr)
-		{
-			return false;
-		}
-
-		const void* ValuePtr = Property->ContainerPtrToValuePtr<void>(OwnerData);
-		Property->ExportTextItem_Direct(OutText, ValuePtr, nullptr, nullptr, PPF_None);
-		return true;
-	}
-
-	bool TryExportObjectPropertyAsText(UObject* TargetObject, const FString& PropertyName, FString& OutText)
-	{
-		return TargetObject != nullptr
-			&& TryExportFieldAsText(TargetObject->GetClass(), TargetObject, PropertyName, OutText);
-	}
-
-	bool TryReadStructFieldAsString(
-		const UStruct* OwnerStruct,
-		const void* OwnerData,
-		const TArray<FString>& CandidateNames,
-		FString& OutValue)
-	{
-		OutValue.Reset();
-		if (OwnerStruct == nullptr || OwnerData == nullptr)
-		{
-			return false;
-		}
-
-		for (const FString& CandidateName : CandidateNames)
-		{
-			FProperty* Property = OwnerStruct->FindPropertyByName(FName(*CandidateName));
-			if (Property == nullptr)
-			{
-				continue;
-			}
-
-			const void* ValuePtr = Property->ContainerPtrToValuePtr<void>(OwnerData);
-			if (const FNameProperty* NameProperty = CastField<FNameProperty>(Property))
-			{
-				OutValue = NameProperty->GetPropertyValue(ValuePtr).ToString();
-				return true;
-			}
-
-			if (const FStrProperty* StringProperty = CastField<FStrProperty>(Property))
-			{
-				OutValue = StringProperty->GetPropertyValue(ValuePtr);
-				return true;
-			}
-
-			if (const FTextProperty* TextProperty = CastField<FTextProperty>(Property))
-			{
-				OutValue = TextProperty->GetPropertyValue(ValuePtr).ToString();
-				return true;
-			}
-		}
-
-		return false;
-	}
-
-	bool TryWriteStructFieldFromString(
-		const UStruct* OwnerStruct,
-		void* OwnerData,
-		const TArray<FString>& CandidateNames,
-		const FString& Value)
-	{
-		if (OwnerStruct == nullptr || OwnerData == nullptr)
-		{
-			return false;
-		}
-
-		for (const FString& CandidateName : CandidateNames)
-		{
-			FProperty* Property = OwnerStruct->FindPropertyByName(FName(*CandidateName));
-			if (Property == nullptr)
-			{
-				continue;
-			}
-
-			void* ValuePtr = Property->ContainerPtrToValuePtr<void>(OwnerData);
-			if (FNameProperty* NameProperty = CastField<FNameProperty>(Property))
-			{
-				NameProperty->SetPropertyValue(ValuePtr, FName(*Value));
-				return true;
-			}
-
-			if (FStrProperty* StringProperty = CastField<FStrProperty>(Property))
-			{
-				StringProperty->SetPropertyValue(ValuePtr, Value);
-				return true;
-			}
-
-			if (FTextProperty* TextProperty = CastField<FTextProperty>(Property))
-			{
-				TextProperty->SetPropertyValue(ValuePtr, FText::FromString(Value));
-				return true;
-			}
-		}
-
-		return false;
-	}
-
-	TSharedRef<FJsonObject> BuildSlotSummaryObject(UPanelSlot* Slot)
-	{
-		TSharedRef<FJsonObject> Summary = MakeShared<FJsonObject>();
-		if (Slot == nullptr)
-		{
-			return Summary;
-		}
-
-		Summary->SetStringField(TEXT("slot_class"), Slot->GetClass()->GetPathName());
-
-		const TArray<FString> CandidateFields{
-			TEXT("LayoutData"),
-			TEXT("Offsets"),
-			TEXT("Anchors"),
-			TEXT("Alignment"),
-			TEXT("Padding"),
-			TEXT("HorizontalAlignment"),
-			TEXT("VerticalAlignment"),
-			TEXT("ZOrder")
-		};
-
-		for (const FString& CandidateField : CandidateFields)
-		{
-			FString ExportedText;
-			if (TryExportObjectPropertyAsText(Slot, CandidateField, ExportedText))
-			{
-				Summary->SetStringField(CandidateField, ExportedText);
-			}
-		}
-
-		return Summary;
-	}
-
-	TSharedRef<FJsonObject> BuildWidgetLayoutSummaryObject(UWidget* Widget)
-	{
-		TSharedRef<FJsonObject> Summary = MakeShared<FJsonObject>();
-		if (Widget == nullptr)
-		{
-			return Summary;
-		}
-
-		Summary->SetStringField(TEXT("widget_class"), Widget->GetClass()->GetPathName());
-
-		FString ExportedText;
-		if (TryExportObjectPropertyAsText(Widget, TEXT("RenderTransform"), ExportedText))
-		{
-			Summary->SetStringField(TEXT("RenderTransform"), ExportedText);
-		}
-		if (TryExportObjectPropertyAsText(Widget, TEXT("RenderOpacity"), ExportedText))
-		{
-			Summary->SetStringField(TEXT("RenderOpacity"), ExportedText);
-		}
-		if (TryExportObjectPropertyAsText(Widget, TEXT("Visibility"), ExportedText))
-		{
-			Summary->SetStringField(TEXT("Visibility"), ExportedText);
-		}
-
-		if (Widget->Slot != nullptr)
-		{
-			Summary->SetObjectField(TEXT("slot"), BuildSlotSummaryObject(Widget->Slot));
-		}
-
-		return Summary;
-	}
-
-	bool TryGetWidgetBlueprintBindingArray(UWidgetBlueprint* WidgetBlueprint, FArrayProperty*& OutArrayProperty, void*& OutArrayPtr)
-	{
-		OutArrayProperty = nullptr;
-		OutArrayPtr = nullptr;
-		if (WidgetBlueprint == nullptr)
-		{
-			return false;
-		}
-
-		OutArrayProperty = FindFProperty<FArrayProperty>(WidgetBlueprint->GetClass(), TEXT("Bindings"));
-		if (OutArrayProperty == nullptr || !OutArrayProperty->Inner->IsA<FStructProperty>())
-		{
-			return false;
-		}
-
-		OutArrayPtr = OutArrayProperty->ContainerPtrToValuePtr<void>(WidgetBlueprint);
-		return OutArrayPtr != nullptr;
-	}
-
-	bool TryResolveWidgetAnimationArray(UWidgetBlueprint* WidgetBlueprint, FArrayProperty*& OutArrayProperty, void*& OutArrayPtr)
-	{
-		OutArrayProperty = nullptr;
-		OutArrayPtr = nullptr;
-		if (WidgetBlueprint == nullptr)
-		{
-			return false;
-		}
-
-		OutArrayProperty = FindFProperty<FArrayProperty>(WidgetBlueprint->GetClass(), TEXT("Animations"));
-		if (OutArrayProperty == nullptr || !OutArrayProperty->Inner->IsA<FObjectPropertyBase>())
-		{
-			return false;
-		}
-
-		OutArrayPtr = OutArrayProperty->ContainerPtrToValuePtr<void>(WidgetBlueprint);
-		return OutArrayPtr != nullptr;
-	}
-
-	enum class EMCPUMGAnimationTrackKind : uint8
-	{
-		Unknown = 0,
-		Float = 1,
-		Transform2D = 2,
-		Color = 3
-	};
-
-	enum class EMCPUMGAnimationChannel : uint8
-	{
-		None = 0,
-		FloatValue = 1,
-		TransformTranslationX = 2,
-		TransformTranslationY = 3,
-		TransformScaleX = 4,
-		TransformScaleY = 5,
-		TransformShearX = 6,
-		TransformShearY = 7,
-		TransformRotation = 8,
-		ColorR = 9,
-		ColorG = 10,
-		ColorB = 11,
-		ColorA = 12
-	};
-
-	struct FMCPUMGAnimationPropertySpec
-	{
-		EMCPUMGAnimationTrackKind TrackKind = EMCPUMGAnimationTrackKind::Unknown;
-		EMCPUMGAnimationChannel Channel = EMCPUMGAnimationChannel::None;
-		FName PropertyName = NAME_None;
-		FString PropertyPath;
-		FString CanonicalPath;
-	};
-
-	FString MCPUMGAnim_NormalizePropertyPath(const FString& InPropertyPath)
-	{
-		FString Normalized = InPropertyPath;
-		Normalized.TrimStartAndEndInline();
-		Normalized.ReplaceInline(TEXT(" "), TEXT(""));
-		Normalized.ReplaceInline(TEXT("/"), TEXT("."));
-		Normalized.ReplaceInline(TEXT("::"), TEXT("."));
-		while (Normalized.Contains(TEXT("..")))
-		{
-			Normalized.ReplaceInline(TEXT(".."), TEXT("."));
-		}
-		return Normalized.ToLower();
-	}
-
-	FString MCPUMGAnim_ChannelToString(const EMCPUMGAnimationChannel Channel)
-	{
-		switch (Channel)
-		{
-		case EMCPUMGAnimationChannel::FloatValue:
-			return TEXT("value");
-		case EMCPUMGAnimationChannel::TransformTranslationX:
-			return TEXT("translation.x");
-		case EMCPUMGAnimationChannel::TransformTranslationY:
-			return TEXT("translation.y");
-		case EMCPUMGAnimationChannel::TransformScaleX:
-			return TEXT("scale.x");
-		case EMCPUMGAnimationChannel::TransformScaleY:
-			return TEXT("scale.y");
-		case EMCPUMGAnimationChannel::TransformShearX:
-			return TEXT("shear.x");
-		case EMCPUMGAnimationChannel::TransformShearY:
-			return TEXT("shear.y");
-		case EMCPUMGAnimationChannel::TransformRotation:
-			return TEXT("angle");
-		case EMCPUMGAnimationChannel::ColorR:
-			return TEXT("r");
-		case EMCPUMGAnimationChannel::ColorG:
-			return TEXT("g");
-		case EMCPUMGAnimationChannel::ColorB:
-			return TEXT("b");
-		case EMCPUMGAnimationChannel::ColorA:
-			return TEXT("a");
-		default:
-			break;
-		}
-		return FString();
-	}
-
-	FString MCPUMGAnim_TrackKindToString(const EMCPUMGAnimationTrackKind TrackKind)
-	{
-		switch (TrackKind)
-		{
-		case EMCPUMGAnimationTrackKind::Float:
-			return TEXT("float");
-		case EMCPUMGAnimationTrackKind::Transform2D:
-			return TEXT("transform2d");
-		case EMCPUMGAnimationTrackKind::Color:
-			return TEXT("color");
-		default:
-			break;
-		}
-		return TEXT("unknown");
-	}
-
-	bool MCPUMGAnim_ParsePropertySpec(
-		const FString& InPropertyPath,
-		const bool bRequireChannelForCompositeTrack,
-		FMCPUMGAnimationPropertySpec& OutSpec,
-		FMCPDiagnostic& OutDiagnostic)
-	{
-		OutSpec = FMCPUMGAnimationPropertySpec();
-		const FString Normalized = MCPUMGAnim_NormalizePropertyPath(InPropertyPath);
-		if (Normalized.IsEmpty())
-		{
-			OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-			OutDiagnostic.Message = TEXT("property_path is required.");
-			return false;
-		}
-
-		if (Normalized == TEXT("renderopacity"))
-		{
-			OutSpec.TrackKind = EMCPUMGAnimationTrackKind::Float;
-			OutSpec.Channel = EMCPUMGAnimationChannel::FloatValue;
-			OutSpec.PropertyName = TEXT("RenderOpacity");
-			OutSpec.PropertyPath = TEXT("RenderOpacity");
-			OutSpec.CanonicalPath = TEXT("RenderOpacity");
-			return true;
-		}
-
-		if (Normalized == TEXT("rendertransform"))
-		{
-			OutSpec.TrackKind = EMCPUMGAnimationTrackKind::Transform2D;
-			OutSpec.Channel = EMCPUMGAnimationChannel::None;
-			OutSpec.PropertyName = TEXT("RenderTransform");
-			OutSpec.PropertyPath = TEXT("RenderTransform");
-			OutSpec.CanonicalPath = TEXT("RenderTransform");
-		}
-		else if (Normalized == TEXT("rendertransform.translation.x"))
-		{
-			OutSpec.TrackKind = EMCPUMGAnimationTrackKind::Transform2D;
-			OutSpec.Channel = EMCPUMGAnimationChannel::TransformTranslationX;
-			OutSpec.PropertyName = TEXT("RenderTransform");
-			OutSpec.PropertyPath = TEXT("RenderTransform");
-			OutSpec.CanonicalPath = TEXT("RenderTransform.Translation.X");
-		}
-		else if (Normalized == TEXT("rendertransform.translation.y"))
-		{
-			OutSpec.TrackKind = EMCPUMGAnimationTrackKind::Transform2D;
-			OutSpec.Channel = EMCPUMGAnimationChannel::TransformTranslationY;
-			OutSpec.PropertyName = TEXT("RenderTransform");
-			OutSpec.PropertyPath = TEXT("RenderTransform");
-			OutSpec.CanonicalPath = TEXT("RenderTransform.Translation.Y");
-		}
-		else if (Normalized == TEXT("rendertransform.scale.x"))
-		{
-			OutSpec.TrackKind = EMCPUMGAnimationTrackKind::Transform2D;
-			OutSpec.Channel = EMCPUMGAnimationChannel::TransformScaleX;
-			OutSpec.PropertyName = TEXT("RenderTransform");
-			OutSpec.PropertyPath = TEXT("RenderTransform");
-			OutSpec.CanonicalPath = TEXT("RenderTransform.Scale.X");
-		}
-		else if (Normalized == TEXT("rendertransform.scale.y"))
-		{
-			OutSpec.TrackKind = EMCPUMGAnimationTrackKind::Transform2D;
-			OutSpec.Channel = EMCPUMGAnimationChannel::TransformScaleY;
-			OutSpec.PropertyName = TEXT("RenderTransform");
-			OutSpec.PropertyPath = TEXT("RenderTransform");
-			OutSpec.CanonicalPath = TEXT("RenderTransform.Scale.Y");
-		}
-		else if (Normalized == TEXT("rendertransform.shear.x"))
-		{
-			OutSpec.TrackKind = EMCPUMGAnimationTrackKind::Transform2D;
-			OutSpec.Channel = EMCPUMGAnimationChannel::TransformShearX;
-			OutSpec.PropertyName = TEXT("RenderTransform");
-			OutSpec.PropertyPath = TEXT("RenderTransform");
-			OutSpec.CanonicalPath = TEXT("RenderTransform.Shear.X");
-		}
-		else if (Normalized == TEXT("rendertransform.shear.y"))
-		{
-			OutSpec.TrackKind = EMCPUMGAnimationTrackKind::Transform2D;
-			OutSpec.Channel = EMCPUMGAnimationChannel::TransformShearY;
-			OutSpec.PropertyName = TEXT("RenderTransform");
-			OutSpec.PropertyPath = TEXT("RenderTransform");
-			OutSpec.CanonicalPath = TEXT("RenderTransform.Shear.Y");
-		}
-		else if (Normalized == TEXT("rendertransform.angle") || Normalized == TEXT("rendertransform.rotation"))
-		{
-			OutSpec.TrackKind = EMCPUMGAnimationTrackKind::Transform2D;
-			OutSpec.Channel = EMCPUMGAnimationChannel::TransformRotation;
-			OutSpec.PropertyName = TEXT("RenderTransform");
-			OutSpec.PropertyPath = TEXT("RenderTransform");
-			OutSpec.CanonicalPath = TEXT("RenderTransform.Angle");
-		}
-		else if (Normalized == TEXT("colorandopacity"))
-		{
-			OutSpec.TrackKind = EMCPUMGAnimationTrackKind::Color;
-			OutSpec.Channel = EMCPUMGAnimationChannel::None;
-			OutSpec.PropertyName = TEXT("ColorAndOpacity");
-			OutSpec.PropertyPath = TEXT("ColorAndOpacity");
-			OutSpec.CanonicalPath = TEXT("ColorAndOpacity");
-		}
-		else if (Normalized == TEXT("colorandopacity.r") || Normalized == TEXT("colorandopacity.red"))
-		{
-			OutSpec.TrackKind = EMCPUMGAnimationTrackKind::Color;
-			OutSpec.Channel = EMCPUMGAnimationChannel::ColorR;
-			OutSpec.PropertyName = TEXT("ColorAndOpacity");
-			OutSpec.PropertyPath = TEXT("ColorAndOpacity");
-			OutSpec.CanonicalPath = TEXT("ColorAndOpacity.R");
-		}
-		else if (Normalized == TEXT("colorandopacity.g") || Normalized == TEXT("colorandopacity.green"))
-		{
-			OutSpec.TrackKind = EMCPUMGAnimationTrackKind::Color;
-			OutSpec.Channel = EMCPUMGAnimationChannel::ColorG;
-			OutSpec.PropertyName = TEXT("ColorAndOpacity");
-			OutSpec.PropertyPath = TEXT("ColorAndOpacity");
-			OutSpec.CanonicalPath = TEXT("ColorAndOpacity.G");
-		}
-		else if (Normalized == TEXT("colorandopacity.b") || Normalized == TEXT("colorandopacity.blue"))
-		{
-			OutSpec.TrackKind = EMCPUMGAnimationTrackKind::Color;
-			OutSpec.Channel = EMCPUMGAnimationChannel::ColorB;
-			OutSpec.PropertyName = TEXT("ColorAndOpacity");
-			OutSpec.PropertyPath = TEXT("ColorAndOpacity");
-			OutSpec.CanonicalPath = TEXT("ColorAndOpacity.B");
-		}
-		else if (Normalized == TEXT("colorandopacity.a") || Normalized == TEXT("colorandopacity.alpha"))
-		{
-			OutSpec.TrackKind = EMCPUMGAnimationTrackKind::Color;
-			OutSpec.Channel = EMCPUMGAnimationChannel::ColorA;
-			OutSpec.PropertyName = TEXT("ColorAndOpacity");
-			OutSpec.PropertyPath = TEXT("ColorAndOpacity");
-			OutSpec.CanonicalPath = TEXT("ColorAndOpacity.A");
-		}
-		else
-		{
-			OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-			OutDiagnostic.Message = TEXT("Unsupported property_path for UMG animation tool.");
-			OutDiagnostic.Detail = InPropertyPath;
-			OutDiagnostic.Suggestion = TEXT("Use RenderOpacity / RenderTransform.<Translation|Scale|Shear>.<X|Y> / RenderTransform.Angle / ColorAndOpacity.<R|G|B|A>.");
-			return false;
-		}
-
-		if (bRequireChannelForCompositeTrack
-			&& OutSpec.TrackKind != EMCPUMGAnimationTrackKind::Float
-			&& OutSpec.Channel == EMCPUMGAnimationChannel::None)
-		{
-			OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-			OutDiagnostic.Message = TEXT("property_path must target a concrete channel for key operations.");
-			OutDiagnostic.Detail = InPropertyPath;
-			OutDiagnostic.Suggestion = TEXT("Example: RenderTransform.Translation.X or ColorAndOpacity.R");
-			return false;
-		}
-
-		return true;
-	}
-
-	bool MCPUMGAnim_ParseInterpolation(
-		const TSharedPtr<FJsonObject>& Params,
-		EMovieSceneKeyInterpolation& OutInterpolation,
-		FMCPDiagnostic& OutDiagnostic)
-	{
-		OutInterpolation = EMovieSceneKeyInterpolation::Auto;
-		if (!Params.IsValid())
-		{
-			return true;
-		}
-
-		FString Interpolation;
-		if (!Params->TryGetStringField(TEXT("interpolation"), Interpolation) || Interpolation.IsEmpty())
-		{
-			return true;
-		}
-
-		const FString Normalized = Interpolation.ToLower();
-		if (Normalized == TEXT("auto"))
-		{
-			OutInterpolation = EMovieSceneKeyInterpolation::Auto;
-			return true;
-		}
-		if (Normalized == TEXT("smart_auto") || Normalized == TEXT("smartauto"))
-		{
-			OutInterpolation = EMovieSceneKeyInterpolation::SmartAuto;
-			return true;
-		}
-		if (Normalized == TEXT("linear"))
-		{
-			OutInterpolation = EMovieSceneKeyInterpolation::Linear;
-			return true;
-		}
-		if (Normalized == TEXT("constant"))
-		{
-			OutInterpolation = EMovieSceneKeyInterpolation::Constant;
-			return true;
-		}
-		if (Normalized == TEXT("user"))
-		{
-			OutInterpolation = EMovieSceneKeyInterpolation::User;
-			return true;
-		}
-		if (Normalized == TEXT("break"))
-		{
-			OutInterpolation = EMovieSceneKeyInterpolation::Break;
-			return true;
-		}
-
-		OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		OutDiagnostic.Message = TEXT("Unsupported interpolation mode.");
-		OutDiagnostic.Detail = Interpolation;
-		OutDiagnostic.Suggestion = TEXT("Use auto|smart_auto|linear|constant|user|break.");
-		return false;
-	}
-
-	bool MCPUMGAnim_ParseKeyTime(
-		const TSharedPtr<FJsonObject>& Params,
-		const FFrameRate& TickResolution,
-		FFrameNumber& OutFrame,
-		double& OutTimeSeconds,
-		FMCPDiagnostic& OutDiagnostic)
-	{
-		OutFrame = 0;
-		OutTimeSeconds = 0.0;
-		if (!Params.IsValid())
-		{
-			OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-			OutDiagnostic.Message = TEXT("params are required.");
-			return false;
-		}
-
-		double FrameValue = 0.0;
-		double TimeSecondsValue = 0.0;
-		const bool bHasFrame = Params->TryGetNumberField(TEXT("frame"), FrameValue);
-		const bool bHasTimeSeconds = Params->TryGetNumberField(TEXT("time_seconds"), TimeSecondsValue);
-		if (!bHasFrame && !bHasTimeSeconds)
-		{
-			OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-			OutDiagnostic.Message = TEXT("Either frame or time_seconds must be provided.");
-			return false;
-		}
-
-		if (bHasFrame)
-		{
-			const int32 FrameInt = FMath::RoundToInt(FrameValue);
-			if (FrameInt < 0)
-			{
-				OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-				OutDiagnostic.Message = TEXT("frame must be >= 0.");
-				return false;
-			}
-
-			OutFrame = FFrameNumber(FrameInt);
-			const double TickAsDecimal = TickResolution.AsDecimal();
-			OutTimeSeconds = TickAsDecimal > KINDA_SMALL_NUMBER
-				? static_cast<double>(OutFrame.Value) / TickAsDecimal
-				: 0.0;
-			return true;
-		}
-
-		if (TimeSecondsValue < 0.0)
-		{
-			OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-			OutDiagnostic.Message = TEXT("time_seconds must be >= 0.");
-			return false;
-		}
-
-		OutTimeSeconds = TimeSecondsValue;
-		OutFrame = TickResolution.AsFrameTime(TimeSecondsValue).RoundToFrame();
-		return true;
-	}
-
-	UWidgetAnimation* MCPUMGAnim_FindAnimationByNameOrPath(UWidgetBlueprint* WidgetBlueprint, const FString& AnimationNameOrPath)
-	{
-		if (WidgetBlueprint == nullptr || AnimationNameOrPath.IsEmpty())
-		{
-			return nullptr;
-		}
-
-		FArrayProperty* AnimationsArrayProperty = nullptr;
-		void* AnimationsArrayPtr = nullptr;
-		if (!TryResolveWidgetAnimationArray(WidgetBlueprint, AnimationsArrayProperty, AnimationsArrayPtr))
-		{
-			return nullptr;
-		}
-
-		const FObjectPropertyBase* AnimationObjectProperty = CastField<FObjectPropertyBase>(AnimationsArrayProperty->Inner);
-		if (AnimationObjectProperty == nullptr)
-		{
-			return nullptr;
-		}
-
-		FScriptArrayHelper ArrayHelper(AnimationsArrayProperty, AnimationsArrayPtr);
-		for (int32 Index = 0; Index < ArrayHelper.Num(); ++Index)
-		{
-			UWidgetAnimation* Animation = Cast<UWidgetAnimation>(
-				AnimationObjectProperty->GetObjectPropertyValue(ArrayHelper.GetRawPtr(Index)));
-			if (Animation == nullptr)
-			{
-				continue;
-			}
-
-			if (Animation->GetName().Equals(AnimationNameOrPath, ESearchCase::IgnoreCase)
-				|| Animation->GetPathName().Equals(AnimationNameOrPath, ESearchCase::IgnoreCase))
-			{
-				return Animation;
-			}
-		}
-
-		return nullptr;
-	}
-
-	bool MCPUMGAnim_ResolveBindingGuid(
-		UWidgetAnimation* Animation,
-		UWidget* Widget,
-		const bool bCreateIfMissing,
-		FGuid& OutBindingGuid,
-		bool& bOutBindingCreated,
-		FMCPDiagnostic& OutDiagnostic)
-	{
-		OutBindingGuid.Invalidate();
-		bOutBindingCreated = false;
-		if (Animation == nullptr || Widget == nullptr)
-		{
-			OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-			OutDiagnostic.Message = TEXT("animation and widget are required.");
-			return false;
-		}
-
-		UMovieScene* MovieScene = Animation->GetMovieScene();
-		if (MovieScene == nullptr)
-		{
-			OutDiagnostic.Code = TEXT("MCP.UMG.ANIMATION.NO_MOVIESCENE");
-			OutDiagnostic.Message = TEXT("Widget animation has no MovieScene.");
-			return false;
-		}
-
-		const FName WidgetName = Widget->GetFName();
-		for (FWidgetAnimationBinding& Binding : Animation->AnimationBindings)
-		{
-			if (Binding.WidgetName != WidgetName)
-			{
-				continue;
-			}
-
-			if (!Binding.AnimationGuid.IsValid() || MovieScene->FindPossessable(Binding.AnimationGuid) == nullptr)
-			{
-				if (!bCreateIfMissing)
-				{
-					OutDiagnostic.Code = TEXT("MCP.UMG.ANIMATION.BINDING_NOT_FOUND");
-					OutDiagnostic.Message = TEXT("Animation binding exists but possessable is missing.");
-					OutDiagnostic.Detail = Widget->GetName();
-					return false;
-				}
-
-				const FGuid NewGuid = MovieScene->AddPossessable(Widget->GetName(), Widget->GetClass());
-				if (!NewGuid.IsValid())
-				{
-					OutDiagnostic.Code = MCPErrorCodes::INTERNAL_EXCEPTION;
-					OutDiagnostic.Message = TEXT("Failed to create MovieScene possessable for widget.");
-					OutDiagnostic.Detail = Widget->GetName();
-					return false;
-				}
-
-				Binding.AnimationGuid = NewGuid;
-				bOutBindingCreated = true;
-			}
-
-			OutBindingGuid = Binding.AnimationGuid;
-			return true;
-		}
-
-		if (!bCreateIfMissing)
-		{
-			OutDiagnostic.Code = TEXT("MCP.UMG.ANIMATION.BINDING_NOT_FOUND");
-			OutDiagnostic.Message = TEXT("Widget is not bound to the target animation.");
-			OutDiagnostic.Detail = Widget->GetName();
-			OutDiagnostic.Suggestion = TEXT("Call umg.animation.track.add first, or provide the correct widget_ref.");
-			return false;
-		}
-
-		const FGuid NewGuid = MovieScene->AddPossessable(Widget->GetName(), Widget->GetClass());
-		if (!NewGuid.IsValid())
-		{
-			OutDiagnostic.Code = MCPErrorCodes::INTERNAL_EXCEPTION;
-			OutDiagnostic.Message = TEXT("Failed to create MovieScene possessable for widget.");
-			OutDiagnostic.Detail = Widget->GetName();
-			return false;
-		}
-
-		FWidgetAnimationBinding NewBinding;
-		NewBinding.WidgetName = WidgetName;
-		NewBinding.SlotWidgetName = NAME_None;
-		NewBinding.AnimationGuid = NewGuid;
-		NewBinding.bIsRootWidget = false;
-		Animation->AnimationBindings.Add(NewBinding);
-
-		OutBindingGuid = NewGuid;
-		bOutBindingCreated = true;
-		return true;
-	}
-
-	template <typename TrackType>
-	TrackType* MCPUMGAnim_FindPropertyTrack(
-		UMovieScene* MovieScene,
-		const FGuid& BindingGuid,
-		const FName PropertyName,
-		const FString& PropertyPath)
-	{
-		if (MovieScene == nullptr || !BindingGuid.IsValid())
-		{
-			return nullptr;
-		}
-
-		const TArray<UMovieSceneTrack*> ExistingTracks = MovieScene->FindTracks(TrackType::StaticClass(), BindingGuid);
-		const FName PropertyPathName(*PropertyPath);
-		for (UMovieSceneTrack* ExistingTrack : ExistingTracks)
-		{
-			UMovieScenePropertyTrack* PropertyTrack = Cast<UMovieScenePropertyTrack>(ExistingTrack);
-			if (PropertyTrack == nullptr)
-			{
-				continue;
-			}
-
-			if (PropertyTrack->GetPropertyName() == PropertyName && PropertyTrack->GetPropertyPath() == PropertyPathName)
-			{
-				return Cast<TrackType>(PropertyTrack);
-			}
-		}
-
-		return nullptr;
-	}
-
-	template <typename TrackType>
-	TrackType* MCPUMGAnim_FindOrAddPropertyTrack(
-		UMovieScene* MovieScene,
-		const FGuid& BindingGuid,
-		const FName PropertyName,
-		const FString& PropertyPath,
-		const bool bAllowCreate,
-		bool& bOutTrackAdded)
-	{
-		bOutTrackAdded = false;
-		TrackType* Track = MCPUMGAnim_FindPropertyTrack<TrackType>(MovieScene, BindingGuid, PropertyName, PropertyPath);
-		if (Track != nullptr || !bAllowCreate || MovieScene == nullptr || !BindingGuid.IsValid())
-		{
-			return Track;
-		}
-
-		Track = MovieScene->AddTrack<TrackType>(BindingGuid);
-		if (Track == nullptr)
-		{
-			return nullptr;
-		}
-
-		Track->SetPropertyNameAndPath(PropertyName, PropertyPath);
-		bOutTrackAdded = true;
-		return Track;
-	}
-
-	template <typename SectionType>
-	SectionType* MCPUMGAnim_FindOrAddSection(UMovieSceneTrack* Track, const bool bAllowCreate, bool& bOutSectionAdded)
-	{
-		bOutSectionAdded = false;
-		if (Track == nullptr)
-		{
-			return nullptr;
-		}
-
-		const TArray<UMovieSceneSection*>& ExistingSections = Track->GetAllSections();
-		for (UMovieSceneSection* ExistingSection : ExistingSections)
-		{
-			if (SectionType* TypedSection = Cast<SectionType>(ExistingSection))
-			{
-				return TypedSection;
-			}
-		}
-
-		if (!bAllowCreate)
-		{
-			return nullptr;
-		}
-
-		UMovieSceneSection* NewSection = Track->CreateNewSection();
-		SectionType* TypedSection = Cast<SectionType>(NewSection);
-		if (TypedSection == nullptr)
-		{
-			return nullptr;
-		}
-
-		Track->AddSection(*TypedSection);
-		TypedSection->SetRange(TRange<FFrameNumber>::All());
-		bOutSectionAdded = true;
-		return TypedSection;
-	}
-
-	UMovieSceneTrack* MCPUMGAnim_FindOrAddTrackForSpec(
-		UMovieScene* MovieScene,
-		const FGuid& BindingGuid,
-		const FMCPUMGAnimationPropertySpec& PropertySpec,
-		const bool bAllowCreate,
-		bool& bOutTrackAdded)
-	{
-		bOutTrackAdded = false;
-		switch (PropertySpec.TrackKind)
-		{
-		case EMCPUMGAnimationTrackKind::Float:
-			return MCPUMGAnim_FindOrAddPropertyTrack<UMovieSceneFloatTrack>(
-				MovieScene,
-				BindingGuid,
-				PropertySpec.PropertyName,
-				PropertySpec.PropertyPath,
-				bAllowCreate,
-				bOutTrackAdded);
-		case EMCPUMGAnimationTrackKind::Transform2D:
-			return MCPUMGAnim_FindOrAddPropertyTrack<UMovieScene2DTransformTrack>(
-				MovieScene,
-				BindingGuid,
-				PropertySpec.PropertyName,
-				PropertySpec.PropertyPath,
-				bAllowCreate,
-				bOutTrackAdded);
-		case EMCPUMGAnimationTrackKind::Color:
-			return MCPUMGAnim_FindOrAddPropertyTrack<UMovieSceneColorTrack>(
-				MovieScene,
-				BindingGuid,
-				PropertySpec.PropertyName,
-				PropertySpec.PropertyPath,
-				bAllowCreate,
-				bOutTrackAdded);
-		default:
-			break;
-		}
-
-		return nullptr;
-	}
-
-	FMovieSceneFloatChannel* MCPUMGAnim_ResolveChannelFromTrack(
-		UMovieSceneTrack* Track,
-		const FMCPUMGAnimationPropertySpec& PropertySpec,
-		const bool bAllowCreateSection,
-		bool& bOutSectionAdded)
-	{
-		bOutSectionAdded = false;
-		if (Track == nullptr)
-		{
-			return nullptr;
-		}
-
-		switch (PropertySpec.TrackKind)
-		{
-		case EMCPUMGAnimationTrackKind::Float:
-		{
-			UMovieSceneFloatTrack* FloatTrack = Cast<UMovieSceneFloatTrack>(Track);
-			UMovieSceneFloatSection* FloatSection = MCPUMGAnim_FindOrAddSection<UMovieSceneFloatSection>(
-				FloatTrack, bAllowCreateSection, bOutSectionAdded);
-			return FloatSection ? &FloatSection->GetChannel() : nullptr;
-		}
-		case EMCPUMGAnimationTrackKind::Transform2D:
-		{
-			UMovieScene2DTransformTrack* TransformTrack = Cast<UMovieScene2DTransformTrack>(Track);
-			UMovieScene2DTransformSection* TransformSection = MCPUMGAnim_FindOrAddSection<UMovieScene2DTransformSection>(
-				TransformTrack, bAllowCreateSection, bOutSectionAdded);
-			if (TransformSection == nullptr)
-			{
-				return nullptr;
-			}
-
-			switch (PropertySpec.Channel)
-			{
-			case EMCPUMGAnimationChannel::TransformTranslationX:
-				return &TransformSection->Translation[0];
-			case EMCPUMGAnimationChannel::TransformTranslationY:
-				return &TransformSection->Translation[1];
-			case EMCPUMGAnimationChannel::TransformScaleX:
-				return &TransformSection->Scale[0];
-			case EMCPUMGAnimationChannel::TransformScaleY:
-				return &TransformSection->Scale[1];
-			case EMCPUMGAnimationChannel::TransformShearX:
-				return &TransformSection->Shear[0];
-			case EMCPUMGAnimationChannel::TransformShearY:
-				return &TransformSection->Shear[1];
-			case EMCPUMGAnimationChannel::TransformRotation:
-				return &TransformSection->Rotation;
-			default:
-				return nullptr;
-			}
-		}
-		case EMCPUMGAnimationTrackKind::Color:
-		{
-			UMovieSceneColorTrack* ColorTrack = Cast<UMovieSceneColorTrack>(Track);
-			UMovieSceneColorSection* ColorSection = MCPUMGAnim_FindOrAddSection<UMovieSceneColorSection>(
-				ColorTrack, bAllowCreateSection, bOutSectionAdded);
-			if (ColorSection == nullptr)
-			{
-				return nullptr;
-			}
-
-			switch (PropertySpec.Channel)
-			{
-			case EMCPUMGAnimationChannel::ColorR:
-				return &ColorSection->GetRedChannel();
-			case EMCPUMGAnimationChannel::ColorG:
-				return &ColorSection->GetGreenChannel();
-			case EMCPUMGAnimationChannel::ColorB:
-				return &ColorSection->GetBlueChannel();
-			case EMCPUMGAnimationChannel::ColorA:
-				return &ColorSection->GetAlphaChannel();
-			default:
-				return nullptr;
-			}
-		}
-		default:
-			break;
-		}
-
-		return nullptr;
+		MCPToolUMGUtils::EnsureWidgetGuidEntry(WidgetBlueprint, Widget);
 	}
 
 	UClass* ResolveWidgetClassByPath(const FString& WidgetClassPath)
 	{
-		UClass* WidgetClass = ResolveClassByPath(WidgetClassPath);
-		if (WidgetClass == nullptr)
-		{
-			return nullptr;
-		}
-
-		if (!WidgetClass->IsChildOf(UWidget::StaticClass()))
-		{
-			return nullptr;
-		}
-
-		if (WidgetClass->HasAnyClassFlags(CLASS_Abstract | CLASS_NewerVersionExists))
-		{
-			return nullptr;
-		}
-
-		return WidgetClass;
+		return MCPToolUMGUtils::ResolveWidgetClassByPath(WidgetClassPath);
 	}
 
 	FString GetPanelSlotTypeName(UPanelWidget* PanelWidget)
 	{
-		if (PanelWidget == nullptr)
-		{
-			return FString();
-		}
-
-		const int32 ChildCount = PanelWidget->GetChildrenCount();
-		for (int32 ChildIndex = 0; ChildIndex < ChildCount; ++ChildIndex)
-		{
-			if (UWidget* ChildWidget = PanelWidget->GetChildAt(ChildIndex))
-			{
-				if (ChildWidget->Slot != nullptr)
-				{
-					return ChildWidget->Slot->GetClass()->GetName();
-				}
-			}
-		}
-
-		return UPanelSlot::StaticClass()->GetName();
+		return MCPToolUMGUtils::GetPanelSlotTypeName(PanelWidget);
 	}
 
 	FName BuildUniqueWidgetName(UWidgetBlueprint* WidgetBlueprint, UClass* WidgetClass, const FString& RequestedName)
 	{
-		if (WidgetBlueprint == nullptr || WidgetBlueprint->WidgetTree == nullptr)
-		{
-			return NAME_None;
-		}
-
-		FString BaseName = RequestedName;
-		if (BaseName.IsEmpty() && WidgetClass != nullptr)
-		{
-			BaseName = WidgetClass->GetName();
-			if (BaseName.StartsWith(TEXT("U")))
-			{
-				BaseName.RightChopInline(1);
-			}
-		}
-
-		BaseName.TrimStartAndEndInline();
-		if (BaseName.IsEmpty())
-		{
-			BaseName = TEXT("Widget");
-		}
-
-		FString CandidateName = BaseName;
-		int32 Suffix = 1;
-		while (WidgetBlueprint->WidgetTree->FindWidget(FName(*CandidateName)) != nullptr)
-		{
-			CandidateName = FString::Printf(TEXT("%s_%d"), *BaseName, Suffix++);
-		}
-		return FName(*CandidateName);
+		return MCPToolUMGUtils::BuildUniqueWidgetName(WidgetBlueprint, WidgetClass, RequestedName);
 	}
 
 	FString GetParentWidgetId(const UWidgetBlueprint* WidgetBlueprint, const UWidget* Widget)
 	{
-		if (WidgetBlueprint == nullptr || Widget == nullptr)
-		{
-			return TEXT("");
-		}
-
-		if (Widget->Slot != nullptr && Widget->Slot->Parent != nullptr)
-		{
-			return GetWidgetStableId(WidgetBlueprint, Widget->Slot->Parent);
-		}
-
-		if (WidgetBlueprint->WidgetTree == nullptr)
-		{
-			return TEXT("");
-		}
-
-		TArray<UWidget*> AllWidgets;
-		WidgetBlueprint->WidgetTree->GetAllWidgets(AllWidgets);
-		for (UWidget* CandidateHost : AllWidgets)
-		{
-			if (CandidateHost == nullptr || CandidateHost == Widget)
-			{
-				continue;
-			}
-
-			INamedSlotInterface* NamedSlotHost = Cast<INamedSlotInterface>(CandidateHost);
-			if (NamedSlotHost == nullptr)
-			{
-				continue;
-			}
-
-			TArray<FName> SlotNames;
-			NamedSlotHost->GetSlotNames(SlotNames);
-			for (const FName SlotName : SlotNames)
-			{
-				if (SlotName.IsNone())
-				{
-					continue;
-				}
-
-				if (NamedSlotHost->GetContentForSlot(SlotName) == Widget)
-				{
-					return GetWidgetStableId(WidgetBlueprint, CandidateHost);
-				}
-			}
-		}
-
-		TArray<FName> TreeSlotNames;
-		WidgetBlueprint->WidgetTree->GetSlotNames(TreeSlotNames);
-		for (const FName SlotName : TreeSlotNames)
-		{
-			if (SlotName.IsNone())
-			{
-				continue;
-			}
-
-			if (WidgetBlueprint->WidgetTree->GetContentForSlot(SlotName) == Widget)
-			{
-				return TEXT("this");
-			}
-		}
-
-		return TEXT("");
+		return MCPToolUMGUtils::GetParentWidgetId(WidgetBlueprint, Widget);
 	}
 
 	FString GetWidgetSlotType(const UWidgetBlueprint* WidgetBlueprint, const UWidget* Widget, FString* OutNamedSlotName = nullptr)
 	{
-		if (OutNamedSlotName != nullptr)
-		{
-			OutNamedSlotName->Reset();
-		}
-
-		if (Widget == nullptr)
-		{
-			return FString();
-		}
-
-		if (Widget->Slot != nullptr)
-		{
-			return Widget->Slot->GetClass()->GetName();
-		}
-
-		if (WidgetBlueprint == nullptr || WidgetBlueprint->WidgetTree == nullptr)
-		{
-			return FString();
-		}
-
-		TArray<UWidget*> AllWidgets;
-		WidgetBlueprint->WidgetTree->GetAllWidgets(AllWidgets);
-		for (UWidget* CandidateHost : AllWidgets)
-		{
-			if (CandidateHost == nullptr || CandidateHost == Widget)
-			{
-				continue;
-			}
-
-			INamedSlotInterface* NamedSlotHost = Cast<INamedSlotInterface>(CandidateHost);
-			if (NamedSlotHost == nullptr)
-			{
-				continue;
-			}
-
-			TArray<FName> SlotNames;
-			NamedSlotHost->GetSlotNames(SlotNames);
-			for (const FName SlotName : SlotNames)
-			{
-				if (SlotName.IsNone())
-				{
-					continue;
-				}
-
-				if (NamedSlotHost->GetContentForSlot(SlotName) == Widget)
-				{
-					if (OutNamedSlotName != nullptr)
-					{
-						*OutNamedSlotName = SlotName.ToString();
-					}
-					return FString::Printf(TEXT("NamedSlot:%s"), *SlotName.ToString());
-				}
-			}
-		}
-
-		TArray<FName> TreeSlotNames;
-		WidgetBlueprint->WidgetTree->GetSlotNames(TreeSlotNames);
-		for (const FName SlotName : TreeSlotNames)
-		{
-			if (SlotName.IsNone())
-			{
-				continue;
-			}
-
-			if (WidgetBlueprint->WidgetTree->GetContentForSlot(SlotName) == Widget)
-			{
-				if (OutNamedSlotName != nullptr)
-				{
-					*OutNamedSlotName = SlotName.ToString();
-				}
-
-				return FString::Printf(TEXT("NamedSlot:%s"), *SlotName.ToString());
-			}
-		}
-
-		return FString();
-	}
-
-	void CollectWidgetTreeNamedSlotNames(const UWidgetBlueprint* WidgetBlueprint, TArray<FName>& OutSlotNames)
-	{
-		OutSlotNames.Reset();
-		if (WidgetBlueprint == nullptr || WidgetBlueprint->WidgetTree == nullptr)
-		{
-			return;
-		}
-
-		WidgetBlueprint->WidgetTree->GetSlotNames(OutSlotNames);
-
-		if constexpr (THasGetInheritedAvailableNamedSlots<UWidgetBlueprint>::value)
-		{
-			const TArray<FName> InheritedNamedSlots = WidgetBlueprint->GetInheritedAvailableNamedSlots();
-			for (const FName InheritedNamedSlot : InheritedNamedSlots)
-			{
-				if (!InheritedNamedSlot.IsNone())
-				{
-					OutSlotNames.AddUnique(InheritedNamedSlot);
-				}
-			}
-		}
-
-		OutSlotNames.RemoveAll([](const FName SlotName) { return SlotName.IsNone(); });
-	}
-
-	FString JoinNamedSlotNames(const TArray<FName>& SlotNames)
-	{
-		TArray<FString> Names;
-		Names.Reserve(SlotNames.Num());
-		for (const FName SlotName : SlotNames)
-		{
-			if (!SlotName.IsNone())
-			{
-				Names.Add(SlotName.ToString());
-			}
-		}
-
-		return FString::Join(Names, TEXT(", "));
+		return MCPToolUMGUtils::GetWidgetSlotType(WidgetBlueprint, Widget, OutNamedSlotName);
 	}
 
 	bool ResolveNamedSlotName(
@@ -2946,64 +732,7 @@ namespace
 		FName& OutSlotName,
 		FMCPDiagnostic& OutDiagnostic)
 	{
-		OutSlotName = NAME_None;
-
-		if (ParentWidget == nullptr)
-		{
-			OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-			OutDiagnostic.Message = TEXT("named_slot_name requires a valid parent widget.");
-			return false;
-		}
-
-		INamedSlotInterface* NamedSlotHost = Cast<INamedSlotInterface>(ParentWidget);
-		if (NamedSlotHost == nullptr)
-		{
-			OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-			OutDiagnostic.Message = TEXT("parent_ref does not support named slots.");
-			OutDiagnostic.Detail = ParentWidget->GetClass()->GetPathName();
-			OutDiagnostic.Suggestion = TEXT("Choose a UUserWidget (or widget) that exposes named slots.");
-			return false;
-		}
-
-		TArray<FName> SlotNames;
-		NamedSlotHost->GetSlotNames(SlotNames);
-		SlotNames.RemoveAll([](const FName Name) { return Name.IsNone(); });
-		if (SlotNames.Num() == 0)
-		{
-			OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-			OutDiagnostic.Message = TEXT("parent_ref has no named slots.");
-			OutDiagnostic.Detail = ParentWidget->GetName();
-			return false;
-		}
-
-		if (!RequestedNamedSlotName.IsEmpty())
-		{
-			for (const FName SlotName : SlotNames)
-			{
-				if (SlotName.ToString().Equals(RequestedNamedSlotName, ESearchCase::IgnoreCase))
-				{
-					OutSlotName = SlotName;
-					return true;
-				}
-			}
-
-			OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-			OutDiagnostic.Message = TEXT("named_slot_name does not exist on parent_ref.");
-			OutDiagnostic.Detail = RequestedNamedSlotName;
-			OutDiagnostic.Suggestion = FString::Printf(TEXT("Available named slots: %s"), *JoinNamedSlotNames(SlotNames));
-			return false;
-		}
-
-		if (SlotNames.Num() == 1)
-		{
-			OutSlotName = SlotNames[0];
-			return true;
-		}
-
-		OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		OutDiagnostic.Message = TEXT("named_slot_name is required because parent_ref has multiple named slots.");
-		OutDiagnostic.Suggestion = FString::Printf(TEXT("Available named slots: %s"), *JoinNamedSlotNames(SlotNames));
-		return false;
+		return MCPToolUMGUtils::ResolveNamedSlotName(ParentWidget, RequestedNamedSlotName, OutSlotName, OutDiagnostic);
 	}
 
 	bool ResolveWidgetTreeNamedSlotName(
@@ -3012,53 +741,7 @@ namespace
 		FName& OutSlotName,
 		FMCPDiagnostic& OutDiagnostic)
 	{
-		OutSlotName = NAME_None;
-
-		if (WidgetBlueprint == nullptr || WidgetBlueprint->WidgetTree == nullptr)
-		{
-			OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-			OutDiagnostic.Message = TEXT("Widget blueprint context is invalid.");
-			return false;
-		}
-
-		TArray<FName> SlotNames;
-		CollectWidgetTreeNamedSlotNames(WidgetBlueprint, SlotNames);
-		if (SlotNames.Num() == 0)
-		{
-			OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-			OutDiagnostic.Message = TEXT("No top-level named slots are available on this widget blueprint.");
-			OutDiagnostic.Suggestion = TEXT("Use parent_ref for panel/content widgets, or expose named slots in the parent widget class.");
-			return false;
-		}
-
-		if (!RequestedNamedSlotName.IsEmpty())
-		{
-			for (const FName SlotName : SlotNames)
-			{
-				if (SlotName.ToString().Equals(RequestedNamedSlotName, ESearchCase::IgnoreCase))
-				{
-					OutSlotName = SlotName;
-					return true;
-				}
-			}
-
-			OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-			OutDiagnostic.Message = TEXT("named_slot_name does not exist on this widget blueprint.");
-			OutDiagnostic.Detail = RequestedNamedSlotName;
-			OutDiagnostic.Suggestion = FString::Printf(TEXT("Available named slots: %s"), *JoinNamedSlotNames(SlotNames));
-			return false;
-		}
-
-		if (SlotNames.Num() == 1)
-		{
-			OutSlotName = SlotNames[0];
-			return true;
-		}
-
-		OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		OutDiagnostic.Message = TEXT("named_slot_name is required because multiple top-level named slots are available.");
-		OutDiagnostic.Suggestion = FString::Printf(TEXT("Available named slots: %s"), *JoinNamedSlotNames(SlotNames));
-		return false;
+		return MCPToolUMGUtils::ResolveWidgetTreeNamedSlotName(WidgetBlueprint, RequestedNamedSlotName, OutSlotName, OutDiagnostic);
 	}
 
 	bool AttachWidgetToParent(
@@ -3072,184 +755,16 @@ namespace
 		FString& OutResolvedSlotType,
 		FMCPDiagnostic& OutDiagnostic)
 	{
-		OutResolvedNamedSlotName.Reset();
-		OutResolvedSlotType.Reset();
-
-		if (WidgetBlueprint == nullptr || WidgetBlueprint->WidgetTree == nullptr || ChildWidget == nullptr)
-		{
-			OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-			OutDiagnostic.Message = TEXT("Widget blueprint context is invalid.");
-			return false;
-		}
-
-		if (ParentWidget == nullptr && !NamedSlotName.IsEmpty())
-		{
-			FName ResolvedNamedSlot = NAME_None;
-			FMCPDiagnostic NamedSlotDiagnostic;
-			if (!ResolveWidgetTreeNamedSlotName(WidgetBlueprint, NamedSlotName, ResolvedNamedSlot, NamedSlotDiagnostic))
-			{
-				OutDiagnostic = NamedSlotDiagnostic;
-				return false;
-			}
-
-			UWidget* ExistingContent = WidgetBlueprint->WidgetTree->GetContentForSlot(ResolvedNamedSlot);
-			if (ExistingContent != nullptr && ExistingContent != ChildWidget && !bReplaceContent)
-			{
-				OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-				OutDiagnostic.Message = TEXT("Target top-level named slot already has content. Set replace_content=true to replace it.");
-				OutDiagnostic.Detail = ResolvedNamedSlot.ToString();
-				return false;
-			}
-
-			if (ExistingContent != nullptr && ExistingContent != ChildWidget && bReplaceContent)
-			{
-				TArray<FName> RemovedVariableNames;
-				CollectWidgetSubtreeVariableNames(ExistingContent, RemovedVariableNames);
-				if (!WidgetBlueprint->WidgetTree->RemoveWidget(ExistingContent))
-				{
-					WidgetBlueprint->WidgetTree->SetContentForSlot(ResolvedNamedSlot, nullptr);
-				}
-				else
-				{
-					for (const FName& RemovedVariableName : RemovedVariableNames)
-					{
-						RemoveWidgetGuidEntry(WidgetBlueprint, RemovedVariableName);
-					}
-				}
-			}
-
-			WidgetBlueprint->WidgetTree->SetContentForSlot(ResolvedNamedSlot, ChildWidget);
-			OutResolvedNamedSlotName = ResolvedNamedSlot.ToString();
-			OutResolvedSlotType = FString::Printf(TEXT("NamedSlot:%s"), *OutResolvedNamedSlotName);
-			return true;
-		}
-
-		if (ParentWidget == nullptr)
-		{
-			if (WidgetBlueprint->WidgetTree->RootWidget != nullptr)
-			{
-				OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-				OutDiagnostic.Message = TEXT("WidgetTree root already exists. Provide parent_ref to add child widgets.");
-				return false;
-			}
-
-			WidgetBlueprint->WidgetTree->RootWidget = ChildWidget;
-			return true;
-		}
-
-		const bool bIsPanelWidget = Cast<UPanelWidget>(ParentWidget) != nullptr;
-		const bool bIsContentWidget = Cast<UContentWidget>(ParentWidget) != nullptr;
-		const bool bShouldUseNamedSlot =
-			!NamedSlotName.IsEmpty() || (!bIsPanelWidget && !bIsContentWidget && Cast<INamedSlotInterface>(ParentWidget) != nullptr);
-
-		if (bShouldUseNamedSlot)
-		{
-			FName ResolvedNamedSlot = NAME_None;
-			FMCPDiagnostic NamedSlotDiagnostic;
-			if (!ResolveNamedSlotName(ParentWidget, NamedSlotName, ResolvedNamedSlot, NamedSlotDiagnostic))
-			{
-				OutDiagnostic = NamedSlotDiagnostic;
-				return false;
-			}
-
-			INamedSlotInterface* NamedSlotHost = Cast<INamedSlotInterface>(ParentWidget);
-			UWidget* ExistingContent = NamedSlotHost->GetContentForSlot(ResolvedNamedSlot);
-			if (ExistingContent != nullptr && ExistingContent != ChildWidget && !bReplaceContent)
-			{
-				OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-				OutDiagnostic.Message = TEXT("Target named slot already has content. Set replace_content=true to replace it.");
-				OutDiagnostic.Detail = ResolvedNamedSlot.ToString();
-				return false;
-			}
-
-			if (ExistingContent != nullptr && ExistingContent != ChildWidget && bReplaceContent)
-			{
-				TArray<FName> RemovedVariableNames;
-				CollectWidgetSubtreeVariableNames(ExistingContent, RemovedVariableNames);
-				if (!WidgetBlueprint->WidgetTree->RemoveWidget(ExistingContent))
-				{
-					NamedSlotHost->SetContentForSlot(ResolvedNamedSlot, nullptr);
-				}
-				else
-				{
-					for (const FName& RemovedVariableName : RemovedVariableNames)
-					{
-						RemoveWidgetGuidEntry(WidgetBlueprint, RemovedVariableName);
-					}
-				}
-			}
-
-			NamedSlotHost->SetContentForSlot(ResolvedNamedSlot, ChildWidget);
-			OutResolvedNamedSlotName = ResolvedNamedSlot.ToString();
-			OutResolvedSlotType = FString::Printf(TEXT("NamedSlot:%s"), *OutResolvedNamedSlotName);
-			return true;
-		}
-
-		if (UContentWidget* ContentWidget = Cast<UContentWidget>(ParentWidget))
-		{
-			if (ContentWidget->GetContent() != nullptr && !bReplaceContent)
-			{
-				OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-				OutDiagnostic.Message = TEXT("Target content widget already has a child. Set replace_content=true to replace it.");
-				return false;
-			}
-
-			if (ContentWidget->GetContent() != nullptr && bReplaceContent)
-			{
-				UWidget* ExistingContent = ContentWidget->GetContent();
-				TArray<FName> RemovedVariableNames;
-				CollectWidgetSubtreeVariableNames(ExistingContent, RemovedVariableNames);
-				if (!WidgetBlueprint->WidgetTree->RemoveWidget(ExistingContent))
-				{
-					OutDiagnostic.Code = MCPErrorCodes::INTERNAL_EXCEPTION;
-					OutDiagnostic.Message = TEXT("Failed to remove existing child from content widget.");
-					return false;
-				}
-
-				for (const FName& RemovedVariableName : RemovedVariableNames)
-				{
-					RemoveWidgetGuidEntry(WidgetBlueprint, RemovedVariableName);
-				}
-			}
-
-			UPanelSlot* NewSlot = ContentWidget->SetContent(ChildWidget);
-			if (NewSlot == nullptr)
-			{
-				OutDiagnostic.Code = MCPErrorCodes::INTERNAL_EXCEPTION;
-				OutDiagnostic.Message = TEXT("Failed to attach child to content widget.");
-				return false;
-			}
-			OutResolvedSlotType = NewSlot->GetClass()->GetName();
-			return true;
-		}
-
-		UPanelWidget* PanelWidget = Cast<UPanelWidget>(ParentWidget);
-		if (PanelWidget == nullptr)
-		{
-			OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-			OutDiagnostic.Message = TEXT("parent_ref must point to a panel/content/named-slot widget.");
-			return false;
-		}
-
-		UPanelSlot* NewSlot = nullptr;
-		if (InsertIndex >= 0)
-		{
-			NewSlot = PanelWidget->InsertChildAt(InsertIndex, ChildWidget);
-		}
-		else
-		{
-			NewSlot = PanelWidget->AddChild(ChildWidget);
-		}
-
-		if (NewSlot == nullptr)
-		{
-			OutDiagnostic.Code = MCPErrorCodes::INTERNAL_EXCEPTION;
-			OutDiagnostic.Message = TEXT("Failed to attach child to panel widget.");
-			return false;
-		}
-
-		OutResolvedSlotType = NewSlot->GetClass()->GetName();
-		return true;
+		return MCPToolUMGUtils::AttachWidgetToParent(
+			WidgetBlueprint,
+			ParentWidget,
+			ChildWidget,
+			InsertIndex,
+			bReplaceContent,
+			NamedSlotName,
+			OutResolvedNamedSlotName,
+			OutResolvedSlotType,
+			OutDiagnostic);
 	}
 
 	bool DetachWidgetFromParent(
@@ -3257,217 +772,9 @@ namespace
 		UWidget* Widget,
 		FMCPDiagnostic& OutDiagnostic)
 	{
-		if (WidgetBlueprint == nullptr || WidgetBlueprint->WidgetTree == nullptr || Widget == nullptr)
-		{
-			OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-			OutDiagnostic.Message = TEXT("Widget blueprint context is invalid.");
-			return false;
-		}
-
-		if (WidgetBlueprint->WidgetTree->RootWidget == Widget)
-		{
-			WidgetBlueprint->WidgetTree->RootWidget = nullptr;
-			return true;
-		}
-
-		if (Widget->Slot == nullptr || Widget->Slot->Parent == nullptr)
-		{
-			TArray<UWidget*> AllWidgets;
-			WidgetBlueprint->WidgetTree->GetAllWidgets(AllWidgets);
-			for (UWidget* CandidateHost : AllWidgets)
-			{
-				if (CandidateHost == nullptr || CandidateHost == Widget)
-				{
-					continue;
-				}
-
-				INamedSlotInterface* NamedSlotHost = Cast<INamedSlotInterface>(CandidateHost);
-				if (NamedSlotHost == nullptr)
-				{
-					continue;
-				}
-
-				TArray<FName> SlotNames;
-				NamedSlotHost->GetSlotNames(SlotNames);
-				for (const FName SlotName : SlotNames)
-				{
-					if (SlotName.IsNone())
-					{
-						continue;
-					}
-
-					if (NamedSlotHost->GetContentForSlot(SlotName) == Widget)
-					{
-						NamedSlotHost->SetContentForSlot(SlotName, nullptr);
-						return true;
-					}
-				}
-			}
-
-			TArray<FName> TreeSlotNames;
-			WidgetBlueprint->WidgetTree->GetSlotNames(TreeSlotNames);
-			for (const FName SlotName : TreeSlotNames)
-			{
-				if (SlotName.IsNone())
-				{
-					continue;
-				}
-
-				if (WidgetBlueprint->WidgetTree->GetContentForSlot(SlotName) == Widget)
-				{
-					WidgetBlueprint->WidgetTree->SetContentForSlot(SlotName, nullptr);
-					return true;
-				}
-			}
-
-			OutDiagnostic.Code = MCPErrorCodes::UMG_WIDGET_NOT_FOUND;
-			OutDiagnostic.Message = TEXT("Widget has no parent slot and cannot be detached.");
-			return false;
-		}
-
-		UPanelWidget* ParentPanel = Widget->Slot->Parent;
-		if (!ParentPanel->RemoveChild(Widget))
-		{
-			OutDiagnostic.Code = MCPErrorCodes::INTERNAL_EXCEPTION;
-			OutDiagnostic.Message = TEXT("Failed to detach widget from its parent.");
-			return false;
-		}
-
-		return true;
+		return MCPToolUMGUtils::DetachWidgetFromParent(WidgetBlueprint, Widget, OutDiagnostic);
 	}
 
-	FString BuildNiagaraCompatModuleKey(const FString& ObjectPath)
-	{
-		return FString::Printf(TEXT("compat|%s|default"), *HashToHexSha1(ObjectPath.ToLower()));
-	}
-
-	void BuildWidgetTreeNodesRecursive(
-		const UWidgetBlueprint* WidgetBlueprint,
-		UWidget* Widget,
-		const FString& ParentId,
-		const FString& SlotTypeOverride,
-		const FString& NameGlob,
-		const TSet<FString>& AllowedClassPaths,
-		const int32 MaxDepth,
-		const int32 Depth,
-		const bool bIncludeSlotSummary,
-		const bool bIncludeLayoutSummary,
-		TArray<TSharedPtr<FJsonValue>>& OutNodes)
-	{
-		if (Widget == nullptr || Depth > MaxDepth)
-		{
-			return;
-		}
-
-		const FString WidgetId = GetWidgetStableId(WidgetBlueprint, Widget);
-		const FString ClassPath = Widget->GetClass() ? Widget->GetClass()->GetPathName() : FString();
-		const bool bPassNameFilter = NameGlob.IsEmpty() || Widget->GetName().MatchesWildcard(NameGlob);
-		const bool bPassClassFilter = AllowedClassPaths.Num() == 0 || AllowedClassPaths.Contains(ClassPath);
-
-		if (bPassNameFilter && bPassClassFilter)
-		{
-			TSharedRef<FJsonObject> NodeObject = MakeShared<FJsonObject>();
-			NodeObject->SetStringField(TEXT("widget_id"), WidgetId);
-			NodeObject->SetStringField(TEXT("name"), Widget->GetName());
-			NodeObject->SetStringField(TEXT("class_path"), ClassPath);
-			NodeObject->SetStringField(TEXT("parent_id"), ParentId);
-			const FString SlotType = !SlotTypeOverride.IsEmpty()
-				? SlotTypeOverride
-				: GetWidgetSlotType(WidgetBlueprint, Widget);
-			NodeObject->SetStringField(TEXT("slot_type"), SlotType);
-
-			int32 ChildrenCount = 0;
-			if (const UPanelWidget* Panel = Cast<UPanelWidget>(Widget))
-			{
-				ChildrenCount += Panel->GetChildrenCount();
-			}
-			if (const INamedSlotInterface* NamedSlotHost = Cast<INamedSlotInterface>(Widget))
-			{
-				TArray<FName> SlotNames;
-				NamedSlotHost->GetSlotNames(SlotNames);
-				for (const FName SlotName : SlotNames)
-				{
-					if (SlotName.IsNone())
-					{
-						continue;
-					}
-					if (NamedSlotHost->GetContentForSlot(SlotName) != nullptr)
-					{
-						++ChildrenCount;
-					}
-				}
-			}
-			NodeObject->SetNumberField(TEXT("children_count"), ChildrenCount);
-			NodeObject->SetObjectField(TEXT("flags"), MakeShared<FJsonObject>());
-			if (bIncludeSlotSummary && Widget->Slot != nullptr)
-			{
-				NodeObject->SetObjectField(TEXT("slot_summary"), BuildSlotSummaryObject(Widget->Slot));
-			}
-			if (bIncludeLayoutSummary)
-			{
-				NodeObject->SetObjectField(TEXT("layout_summary"), BuildWidgetLayoutSummaryObject(Widget));
-			}
-			OutNodes.Add(MakeShared<FJsonValueObject>(NodeObject));
-		}
-
-		if (const UPanelWidget* Panel = Cast<UPanelWidget>(Widget))
-		{
-			for (int32 Index = 0; Index < Panel->GetChildrenCount(); ++Index)
-			{
-				UWidget* ChildWidget = Panel->GetChildAt(Index);
-				const FString ChildSlotType = (ChildWidget != nullptr && ChildWidget->Slot != nullptr)
-					? ChildWidget->Slot->GetClass()->GetName()
-					: FString();
-				BuildWidgetTreeNodesRecursive(
-					WidgetBlueprint,
-					ChildWidget,
-					WidgetId,
-					ChildSlotType,
-					NameGlob,
-					AllowedClassPaths,
-					MaxDepth,
-					Depth + 1,
-					bIncludeSlotSummary,
-					bIncludeLayoutSummary,
-					OutNodes);
-			}
-		}
-
-		if (const INamedSlotInterface* NamedSlotHost = Cast<INamedSlotInterface>(Widget))
-		{
-			TSet<const UWidget*> VisitedNamedSlotChildren;
-			TArray<FName> SlotNames;
-			NamedSlotHost->GetSlotNames(SlotNames);
-			for (const FName SlotName : SlotNames)
-			{
-				if (SlotName.IsNone())
-				{
-					continue;
-				}
-
-				UWidget* SlotContent = NamedSlotHost->GetContentForSlot(SlotName);
-				if (SlotContent == nullptr || VisitedNamedSlotChildren.Contains(SlotContent))
-				{
-					continue;
-				}
-
-				VisitedNamedSlotChildren.Add(SlotContent);
-				const FString NamedSlotType = FString::Printf(TEXT("NamedSlot:%s"), *SlotName.ToString());
-				BuildWidgetTreeNodesRecursive(
-					WidgetBlueprint,
-					SlotContent,
-					WidgetId,
-					NamedSlotType,
-					NameGlob,
-					AllowedClassPaths,
-					MaxDepth,
-					Depth + 1,
-					bIncludeSlotSummary,
-					bIncludeLayoutSummary,
-					OutNodes);
-			}
-		}
-	}
 }
 
 void UMCPToolRegistrySubsystem::Initialize(FSubsystemCollectionBase& Collection)
@@ -3509,7 +816,7 @@ bool UMCPToolRegistrySubsystem::ValidateRequest(const FMCPRequestEnvelope& Reque
 	const TSharedPtr<FJsonValueObject> ParamsValue = MakeShared<FJsonValueObject>(ParamsObject);
 
 	FString SchemaError;
-	if (!ValidateJsonValueAgainstSchema(ParamsValue, ToolDefinition->ParamsSchema, TEXT("params"), SchemaError))
+	if (!MCPToolSchemaValidator::ValidateJsonValueAgainstSchema(ParamsValue, ToolDefinition->ParamsSchema, TEXT("params"), SchemaError))
 	{
 		OutDiagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
 		OutDiagnostic.Message = TEXT("Request params failed schema validation.");
@@ -3654,709 +961,103 @@ TArray<FString> UMCPToolRegistrySubsystem::GetRegisteredToolNames() const
 
 void UMCPToolRegistrySubsystem::RegisterBuiltInTools()
 {
-	RegisterTool({
-		TEXT("tools.list"),
-		TEXT("tools"),
-		TEXT("1.0.0"),
-		true,
-		false,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleToolsList(Request, OutResult); }
-	});
+	RegisterBuiltInToolsImpl();
+}
 
-	RegisterTool({
-		TEXT("system.health"),
-		TEXT("system"),
-		TEXT("1.0.0"),
-		true,
-		false,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleSystemHealth(Request, OutResult); }
-	});
+void UMCPToolRegistrySubsystem::RegisterBuiltInToolsImpl()
+{
+	using FToolHandler = bool (UMCPToolRegistrySubsystem::*)(const FMCPRequestEnvelope&, FMCPToolExecutionResult&) const;
+	struct FToolSpec
+	{
+		const TCHAR* Name;
+		bool bWriteTool = false;
+		FToolHandler Handler = nullptr;
+	};
 
-	RegisterTool({
-		TEXT("editor.livecoding.compile"),
-		TEXT("editor"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleEditorLiveCodingCompile(Request, OutResult); }
-	});
+	static const FToolSpec ToolSpecs[] = {
+		{ TEXT("tools.list"), false, &UMCPToolRegistrySubsystem::HandleToolsList },
+		{ TEXT("system.health"), false, &UMCPToolRegistrySubsystem::HandleSystemHealth },
+		{ TEXT("editor.livecoding.compile"), true, &UMCPToolRegistrySubsystem::HandleEditorLiveCodingCompile },
+		{ TEXT("asset.find"), false, &UMCPToolRegistrySubsystem::HandleAssetFind },
+		{ TEXT("asset.load"), false, &UMCPToolRegistrySubsystem::HandleAssetLoad },
+		{ TEXT("asset.save"), true, &UMCPToolRegistrySubsystem::HandleAssetSave },
+		{ TEXT("asset.import"), true, &UMCPToolRegistrySubsystem::HandleAssetImport },
+		{ TEXT("asset.create"), true, &UMCPToolRegistrySubsystem::HandleAssetCreate },
+		{ TEXT("blueprint.class.create"), true, &UMCPToolRegistrySubsystem::HandleBlueprintClassCreate },
+		{ TEXT("asset.duplicate"), true, &UMCPToolRegistrySubsystem::HandleAssetDuplicate },
+		{ TEXT("asset.rename"), true, &UMCPToolRegistrySubsystem::HandleAssetRename },
+		{ TEXT("asset.delete"), true, &UMCPToolRegistrySubsystem::HandleAssetDelete },
+		{ TEXT("settings.project.get"), false, &UMCPToolRegistrySubsystem::HandleSettingsProjectGet },
+		{ TEXT("settings.project.patch"), true, &UMCPToolRegistrySubsystem::HandleSettingsProjectPatch },
+		{ TEXT("settings.project.apply"), true, &UMCPToolRegistrySubsystem::HandleSettingsProjectApply },
+		{ TEXT("settings.gamemode.get"), false, &UMCPToolRegistrySubsystem::HandleSettingsGameModeGet },
+		{ TEXT("settings.gamemode.set_default"), true, &UMCPToolRegistrySubsystem::HandleSettingsGameModeSetDefault },
+		{ TEXT("settings.gamemode.compose"), true, &UMCPToolRegistrySubsystem::HandleSettingsGameModeCompose },
+		{ TEXT("settings.gamemode.set_map_override"), true, &UMCPToolRegistrySubsystem::HandleSettingsGameModeSetMapOverride },
+		{ TEXT("settings.gamemode.remove_map_override"), true, &UMCPToolRegistrySubsystem::HandleSettingsGameModeRemoveMapOverride },
+		{ TEXT("object.inspect"), false, &UMCPToolRegistrySubsystem::HandleObjectInspect },
+		{ TEXT("object.patch"), true, &UMCPToolRegistrySubsystem::HandleObjectPatch },
+		{ TEXT("object.patch.v2"), true, &UMCPToolRegistrySubsystem::HandleObjectPatchV2 },
+		{ TEXT("world.outliner.list"), false, &UMCPToolRegistrySubsystem::HandleWorldOutlinerList },
+		{ TEXT("world.selection.get"), false, &UMCPToolRegistrySubsystem::HandleWorldSelectionGet },
+		{ TEXT("world.selection.set"), false, &UMCPToolRegistrySubsystem::HandleWorldSelectionSet },
+		{ TEXT("mat.instance.params.get"), false, &UMCPToolRegistrySubsystem::HandleMatInstanceParamsGet },
+		{ TEXT("mat.instance.params.set"), true, &UMCPToolRegistrySubsystem::HandleMatInstanceParamsSet },
+		{ TEXT("niagara.params.get"), false, &UMCPToolRegistrySubsystem::HandleNiagaraParamsGet },
+		{ TEXT("niagara.params.set"), true, &UMCPToolRegistrySubsystem::HandleNiagaraParamsSet },
+		{ TEXT("niagara.stack.list"), false, &UMCPToolRegistrySubsystem::HandleNiagaraStackList },
+		{ TEXT("niagara.stack.module.set_param"), true, &UMCPToolRegistrySubsystem::HandleNiagaraStackModuleSetParam },
+		{ TEXT("umg.blueprint.create"), true, &UMCPToolRegistrySubsystem::HandleUMGBlueprintCreate },
+		{ TEXT("umg.blueprint.patch"), true, &UMCPToolRegistrySubsystem::HandleUMGBlueprintPatch },
+		{ TEXT("umg.blueprint.reparent"), true, &UMCPToolRegistrySubsystem::HandleUMGBlueprintReparent },
+		{ TEXT("umg.widget.class.list"), false, &UMCPToolRegistrySubsystem::HandleUMGWidgetClassList },
+		{ TEXT("umg.tree.get"), false, &UMCPToolRegistrySubsystem::HandleUMGTreeGet },
+		{ TEXT("umg.widget.inspect"), false, &UMCPToolRegistrySubsystem::HandleUMGWidgetInspect },
+		{ TEXT("umg.slot.inspect"), false, &UMCPToolRegistrySubsystem::HandleUMGSlotInspect },
+		{ TEXT("umg.widget.add"), true, &UMCPToolRegistrySubsystem::HandleUMGWidgetAdd },
+		{ TEXT("umg.widget.remove"), true, &UMCPToolRegistrySubsystem::HandleUMGWidgetRemove },
+		{ TEXT("umg.widget.reparent"), true, &UMCPToolRegistrySubsystem::HandleUMGWidgetReparent },
+		{ TEXT("umg.widget.patch"), true, &UMCPToolRegistrySubsystem::HandleUMGWidgetPatch },
+		{ TEXT("umg.widget.patch.v2"), true, &UMCPToolRegistrySubsystem::HandleUMGWidgetPatchV2 },
+		{ TEXT("umg.slot.patch"), true, &UMCPToolRegistrySubsystem::HandleUMGSlotPatch },
+		{ TEXT("umg.slot.patch.v2"), true, &UMCPToolRegistrySubsystem::HandleUMGSlotPatchV2 },
+		{ TEXT("umg.animation.list"), false, &UMCPToolRegistrySubsystem::HandleUMGAnimationList },
+		{ TEXT("umg.animation.create"), true, &UMCPToolRegistrySubsystem::HandleUMGAnimationCreate },
+		{ TEXT("umg.animation.remove"), true, &UMCPToolRegistrySubsystem::HandleUMGAnimationRemove },
+		{ TEXT("umg.animation.track.add"), true, &UMCPToolRegistrySubsystem::HandleUMGAnimationTrackAdd },
+		{ TEXT("umg.animation.key.set"), true, &UMCPToolRegistrySubsystem::HandleUMGAnimationKeySet },
+		{ TEXT("umg.animation.key.remove"), true, &UMCPToolRegistrySubsystem::HandleUMGAnimationKeyRemove },
+		{ TEXT("umg.binding.list"), false, &UMCPToolRegistrySubsystem::HandleUMGBindingList },
+		{ TEXT("umg.binding.set"), true, &UMCPToolRegistrySubsystem::HandleUMGBindingSet },
+		{ TEXT("umg.binding.clear"), true, &UMCPToolRegistrySubsystem::HandleUMGBindingClear },
+		{ TEXT("umg.widget.event.bind"), true, &UMCPToolRegistrySubsystem::HandleUMGWidgetEventBind },
+		{ TEXT("umg.widget.event.unbind"), true, &UMCPToolRegistrySubsystem::HandleUMGWidgetEventUnbind },
+		{ TEXT("umg.graph.summary"), false, &UMCPToolRegistrySubsystem::HandleUMGGraphSummary },
+		{ TEXT("changeset.list"), false, &UMCPToolRegistrySubsystem::HandleChangeSetList },
+		{ TEXT("changeset.get"), false, &UMCPToolRegistrySubsystem::HandleChangeSetGet },
+		{ TEXT("changeset.rollback.preview"), false, &UMCPToolRegistrySubsystem::HandleChangeSetRollbackPreview },
+		{ TEXT("changeset.rollback.apply"), true, &UMCPToolRegistrySubsystem::HandleChangeSetRollbackApply },
+		{ TEXT("job.get"), false, &UMCPToolRegistrySubsystem::HandleJobGet },
+		{ TEXT("job.cancel"), true, &UMCPToolRegistrySubsystem::HandleJobCancel },
+	};
 
-	RegisterTool({
-		TEXT("asset.find"),
-		TEXT("asset"),
-		TEXT("1.0.0"),
-		true,
-		false,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleAssetFind(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("asset.load"),
-		TEXT("asset"),
-		TEXT("1.0.0"),
-		true,
-		false,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleAssetLoad(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("asset.save"),
-		TEXT("asset"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleAssetSave(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("asset.import"),
-		TEXT("asset"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleAssetImport(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("asset.create"),
-		TEXT("asset"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleAssetCreate(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("blueprint.class.create"),
-		TEXT("blueprint"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleBlueprintClassCreate(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("asset.duplicate"),
-		TEXT("asset"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleAssetDuplicate(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("asset.rename"),
-		TEXT("asset"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleAssetRename(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("asset.delete"),
-		TEXT("asset"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleAssetDelete(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("settings.project.get"),
-		TEXT("settings"),
-		TEXT("1.0.0"),
-		true,
-		false,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleSettingsProjectGet(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("settings.project.patch"),
-		TEXT("settings"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleSettingsProjectPatch(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("settings.project.apply"),
-		TEXT("settings"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleSettingsProjectApply(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("settings.gamemode.get"),
-		TEXT("settings"),
-		TEXT("1.0.0"),
-		true,
-		false,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleSettingsGameModeGet(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("settings.gamemode.set_default"),
-		TEXT("settings"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleSettingsGameModeSetDefault(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("settings.gamemode.compose"),
-		TEXT("settings"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleSettingsGameModeCompose(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("settings.gamemode.set_map_override"),
-		TEXT("settings"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleSettingsGameModeSetMapOverride(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("settings.gamemode.remove_map_override"),
-		TEXT("settings"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleSettingsGameModeRemoveMapOverride(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("object.inspect"),
-		TEXT("object"),
-		TEXT("1.0.0"),
-		true,
-		false,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleObjectInspect(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("object.patch"),
-		TEXT("object"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleObjectPatch(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("object.patch.v2"),
-		TEXT("object"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleObjectPatchV2(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("world.outliner.list"),
-		TEXT("world"),
-		TEXT("1.0.0"),
-		true,
-		false,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleWorldOutlinerList(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("world.selection.get"),
-		TEXT("world"),
-		TEXT("1.0.0"),
-		true,
-		false,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleWorldSelectionGet(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("world.selection.set"),
-		TEXT("world"),
-		TEXT("1.0.0"),
-		true,
-		false,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleWorldSelectionSet(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("mat.instance.params.get"),
-		TEXT("mat"),
-		TEXT("1.0.0"),
-		true,
-		false,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleMatInstanceParamsGet(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("mat.instance.params.set"),
-		TEXT("mat"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleMatInstanceParamsSet(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("niagara.params.get"),
-		TEXT("niagara"),
-		TEXT("1.0.0"),
-		true,
-		false,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleNiagaraParamsGet(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("niagara.params.set"),
-		TEXT("niagara"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleNiagaraParamsSet(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("niagara.stack.list"),
-		TEXT("niagara"),
-		TEXT("1.0.0"),
-		true,
-		false,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleNiagaraStackList(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("niagara.stack.module.set_param"),
-		TEXT("niagara"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleNiagaraStackModuleSetParam(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("umg.blueprint.create"),
-		TEXT("umg"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleUMGBlueprintCreate(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("umg.blueprint.patch"),
-		TEXT("umg"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleUMGBlueprintPatch(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("umg.blueprint.reparent"),
-		TEXT("umg"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleUMGBlueprintReparent(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("umg.widget.class.list"),
-		TEXT("umg"),
-		TEXT("1.0.0"),
-		true,
-		false,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleUMGWidgetClassList(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("umg.tree.get"),
-		TEXT("umg"),
-		TEXT("1.0.0"),
-		true,
-		false,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleUMGTreeGet(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("umg.widget.inspect"),
-		TEXT("umg"),
-		TEXT("1.0.0"),
-		true,
-		false,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleUMGWidgetInspect(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("umg.slot.inspect"),
-		TEXT("umg"),
-		TEXT("1.0.0"),
-		true,
-		false,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleUMGSlotInspect(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("umg.widget.add"),
-		TEXT("umg"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleUMGWidgetAdd(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("umg.widget.remove"),
-		TEXT("umg"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleUMGWidgetRemove(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("umg.widget.reparent"),
-		TEXT("umg"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleUMGWidgetReparent(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("umg.widget.patch"),
-		TEXT("umg"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleUMGWidgetPatch(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("umg.widget.patch.v2"),
-		TEXT("umg"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleUMGWidgetPatchV2(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("umg.slot.patch"),
-		TEXT("umg"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleUMGSlotPatch(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("umg.slot.patch.v2"),
-		TEXT("umg"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleUMGSlotPatchV2(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("umg.animation.list"),
-		TEXT("umg"),
-		TEXT("1.0.0"),
-		true,
-		false,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleUMGAnimationList(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("umg.animation.create"),
-		TEXT("umg"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleUMGAnimationCreate(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("umg.animation.remove"),
-		TEXT("umg"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleUMGAnimationRemove(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("umg.animation.track.add"),
-		TEXT("umg"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleUMGAnimationTrackAdd(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("umg.animation.key.set"),
-		TEXT("umg"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleUMGAnimationKeySet(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("umg.animation.key.remove"),
-		TEXT("umg"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleUMGAnimationKeyRemove(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("umg.binding.list"),
-		TEXT("umg"),
-		TEXT("1.0.0"),
-		true,
-		false,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleUMGBindingList(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("umg.binding.set"),
-		TEXT("umg"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleUMGBindingSet(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("umg.binding.clear"),
-		TEXT("umg"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleUMGBindingClear(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("umg.widget.event.bind"),
-		TEXT("umg"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleUMGWidgetEventBind(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("umg.widget.event.unbind"),
-		TEXT("umg"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleUMGWidgetEventUnbind(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("umg.graph.summary"),
-		TEXT("umg"),
-		TEXT("1.0.0"),
-		true,
-		false,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleUMGGraphSummary(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("changeset.list"),
-		TEXT("changeset"),
-		TEXT("1.0.0"),
-		true,
-		false,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleChangeSetList(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("changeset.get"),
-		TEXT("changeset"),
-		TEXT("1.0.0"),
-		true,
-		false,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleChangeSetGet(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("changeset.rollback.preview"),
-		TEXT("changeset"),
-		TEXT("1.0.0"),
-		true,
-		false,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleChangeSetRollbackPreview(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("changeset.rollback.apply"),
-		TEXT("changeset"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleChangeSetRollbackApply(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("job.get"),
-		TEXT("job"),
-		TEXT("1.0.0"),
-		true,
-		false,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleJobGet(Request, OutResult); }
-	});
-
-	RegisterTool({
-		TEXT("job.cancel"),
-		TEXT("job"),
-		TEXT("1.0.0"),
-		true,
-		true,
-		nullptr,
-		nullptr,
-		[this](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) { return HandleJobCancel(Request, OutResult); }
-	});
+	for (const FToolSpec& ToolSpec : ToolSpecs)
+	{
+		const FToolHandler Handler = ToolSpec.Handler;
+		RegisterTool({
+			ToolSpec.Name,
+			TEXT(""),
+			TEXT("1.0.0"),
+			true,
+			ToolSpec.bWriteTool,
+			nullptr,
+			nullptr,
+			[this, Handler](const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult)
+			{
+				return (this->*Handler)(Request, OutResult);
+			}
+		});
+	}
 }
 
 void UMCPToolRegistrySubsystem::RegisterTool(FMCPToolDefinition Definition)
@@ -4455,1068 +1156,98 @@ void UMCPToolRegistrySubsystem::RebuildSchemaHash()
 
 bool UMCPToolRegistrySubsystem::HandleToolsList(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	bool bIncludeSchemas = true;
-	FString DomainFilter;
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetBoolField(TEXT("include_schemas"), bIncludeSchemas);
-		Request.Params->TryGetStringField(TEXT("domain_filter"), DomainFilter);
-	}
-
-	TArray<TSharedPtr<FJsonValue>> Tools;
-	BuildToolsList(bIncludeSchemas, DomainFilter, Tools);
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetStringField(TEXT("protocol_version"), GetProtocolVersion());
-	OutResult.ResultObject->SetStringField(TEXT("schema_hash"), GetSchemaHash());
-	OutResult.ResultObject->SetArrayField(TEXT("capabilities"), ToJsonStringArray(GetCapabilities()));
-	OutResult.ResultObject->SetArrayField(TEXT("tools"), Tools);
-	OutResult.Status = EMCPResponseStatus::Ok;
-	return true;
+	return FMCPToolsCoreHandler::HandleToolsList(*this, Request, OutResult);
 }
 
 bool UMCPToolRegistrySubsystem::HandleSystemHealth(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("UnrealMCP"));
-	const FString PluginVersion = Plugin.IsValid() ? Plugin->GetDescriptor().VersionName : TEXT("unknown");
-	const FString EngineVersion = FEngineVersion::Current().ToString();
-
-	const UMCPPolicySubsystem* PolicySubsystem = GEditor ? GEditor->GetEditorSubsystem<UMCPPolicySubsystem>() : nullptr;
-	const UMCPEventStreamSubsystem* EventStreamSubsystem = GEditor ? GEditor->GetEditorSubsystem<UMCPEventStreamSubsystem>() : nullptr;
-	const UMCPObservabilitySubsystem* ObservabilitySubsystem = GEditor ? GEditor->GetEditorSubsystem<UMCPObservabilitySubsystem>() : nullptr;
-	const UMCPWebSocketTransportSubsystem* WebSocketTransportSubsystem = GEditor ? GEditor->GetEditorSubsystem<UMCPWebSocketTransportSubsystem>() : nullptr;
-	const bool bSafeMode = PolicySubsystem ? PolicySubsystem->IsSafeMode() : false;
-
-	TSharedRef<FJsonObject> EditorState = MakeShared<FJsonObject>();
-	EditorState->SetBoolField(TEXT("pie"), GEditor != nullptr && GEditor->PlayWorld != nullptr);
-	EditorState->SetBoolField(TEXT("dry_run_request"), Request.Context.bDryRun);
-	EditorState->SetNumberField(TEXT("registered_tool_count"), static_cast<double>(RegisteredTools.Num()));
-
-	if (EventStreamSubsystem != nullptr)
-	{
-		EditorState->SetObjectField(TEXT("event_stream"), EventStreamSubsystem->BuildSnapshot(8));
-	}
-	else
-	{
-		TSharedRef<FJsonObject> EventStreamFallback = MakeShared<FJsonObject>();
-		EventStreamFallback->SetBoolField(TEXT("supported"), false);
-		EditorState->SetObjectField(TEXT("event_stream"), EventStreamFallback);
-	}
-
-	if (ObservabilitySubsystem != nullptr)
-	{
-		EditorState->SetObjectField(TEXT("observability"), ObservabilitySubsystem->BuildSnapshot());
-	}
-	else
-	{
-		EditorState->SetObjectField(TEXT("observability"), MakeShared<FJsonObject>());
-	}
-
-	TSharedRef<FJsonObject> TransportState = MakeShared<FJsonObject>();
-	if (WebSocketTransportSubsystem != nullptr)
-	{
-		TransportState->SetBoolField(TEXT("enabled"), WebSocketTransportSubsystem->IsEnabled());
-		TransportState->SetBoolField(TEXT("listening"), WebSocketTransportSubsystem->IsListening());
-		TransportState->SetStringField(TEXT("bind_address"), WebSocketTransportSubsystem->GetBindAddress());
-		TransportState->SetNumberField(TEXT("port"), static_cast<double>(WebSocketTransportSubsystem->GetListenPort()));
-		TransportState->SetNumberField(TEXT("client_count"), static_cast<double>(WebSocketTransportSubsystem->GetClientCount()));
-	}
-	else
-	{
-		TransportState->SetBoolField(TEXT("enabled"), false);
-		TransportState->SetBoolField(TEXT("listening"), false);
-		TransportState->SetStringField(TEXT("bind_address"), TEXT(""));
-		TransportState->SetNumberField(TEXT("port"), 0.0);
-		TransportState->SetNumberField(TEXT("client_count"), 0.0);
-	}
-	EditorState->SetObjectField(TEXT("event_stream_transport"), TransportState);
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetStringField(TEXT("engine_version"), EngineVersion);
-	OutResult.ResultObject->SetStringField(TEXT("plugin_version"), PluginVersion);
-	OutResult.ResultObject->SetStringField(TEXT("protocol_version"), GetProtocolVersion());
-	OutResult.ResultObject->SetBoolField(TEXT("safe_mode"), bSafeMode);
-	OutResult.ResultObject->SetObjectField(TEXT("editor_state"), EditorState);
-	OutResult.Status = EMCPResponseStatus::Ok;
-	return true;
+	return FMCPToolsCoreHandler::HandleSystemHealth(*this, RegisteredTools.Num(), Request, OutResult);
 }
 
 bool UMCPToolRegistrySubsystem::HandleEditorLiveCodingCompile(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	bool bEnsureEnabledForSession = true;
-	bool bWaitForCompletion = true;
-	bool bShowConsole = false;
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetBoolField(TEXT("ensure_enabled_for_session"), bEnsureEnabledForSession);
-		Request.Params->TryGetBoolField(TEXT("wait_for_completion"), bWaitForCompletion);
-		Request.Params->TryGetBoolField(TEXT("show_console"), bShowConsole);
-	}
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetBoolField(TEXT("supported"), MCP_WITH_LIVE_CODING != 0);
-	OutResult.ResultObject->SetBoolField(TEXT("dry_run"), Request.Context.bDryRun);
-	OutResult.ResultObject->SetBoolField(TEXT("ensure_enabled_for_session"), bEnsureEnabledForSession);
-	OutResult.ResultObject->SetBoolField(TEXT("wait_for_completion"), bWaitForCompletion);
-	OutResult.ResultObject->SetBoolField(TEXT("show_console"), bShowConsole);
-
-#if MCP_WITH_LIVE_CODING
-	ILiveCodingModule* LiveCodingModule = FModuleManager::GetModulePtr<ILiveCodingModule>(LIVE_CODING_MODULE_NAME);
-	if (LiveCodingModule == nullptr && !Request.Context.bDryRun)
-	{
-		LiveCodingModule = FModuleManager::LoadModulePtr<ILiveCodingModule>(LIVE_CODING_MODULE_NAME);
-	}
-
-	if (LiveCodingModule == nullptr)
-	{
-		OutResult.ResultObject->SetBoolField(TEXT("module_loaded"), false);
-		OutResult.ResultObject->SetStringField(TEXT("compile_result"), TEXT("unavailable"));
-
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = TEXT("MCP.EDITOR.LIVECODING.UNAVAILABLE");
-		Diagnostic.Message = TEXT("Live Coding module is not available in this editor build/session.");
-		Diagnostic.Suggestion = TEXT("Enable Live Coding in Editor Preferences and ensure the LiveCoding module is included for this target.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	const bool bStartedBefore = LiveCodingModule->HasStarted();
-	const bool bEnabledForSessionBefore = LiveCodingModule->IsEnabledForSession();
-	const bool bWasCompiling = LiveCodingModule->IsCompiling();
-
-	bool bCompileRequested = false;
-	bool bCompileCallAccepted = false;
-	ELiveCodingCompileResult CompileResult = ELiveCodingCompileResult::NotStarted;
-
-	if (!Request.Context.bDryRun)
-	{
-		if (bShowConsole)
-		{
-			LiveCodingModule->ShowConsole();
-		}
-
-		if (bEnsureEnabledForSession && !LiveCodingModule->IsEnabledForSession())
-		{
-			LiveCodingModule->EnableForSession(true);
-		}
-
-		if (bEnsureEnabledForSession && !LiveCodingModule->IsEnabledForSession())
-		{
-			OutResult.ResultObject->SetBoolField(TEXT("module_loaded"), true);
-			OutResult.ResultObject->SetBoolField(TEXT("started_before"), bStartedBefore);
-			OutResult.ResultObject->SetBoolField(TEXT("enabled_for_session_before"), bEnabledForSessionBefore);
-			OutResult.ResultObject->SetBoolField(TEXT("started_after"), LiveCodingModule->HasStarted());
-			OutResult.ResultObject->SetBoolField(TEXT("enabled_for_session_after"), LiveCodingModule->IsEnabledForSession());
-			OutResult.ResultObject->SetBoolField(TEXT("was_compiling"), bWasCompiling);
-			OutResult.ResultObject->SetBoolField(TEXT("is_compiling"), LiveCodingModule->IsCompiling());
-			OutResult.ResultObject->SetBoolField(TEXT("compile_requested"), false);
-			OutResult.ResultObject->SetBoolField(TEXT("compile_call_accepted"), false);
-			OutResult.ResultObject->SetStringField(TEXT("compile_result"), TEXT("enable_failed"));
-
-			FString EnableErrorText = LiveCodingModule->GetEnableErrorText().ToString();
-			if (EnableErrorText.IsEmpty())
-			{
-				EnableErrorText = TEXT("Live Coding could not be enabled for this session.");
-			}
-			OutResult.ResultObject->SetStringField(TEXT("enable_error"), EnableErrorText);
-
-			FMCPDiagnostic Diagnostic;
-			Diagnostic.Code = TEXT("MCP.EDITOR.LIVECODING.ENABLE_FAILED");
-			Diagnostic.Message = TEXT("Failed to enable Live Coding for current session.");
-			Diagnostic.Detail = EnableErrorText;
-			Diagnostic.Suggestion = TEXT("Restart editor without hot-reloaded modules and retry.");
-			OutResult.Diagnostics.Add(Diagnostic);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-
-		bCompileRequested = true;
-		if (bWaitForCompletion)
-		{
-			bCompileCallAccepted = LiveCodingModule->Compile(ELiveCodingCompileFlags::WaitForCompletion, &CompileResult);
-		}
-		else
-		{
-			LiveCodingModule->Compile();
-			bCompileCallAccepted = true;
-			CompileResult = ELiveCodingCompileResult::InProgress;
-		}
-	}
-	else
-	{
-		CompileResult = ELiveCodingCompileResult::InProgress;
-	}
-
-	OutResult.ResultObject->SetBoolField(TEXT("module_loaded"), true);
-	OutResult.ResultObject->SetBoolField(TEXT("started_before"), bStartedBefore);
-	OutResult.ResultObject->SetBoolField(TEXT("enabled_for_session_before"), bEnabledForSessionBefore);
-	OutResult.ResultObject->SetBoolField(TEXT("started_after"), LiveCodingModule->HasStarted());
-	OutResult.ResultObject->SetBoolField(TEXT("enabled_for_session_after"), LiveCodingModule->IsEnabledForSession());
-	OutResult.ResultObject->SetBoolField(TEXT("was_compiling"), bWasCompiling);
-	OutResult.ResultObject->SetBoolField(TEXT("is_compiling"), LiveCodingModule->IsCompiling());
-	OutResult.ResultObject->SetBoolField(TEXT("compile_requested"), bCompileRequested);
-	OutResult.ResultObject->SetBoolField(TEXT("compile_call_accepted"), bCompileCallAccepted || Request.Context.bDryRun);
-	OutResult.ResultObject->SetStringField(TEXT("compile_result"), LiveCodingCompileResultToString(CompileResult));
-
-	if (Request.Context.bDryRun)
-	{
-		OutResult.Status = EMCPResponseStatus::Ok;
-		return true;
-	}
-
-	if (!bCompileCallAccepted)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = TEXT("MCP.EDITOR.LIVECODING.COMPILE_CALL_FAILED");
-		Diagnostic.Message = TEXT("Live Coding compile call was rejected.");
-		Diagnostic.Suggestion = TEXT("Check Live Coding session state and retry.");
-		Diagnostic.bRetriable = true;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	if (CompileResult == ELiveCodingCompileResult::CompileStillActive)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = TEXT("MCP.EDITOR.LIVECODING.COMPILE_ACTIVE");
-		Diagnostic.Severity = TEXT("warning");
-		Diagnostic.Message = TEXT("A prior Live Coding compile is still active.");
-		Diagnostic.Suggestion = TEXT("Wait for previous compile to complete, then retry.");
-		Diagnostic.bRetriable = true;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Partial;
-		return true;
-	}
-
-	if (CompileResult == ELiveCodingCompileResult::Failure
-		|| CompileResult == ELiveCodingCompileResult::Cancelled
-		|| CompileResult == ELiveCodingCompileResult::NotStarted)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = TEXT("MCP.EDITOR.LIVECODING.COMPILE_FAILED");
-		Diagnostic.Message = TEXT("Live Coding compile failed.");
-		Diagnostic.Detail = LiveCodingCompileResultToString(CompileResult);
-		Diagnostic.bRetriable = CompileResult != ELiveCodingCompileResult::NotStarted;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	OutResult.Status = EMCPResponseStatus::Ok;
-	return true;
-#else
-	OutResult.ResultObject->SetBoolField(TEXT("module_loaded"), false);
-	OutResult.ResultObject->SetStringField(TEXT("compile_result"), TEXT("unsupported_platform_or_build"));
-
-	FMCPDiagnostic Diagnostic;
-	Diagnostic.Code = TEXT("MCP.EDITOR.LIVECODING.UNSUPPORTED");
-	Diagnostic.Message = TEXT("Live Coding compile is not supported on this platform/build.");
-	Diagnostic.Suggestion = TEXT("Use Build.bat or IDE build for this environment.");
-	OutResult.Diagnostics.Add(Diagnostic);
-	OutResult.Status = EMCPResponseStatus::Error;
-	return false;
-#endif
+	return FMCPToolsCoreHandler::HandleEditorLiveCodingCompile(Request, OutResult);
 }
 
 bool UMCPToolRegistrySubsystem::HandleAssetFind(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString PathGlob = TEXT("/Game/**");
-	FString NameGlob;
-	int32 Limit = 50;
-	const int32 Cursor = ParseCursor(Request.Params);
-	TSet<FString> AllowedClassPaths;
-
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("path_glob"), PathGlob);
-		Request.Params->TryGetStringField(TEXT("name_glob"), NameGlob);
-		double LimitNumber = static_cast<double>(Limit);
-		Request.Params->TryGetNumberField(TEXT("limit"), LimitNumber);
-		Limit = FMath::Clamp(static_cast<int32>(LimitNumber), 1, 500);
-
-		const TArray<TSharedPtr<FJsonValue>>* ClassPathValues = nullptr;
-		if (Request.Params->TryGetArrayField(TEXT("class_path_in"), ClassPathValues) && ClassPathValues != nullptr)
-		{
-			for (const TSharedPtr<FJsonValue>& ClassPathValue : *ClassPathValues)
-			{
-				FString ClassPath;
-				if (ClassPathValue.IsValid() && ClassPathValue->TryGetString(ClassPath) && !ClassPath.IsEmpty())
-				{
-					AllowedClassPaths.Add(ClassPath);
-				}
-			}
-		}
-	}
-
-	FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
-	IAssetRegistry& AssetRegistry = AssetRegistryModule.Get();
-
-	TArray<FAssetData> AssetDataList;
-	AssetRegistry.GetAllAssets(AssetDataList, true);
-
-	TArray<TSharedPtr<FJsonObject>> FilteredAssets;
-	for (const FAssetData& AssetData : AssetDataList)
-	{
-		const FString ObjectPath = AssetData.GetObjectPathString();
-		const FString PackagePath = AssetData.PackagePath.ToString();
-		const FString ClassPath = AssetData.AssetClassPath.ToString();
-		const FString AssetName = AssetData.AssetName.ToString();
-
-		if (!PathGlob.IsEmpty() && !ObjectPath.MatchesWildcard(PathGlob) && !PackagePath.MatchesWildcard(PathGlob))
-		{
-			continue;
-		}
-
-		if (!NameGlob.IsEmpty() && !AssetName.MatchesWildcard(NameGlob))
-		{
-			continue;
-		}
-
-		if (!MatchesAnyClassPath(AllowedClassPaths, ClassPath))
-		{
-			continue;
-		}
-
-		TSharedRef<FJsonObject> AssetObject = MakeShared<FJsonObject>();
-		AssetObject->SetStringField(TEXT("object_path"), ObjectPath);
-		AssetObject->SetStringField(TEXT("class_path"), ClassPath);
-		AssetObject->SetStringField(TEXT("package_path"), PackagePath);
-		AssetObject->SetStringField(TEXT("name"), AssetName);
-		FilteredAssets.Add(AssetObject);
-	}
-
-	FilteredAssets.Sort([](const TSharedPtr<FJsonObject>& Left, const TSharedPtr<FJsonObject>& Right)
-	{
-		FString LeftPath;
-		FString RightPath;
-		Left->TryGetStringField(TEXT("object_path"), LeftPath);
-		Right->TryGetStringField(TEXT("object_path"), RightPath);
-		return LeftPath < RightPath;
-	});
-
-	const int32 SafeCursor = FMath::Max(0, Cursor);
-	const int32 EndIndex = FMath::Min(SafeCursor + Limit, FilteredAssets.Num());
-
-	TArray<TSharedPtr<FJsonValue>> ResultAssets;
-	for (int32 Index = SafeCursor; Index < EndIndex; ++Index)
-	{
-		ResultAssets.Add(MakeShared<FJsonValueObject>(FilteredAssets[Index].ToSharedRef()));
-	}
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetArrayField(TEXT("assets"), ResultAssets);
-	if (EndIndex < FilteredAssets.Num())
-	{
-		OutResult.ResultObject->SetStringField(TEXT("next_cursor"), FString::FromInt(EndIndex));
-	}
-	OutResult.Status = EMCPResponseStatus::Ok;
-	return true;
+	return FMCPToolsAssetQueryHandler::HandleFind(Request, OutResult);
 }
 
 bool UMCPToolRegistrySubsystem::HandleAssetLoad(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString ObjectPath;
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
-	}
-
-	if (ObjectPath.IsEmpty())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("object_path is required for asset.load.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UObject* LoadedObject = FindObject<UObject>(nullptr, *ObjectPath);
-	if (LoadedObject == nullptr)
-	{
-		LoadedObject = LoadObject<UObject>(nullptr, *ObjectPath, nullptr, LOAD_NoWarn | LOAD_Quiet);
-	}
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetBoolField(TEXT("loaded"), LoadedObject != nullptr);
-	OutResult.ResultObject->SetStringField(TEXT("object_path"), ObjectPath);
-
-	if (LoadedObject == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::OBJECT_NOT_FOUND;
-		Diagnostic.Message = TEXT("Asset could not be loaded.");
-		Diagnostic.Detail = ObjectPath;
-		Diagnostic.Suggestion = TEXT("Verify object_path and ensure the asset exists.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	OutResult.Status = EMCPResponseStatus::Ok;
-	return true;
+	return FMCPToolsAssetQueryHandler::HandleLoad(Request, OutResult);
 }
 
 bool UMCPToolRegistrySubsystem::HandleAssetSave(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	bool bOnlyDirty = true;
-	const TArray<TSharedPtr<FJsonValue>>* PackageValues = nullptr;
-
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetBoolField(TEXT("only_dirty"), bOnlyDirty);
-		Request.Params->TryGetArrayField(TEXT("packages"), PackageValues);
-	}
-
-	if (PackageValues == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("packages array is required for asset.save.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	TArray<FString> SavedPackages;
-	TArray<FString> FailedPackages;
-	TArray<UPackage*> ExplicitPackages;
-	TArray<FString> ExplicitPackageNames;
-	ExplicitPackages.Reserve(PackageValues->Num());
-	ExplicitPackageNames.Reserve(PackageValues->Num());
-
-	for (const TSharedPtr<FJsonValue>& PackageValue : *PackageValues)
-	{
-		FString PackageInput;
-		if (!PackageValue.IsValid() || !PackageValue->TryGetString(PackageInput) || PackageInput.IsEmpty())
-		{
-			continue;
-		}
-
-		UPackage* Package = ResolvePackageByName(PackageInput);
-		const FString PackageName = NormalizePackageNameFromInput(PackageInput);
-		if (Package == nullptr)
-		{
-			FailedPackages.Add(PackageName.IsEmpty() ? PackageInput : PackageName);
-			FMCPDiagnostic Diagnostic;
-			Diagnostic.Code = MCPErrorCodes::OBJECT_NOT_FOUND;
-			Diagnostic.Severity = TEXT("warning");
-			Diagnostic.Message = TEXT("Package not found while saving assets.");
-			Diagnostic.Detail = PackageInput;
-			Diagnostic.bRetriable = false;
-			OutResult.Diagnostics.Add(Diagnostic);
-			continue;
-		}
-
-		ExplicitPackages.Add(Package);
-		ExplicitPackageNames.Add(Package->GetName());
-	}
-
-	for (int32 Index = 0; Index < ExplicitPackages.Num(); ++Index)
-	{
-		UPackage* Package = ExplicitPackages[Index];
-		const FString PackageName = ExplicitPackageNames.IsValidIndex(Index) ? ExplicitPackageNames[Index] : Package->GetName();
-		bool bSaved = true;
-		if (!Request.Context.bDryRun)
-		{
-			const TArray<UPackage*> SinglePackageArray{ Package };
-			bSaved = UEditorLoadingAndSavingUtils::SavePackages(SinglePackageArray, bOnlyDirty);
-		}
-		if (bSaved)
-		{
-			SavedPackages.Add(PackageName);
-		}
-		else
-		{
-			FailedPackages.Add(PackageName);
-			FMCPDiagnostic Diagnostic;
-			Diagnostic.Code = MCPErrorCodes::SAVE_FAILED;
-			Diagnostic.Severity = TEXT("warning");
-			Diagnostic.Message = TEXT("Package save failed.");
-			Diagnostic.Detail = PackageName;
-			Diagnostic.bRetriable = true;
-			OutResult.Diagnostics.Add(Diagnostic);
-		}
-	}
-
-	OutResult.TouchedPackages.Append(SavedPackages);
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetArrayField(TEXT("saved"), ToJsonStringArray(SavedPackages));
-	OutResult.ResultObject->SetArrayField(TEXT("failed"), ToJsonStringArray(FailedPackages));
-
-	if (FailedPackages.Num() == 0)
-	{
-		OutResult.Status = EMCPResponseStatus::Ok;
-		return true;
-	}
-
-	if (SavedPackages.Num() > 0)
-	{
-		OutResult.Status = EMCPResponseStatus::Partial;
-		return true;
-	}
-
-	OutResult.Status = EMCPResponseStatus::Error;
-	return false;
+	return FMCPToolsAssetQueryHandler::HandleSave(
+		Request,
+		OutResult,
+		[](const FString& InputPath) { return ResolvePackageByName(InputPath); },
+		[](const FString& InputPath) { return NormalizePackageNameFromInput(InputPath); });
 }
 
 bool UMCPToolRegistrySubsystem::HandleAssetImport(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	TArray<FString> SourceFiles;
-	FString DestPackagePath;
-	FString DestAssetName;
-	FString ImportAs = TEXT("auto");
-	bool bReplaceExisting = false;
-	bool bAutomated = true;
-	bool bAutoSave = false;
-
-	if (Request.Params.IsValid())
-	{
-		ParseStringArrayField(Request.Params, TEXT("source_files"), SourceFiles);
-		Request.Params->TryGetStringField(TEXT("dest_package_path"), DestPackagePath);
-		Request.Params->TryGetStringField(TEXT("dest_asset_name"), DestAssetName);
-		Request.Params->TryGetStringField(TEXT("import_as"), ImportAs);
-		Request.Params->TryGetBoolField(TEXT("replace_existing"), bReplaceExisting);
-		Request.Params->TryGetBoolField(TEXT("automated"), bAutomated);
-		ParseAutoSaveOption(Request.Params, bAutoSave);
-	}
-
-	if (SourceFiles.Num() == 0 || DestPackagePath.IsEmpty())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("source_files and dest_package_path are required for asset.import.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	if (!FPackageName::IsValidLongPackageName(DestPackagePath))
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::ASSET_PATH_INVALID;
-		Diagnostic.Message = TEXT("Invalid dest_package_path for asset.import.");
-		Diagnostic.Detail = DestPackagePath;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	ImportAs = ImportAs.ToLower();
-	const bool bImportAsAuto = ImportAs.Equals(TEXT("auto"));
-	const bool bImportAsTexture = ImportAs.Equals(TEXT("texture"));
-	const bool bImportAsStaticMesh = ImportAs.Equals(TEXT("static_mesh"));
-	const bool bImportAsSkeletalMesh = ImportAs.Equals(TEXT("skeletal_mesh"));
-	if (!bImportAsAuto && !bImportAsTexture && !bImportAsStaticMesh && !bImportAsSkeletalMesh)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("import_as must be one of: auto, texture, static_mesh, skeletal_mesh.");
-		Diagnostic.Detail = ImportAs;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	DestAssetName = ObjectTools::SanitizeObjectName(DestAssetName);
-	if (!DestAssetName.IsEmpty() && SourceFiles.Num() != 1)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("dest_asset_name can only be used when source_files has exactly one entry.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	const TSet<FString> ImageExtensions = { TEXT(".png"), TEXT(".jpg"), TEXT(".jpeg"), TEXT(".tga"), TEXT(".exr") };
-	const TSet<FString> MeshExtensions = { TEXT(".fbx") };
-
-	auto NormalizeSourceFilePath = [](const FString& InPath) -> FString
-	{
-		FString CandidatePath = InPath;
-		CandidatePath.TrimStartAndEndInline();
-		if (CandidatePath.IsEmpty())
+	return FMCPToolsAssetLifecycleHandler::HandleImport(
+		Request,
+		OutResult,
+		[](const FString& PackagePath, const FString& AssetName)
 		{
-			return CandidatePath;
-		}
-
-		FPaths::NormalizeFilename(CandidatePath);
-
-#if PLATFORM_WINDOWS
-		if (CandidatePath.StartsWith(TEXT("/mnt/"), ESearchCase::IgnoreCase) &&
-			CandidatePath.Len() > 7 &&
-			FChar::IsAlpha(CandidatePath[5]) &&
-			CandidatePath[6] == TCHAR('/'))
+			return IsValidAssetDestination(PackagePath, AssetName);
+		},
+		[](const FString& PackagePath, const FString& AssetName)
 		{
-			const TCHAR DriveLetter = FChar::ToUpper(CandidatePath[5]);
-			const FString Remainder = CandidatePath.Mid(6);
-			CandidatePath = FString::Printf(TEXT("%c:%s"), DriveLetter, *Remainder);
-		}
-		CandidatePath.ReplaceInline(TEXT("/"), TEXT("\\"));
-#endif
-
-		const FString AbsolutePath = FPaths::ConvertRelativePathToFull(CandidatePath);
-		if (IFileManager::Get().FileExists(*AbsolutePath))
+			return BuildPackageName(PackagePath, AssetName);
+		},
+		[](const FString& PackagePath, const FString& AssetName)
 		{
-			return AbsolutePath;
-		}
-
-		return CandidatePath;
-	};
-
-	auto InferClassPath = [&](const FString& Extension) -> FString
-	{
-		if (bImportAsTexture || (bImportAsAuto && ImageExtensions.Contains(Extension)))
+			return BuildObjectPath(PackagePath, AssetName);
+		},
+		[](const FString& InputPath)
 		{
-			return TEXT("/Script/Engine.Texture2D");
-		}
-		if (bImportAsStaticMesh)
+			return NormalizePackageNameFromInput(InputPath);
+		},
+		[](const FString& ObjectPath)
 		{
-			return TEXT("/Script/Engine.StaticMesh");
-		}
-		if (bImportAsSkeletalMesh)
+			return ResolveObjectByPath(ObjectPath);
+		},
+		[](const FString& PackageName, FMCPToolExecutionResult& InOutResult)
 		{
-			return TEXT("/Script/Engine.SkeletalMesh");
-		}
-		return FString();
-	};
-
-	struct FImportCandidate
-	{
-		FString RequestedPath;
-		FString ResolvedPath;
-		FString Extension;
-		FString AssetName;
-	};
-
-	TArray<FImportCandidate> Candidates;
-	TArray<FString> FailedFiles;
-
-	for (const FString& RequestedPathRaw : SourceFiles)
-	{
-		FString RequestedPath = RequestedPathRaw;
-		RequestedPath.TrimStartAndEndInline();
-		if (RequestedPath.IsEmpty())
-		{
-			continue;
-		}
-
-		const FString ResolvedPath = NormalizeSourceFilePath(RequestedPath);
-		if (!IFileManager::Get().FileExists(*ResolvedPath))
-		{
-			FailedFiles.AddUnique(RequestedPath);
-			FMCPDiagnostic Diagnostic;
-			Diagnostic.Code = MCPErrorCodes::ASSET_NOT_FOUND;
-			Diagnostic.Severity = TEXT("warning");
-			Diagnostic.Message = TEXT("source file was not found.");
-			Diagnostic.Detail = RequestedPath;
-			Diagnostic.Suggestion = TEXT("Provide an existing file path reachable by the Unreal Editor host.");
-			OutResult.Diagnostics.Add(Diagnostic);
-			continue;
-		}
-
-		const FString Extension = FPaths::GetExtension(ResolvedPath, true).ToLower();
-		const bool bIsImageFile = ImageExtensions.Contains(Extension);
-		const bool bIsMeshFile = MeshExtensions.Contains(Extension);
-		if (!bIsImageFile && !bIsMeshFile)
-		{
-			FailedFiles.AddUnique(RequestedPath);
-			FMCPDiagnostic Diagnostic;
-			Diagnostic.Code = MCPErrorCodes::ASSET_IMPORT_UNSUPPORTED;
-			Diagnostic.Severity = TEXT("warning");
-			Diagnostic.Message = TEXT("Unsupported source file extension for asset.import.");
-			Diagnostic.Detail = FString::Printf(TEXT("file=%s extension=%s"), *RequestedPath, *Extension);
-			Diagnostic.Suggestion = TEXT("Use png/jpg/jpeg/tga/exr for textures or fbx for static/skeletal meshes.");
-			OutResult.Diagnostics.Add(Diagnostic);
-			continue;
-		}
-
-		if ((bImportAsTexture && !bIsImageFile) || ((bImportAsStaticMesh || bImportAsSkeletalMesh) && !bIsMeshFile))
-		{
-			FailedFiles.AddUnique(RequestedPath);
-			FMCPDiagnostic Diagnostic;
-			Diagnostic.Code = MCPErrorCodes::ASSET_IMPORT_UNSUPPORTED;
-			Diagnostic.Severity = TEXT("warning");
-			Diagnostic.Message = TEXT("source file extension is incompatible with import_as.");
-			Diagnostic.Detail = FString::Printf(TEXT("file=%s extension=%s import_as=%s"), *RequestedPath, *Extension, *ImportAs);
-			Diagnostic.Suggestion = TEXT("Use import_as=auto or provide a matching source file type.");
-			OutResult.Diagnostics.Add(Diagnostic);
-			continue;
-		}
-
-		FString CandidateAssetName = SourceFiles.Num() == 1 && !DestAssetName.IsEmpty()
-			? DestAssetName
-			: ObjectTools::SanitizeObjectName(FPaths::GetBaseFilename(ResolvedPath));
-
-		if (!IsValidAssetDestination(DestPackagePath, CandidateAssetName))
-		{
-			FailedFiles.AddUnique(RequestedPath);
-			FMCPDiagnostic Diagnostic;
-			Diagnostic.Code = MCPErrorCodes::ASSET_PATH_INVALID;
-			Diagnostic.Severity = TEXT("warning");
-			Diagnostic.Message = TEXT("Could not build valid destination object path for imported file.");
-			Diagnostic.Detail = FString::Printf(TEXT("dest_package_path=%s asset_name=%s"), *DestPackagePath, *CandidateAssetName);
-			OutResult.Diagnostics.Add(Diagnostic);
-			continue;
-		}
-
-		Candidates.Add({ RequestedPath, ResolvedPath, Extension, CandidateAssetName });
-	}
-
-	TArray<TSharedPtr<FJsonValue>> ImportedEntries;
-	ImportedEntries.Reserve(Candidates.Num());
-
-	if (Request.Context.bDryRun)
-	{
-		for (const FImportCandidate& Candidate : Candidates)
-		{
-			const FString ObjectPath = BuildObjectPath(DestPackagePath, Candidate.AssetName);
-			const FString PackageName = BuildPackageName(DestPackagePath, Candidate.AssetName);
-			const FString ClassPath = InferClassPath(Candidate.Extension);
-
-			if (!PackageName.IsEmpty())
-			{
-				OutResult.TouchedPackages.AddUnique(PackageName);
-			}
-
-			TSharedRef<FJsonObject> ImportedEntry = MakeShared<FJsonObject>();
-			ImportedEntry->SetStringField(TEXT("source_file"), Candidate.RequestedPath);
-			ImportedEntry->SetStringField(TEXT("resolved_source_file"), Candidate.ResolvedPath);
-			ImportedEntry->SetStringField(TEXT("object_path"), ObjectPath);
-			ImportedEntry->SetStringField(TEXT("package"), PackageName);
-			if (!ClassPath.IsEmpty())
-			{
-				ImportedEntry->SetStringField(TEXT("class_path"), ClassPath);
-			}
-			ImportedEntries.Add(MakeShared<FJsonValueObject>(ImportedEntry));
-		}
-	}
-	else
-	{
-		TArray<UAssetImportTask*> ImportTasks;
-		ImportTasks.Reserve(Candidates.Num());
-		TMap<UAssetImportTask*, FString> RequestedPathByTask;
-		RequestedPathByTask.Reserve(Candidates.Num());
-		TMap<UAssetImportTask*, FString> ExtensionByTask;
-		ExtensionByTask.Reserve(Candidates.Num());
-
-		for (const FImportCandidate& Candidate : Candidates)
-		{
-			UAssetImportTask* ImportTask = NewObject<UAssetImportTask>(GetTransientPackage());
-			if (ImportTask == nullptr)
-			{
-				FailedFiles.AddUnique(Candidate.RequestedPath);
-				continue;
-			}
-
-			ImportTask->Filename = Candidate.ResolvedPath;
-			ImportTask->DestinationPath = DestPackagePath;
-			ImportTask->DestinationName = Candidate.AssetName;
-			ImportTask->bAutomated = bAutomated;
-			ImportTask->bReplaceExisting = bReplaceExisting;
-			ImportTask->bReplaceExistingSettings = bReplaceExisting;
-			ImportTask->bSave = false;
-			ImportTask->bAsync = false;
-
-			if (Candidate.Extension.Equals(TEXT(".fbx")))
-			{
-				if (bImportAsStaticMesh || bImportAsSkeletalMesh)
-				{
-					UFbxImportUI* FbxImportUI = NewObject<UFbxImportUI>(ImportTask);
-					if (FbxImportUI != nullptr)
-					{
-						FbxImportUI->bAutomatedImportShouldDetectType = false;
-						FbxImportUI->bImportMesh = true;
-						FbxImportUI->bImportAnimations = false;
-						FbxImportUI->bImportMaterials = false;
-						FbxImportUI->bImportTextures = false;
-						FbxImportUI->bImportAsSkeletal = bImportAsSkeletalMesh;
-						FbxImportUI->MeshTypeToImport = bImportAsSkeletalMesh ? FBXIT_SkeletalMesh : FBXIT_StaticMesh;
-						ImportTask->Options = FbxImportUI;
-					}
-				}
-				else if (bImportAsAuto)
-				{
-					UFbxImportUI* FbxImportUI = NewObject<UFbxImportUI>(ImportTask);
-					if (FbxImportUI != nullptr)
-					{
-						FbxImportUI->bAutomatedImportShouldDetectType = true;
-						FbxImportUI->bImportMaterials = false;
-						FbxImportUI->bImportTextures = false;
-						ImportTask->Options = FbxImportUI;
-					}
-				}
-			}
-
-			ImportTasks.Add(ImportTask);
-			RequestedPathByTask.Add(ImportTask, Candidate.RequestedPath);
-			ExtensionByTask.Add(ImportTask, Candidate.Extension);
-		}
-
-		if (ImportTasks.Num() > 0)
-		{
-			FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools"));
-			AssetToolsModule.Get().ImportAssetTasks(ImportTasks);
-		}
-
-		for (UAssetImportTask* ImportTask : ImportTasks)
-		{
-			if (ImportTask == nullptr)
-			{
-				continue;
-			}
-
-			const FString RequestedPath = RequestedPathByTask.FindRef(ImportTask);
-			const FString ResolvedPath = ImportTask->Filename;
-			const FString ImportedExtension = ExtensionByTask.FindRef(ImportTask);
-			const FString FallbackClassPath = InferClassPath(ImportedExtension);
-			if (ImportTask->ImportedObjectPaths.Num() == 0)
-			{
-				FailedFiles.AddUnique(RequestedPath.IsEmpty() ? ResolvedPath : RequestedPath);
-				FMCPDiagnostic Diagnostic;
-				Diagnostic.Code = MCPErrorCodes::ASSET_IMPORT_FAILED;
-				Diagnostic.Severity = TEXT("warning");
-				Diagnostic.Message = TEXT("Asset import finished without imported objects.");
-				Diagnostic.Detail = RequestedPath.IsEmpty() ? ResolvedPath : RequestedPath;
-				Diagnostic.Suggestion = TEXT("Check source data validity and import settings.");
-				Diagnostic.bRetriable = true;
-				OutResult.Diagnostics.Add(Diagnostic);
-				continue;
-			}
-
-			for (const FString& ImportedObjectPath : ImportTask->ImportedObjectPaths)
-			{
-				const FString PackageName = NormalizePackageNameFromInput(ImportedObjectPath);
-				if (!PackageName.IsEmpty())
-				{
-					OutResult.TouchedPackages.AddUnique(PackageName);
-				}
-
-				UObject* ImportedObject = ResolveObjectByPath(ImportedObjectPath);
-				FString ClassPath = ImportedObject != nullptr && ImportedObject->GetClass() != nullptr
-					? ImportedObject->GetClass()->GetClassPathName().ToString()
-					: FallbackClassPath;
-
-				TSharedRef<FJsonObject> ImportedEntry = MakeShared<FJsonObject>();
-				ImportedEntry->SetStringField(TEXT("source_file"), RequestedPath.IsEmpty() ? ResolvedPath : RequestedPath);
-				ImportedEntry->SetStringField(TEXT("resolved_source_file"), ResolvedPath);
-				ImportedEntry->SetStringField(TEXT("object_path"), ImportedObjectPath);
-				ImportedEntry->SetStringField(TEXT("package"), PackageName);
-				if (!ClassPath.IsEmpty())
-				{
-					ImportedEntry->SetStringField(TEXT("class_path"), ClassPath);
-				}
-				ImportedEntries.Add(MakeShared<FJsonValueObject>(ImportedEntry));
-			}
-		}
-	}
-
-	bool bAllSaved = true;
-	if (!Request.Context.bDryRun && bAutoSave)
-	{
-		for (const FString& PackageName : OutResult.TouchedPackages)
-		{
-			bAllSaved &= SavePackageByName(PackageName, OutResult);
-		}
-	}
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetStringField(TEXT("destination_path"), DestPackagePath);
-	OutResult.ResultObject->SetStringField(TEXT("import_as"), ImportAs);
-	OutResult.ResultObject->SetArrayField(TEXT("imported"), ImportedEntries);
-	OutResult.ResultObject->SetArrayField(TEXT("failed"), ToJsonStringArray(FailedFiles));
-	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(OutResult.TouchedPackages));
-	OutResult.ResultObject->SetNumberField(TEXT("imported_count"), ImportedEntries.Num());
-	OutResult.ResultObject->SetNumberField(TEXT("failed_count"), FailedFiles.Num());
-
-	if (ImportedEntries.Num() == 0)
-	{
-		if (OutResult.Diagnostics.Num() == 0)
-		{
-			FMCPDiagnostic Diagnostic;
-			Diagnostic.Code = MCPErrorCodes::ASSET_IMPORT_FAILED;
-			Diagnostic.Message = TEXT("No files were imported.");
-			Diagnostic.Suggestion = TEXT("Verify source_files, import_as and destination settings.");
-			OutResult.Diagnostics.Add(Diagnostic);
-		}
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	if (FailedFiles.Num() > 0 || !bAllSaved)
-	{
-		OutResult.Status = EMCPResponseStatus::Partial;
-		return true;
-	}
-
-	OutResult.Status = EMCPResponseStatus::Ok;
-	return true;
+			return SavePackageByName(PackageName, InOutResult);
+		});
 }
 
 bool UMCPToolRegistrySubsystem::HandleAssetCreate(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString PackagePath;
-	FString AssetName;
-	FString AssetClassPath;
-	FString FactoryClassPath;
-	bool bOverwrite = false;
-	bool bAutoSave = false;
-
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("package_path"), PackagePath);
-		Request.Params->TryGetStringField(TEXT("asset_name"), AssetName);
-		Request.Params->TryGetStringField(TEXT("asset_class_path"), AssetClassPath);
-		Request.Params->TryGetStringField(TEXT("factory_class_path"), FactoryClassPath);
-		Request.Params->TryGetBoolField(TEXT("overwrite"), bOverwrite);
-		ParseAutoSaveOption(Request.Params, bAutoSave);
-	}
-
-	if (PackagePath.IsEmpty() || AssetName.IsEmpty() || AssetClassPath.IsEmpty())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("package_path, asset_name and asset_class_path are required for asset.create.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	if (!IsValidAssetDestination(PackagePath, AssetName))
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::ASSET_PATH_INVALID;
-		Diagnostic.Message = TEXT("Invalid package_path or asset_name for asset.create.");
-		Diagnostic.Detail = FString::Printf(TEXT("package_path=%s asset_name=%s"), *PackagePath, *AssetName);
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	const FString PackageName = BuildPackageName(PackagePath, AssetName);
-	const FString ObjectPath = BuildObjectPath(PackagePath, AssetName);
-	UObject* ExistingObject = ResolveObjectByPath(ObjectPath);
-	if (ExistingObject != nullptr && !bOverwrite)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::ASSET_ALREADY_EXISTS;
-		Diagnostic.Message = TEXT("Asset already exists.");
-		Diagnostic.Detail = ObjectPath;
-		Diagnostic.Suggestion = TEXT("Set overwrite=true or use a different destination.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	if (ExistingObject != nullptr && bOverwrite && !Request.Context.bDryRun)
-	{
-		if (!ObjectTools::DeleteSingleObject(ExistingObject, false))
+	return FMCPToolsAssetLifecycleHandler::HandleCreate(
+		Request,
+		OutResult,
+		[](const FString& PackagePath, const FString& AssetName)
 		{
-			FMCPDiagnostic Diagnostic;
-			Diagnostic.Code = MCPErrorCodes::ASSET_DELETE_FAILED;
-			Diagnostic.Message = TEXT("Failed to delete existing asset for overwrite.");
-			Diagnostic.Detail = ObjectPath;
-			OutResult.Diagnostics.Add(Diagnostic);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-	}
-
-	UObject* CreatedAsset = nullptr;
-	bool bCreatedSuccessfully = false;
-	UClass* ResolvedAssetClass = ResolveClassByPath(AssetClassPath);
-
-	if (ResolvedAssetClass == nullptr || !ResolvedAssetClass->IsChildOf(UObject::StaticClass()) || ResolvedAssetClass->HasAnyClassFlags(CLASS_Abstract))
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::ASSET_CREATE_FAILED;
-		Diagnostic.Message = TEXT("asset_class_path could not be resolved to a creatable UObject class.");
-		Diagnostic.Detail = AssetClassPath;
-		Diagnostic.Suggestion = TEXT("Provide a valid non-abstract class path.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	if (!Request.Context.bDryRun)
-	{
-		UFactory* Factory = nullptr;
-		if (!FactoryClassPath.IsEmpty())
+			return IsValidAssetDestination(PackagePath, AssetName);
+		},
+		[](const FString& PackagePath, const FString& AssetName)
 		{
-			UClass* FactoryClass = ResolveClassByPath(FactoryClassPath);
-
-			if (FactoryClass == nullptr || !FactoryClass->IsChildOf(UFactory::StaticClass()))
-			{
-				FMCPDiagnostic Diagnostic;
-				Diagnostic.Code = MCPErrorCodes::ASSET_CREATE_FAILED;
-				Diagnostic.Message = TEXT("factory_class_path is invalid.");
-				Diagnostic.Detail = FactoryClassPath;
-				OutResult.Diagnostics.Add(Diagnostic);
-				OutResult.Status = EMCPResponseStatus::Error;
-				return false;
-			}
-
-			Factory = NewObject<UFactory>(GetTransientPackage(), FactoryClass);
-		}
-
-		if (Factory != nullptr)
+			return BuildPackageName(PackagePath, AssetName);
+		},
+		[](const FString& PackagePath, const FString& AssetName)
 		{
-			FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools"));
-			CreatedAsset = AssetToolsModule.Get().CreateAsset(AssetName, PackagePath, ResolvedAssetClass, Factory, FName(TEXT("UnrealMCP")));
-			bCreatedSuccessfully = CreatedAsset != nullptr;
-		}
-		else
+			return BuildObjectPath(PackagePath, AssetName);
+		},
+		[](const FString& ObjectPath)
 		{
-			UPackage* Package = CreatePackage(*PackageName);
-			if (Package != nullptr)
-			{
-				CreatedAsset = NewObject<UObject>(Package, ResolvedAssetClass, *AssetName, RF_Public | RF_Standalone | RF_Transactional);
-				if (CreatedAsset != nullptr)
-				{
-					FAssetRegistryModule::AssetCreated(CreatedAsset);
-					CreatedAsset->MarkPackageDirty();
-					Package->MarkPackageDirty();
-					CreatedAsset->PostEditChange();
-					bCreatedSuccessfully = true;
-				}
-			}
-		}
-	}
-	else
-	{
-		bCreatedSuccessfully = true;
-	}
-
-	if (!bCreatedSuccessfully && CreatedAsset == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::ASSET_CREATE_FAILED;
-		Diagnostic.Message = TEXT("Failed to create asset.");
-		Diagnostic.Detail = ObjectPath;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	OutResult.TouchedPackages.AddUnique(PackageName);
-
-	bool bAllSaved = true;
-	if (!Request.Context.bDryRun && bAutoSave)
-	{
-		bAllSaved = SavePackageByName(PackageName, OutResult);
-	}
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetBoolField(TEXT("created"), true);
-	OutResult.ResultObject->SetStringField(TEXT("object_path"), ObjectPath);
-	OutResult.ResultObject->SetStringField(TEXT("class_path"), ResolvedAssetClass->GetClassPathName().ToString());
-	OutResult.ResultObject->SetStringField(TEXT("package"), PackageName);
-	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(OutResult.TouchedPackages));
-	OutResult.Status = bAllSaved ? EMCPResponseStatus::Ok : EMCPResponseStatus::Partial;
-	return true;
+			return ResolveObjectByPath(ObjectPath);
+		},
+		[](const FString& ClassPath)
+		{
+			return ResolveClassByPath(ClassPath);
+		},
+		[](const FString& PackageName, FMCPToolExecutionResult& InOutResult)
+		{
+			return SavePackageByName(PackageName, InOutResult);
+		});
 }
 
 bool UMCPToolRegistrySubsystem::HandleBlueprintClassCreate(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
@@ -5726,1997 +1457,394 @@ bool UMCPToolRegistrySubsystem::HandleUMGBlueprintCreate(const FMCPRequestEnvelo
 
 bool UMCPToolRegistrySubsystem::HandleUMGBlueprintPatch(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString ObjectPath;
-	bool bCompileOnSuccess = true;
-	bool bAutoSave = false;
-
-	const TSharedPtr<FJsonObject>* DesignTimeSizeObject = nullptr;
-	const TSharedPtr<FJsonValue>* DesignSizeModeValue = nullptr;
-	bool bHasDesignTimeSize = false;
-	bool bHasDesignSizeMode = false;
-
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
-		Request.Params->TryGetBoolField(TEXT("compile_on_success"), bCompileOnSuccess);
-		ParseAutoSaveOption(Request.Params, bAutoSave);
-
-		bHasDesignTimeSize = Request.Params->HasField(TEXT("design_time_size"));
-		if (bHasDesignTimeSize && !Request.Params->TryGetObjectField(TEXT("design_time_size"), DesignTimeSizeObject))
+	return FMCPToolsUMGStructureHandler::HandleBlueprintPatch(
+		Request,
+		OutResult,
+		[](const FString& ObjectPath) { return LoadWidgetBlueprintByPath(ObjectPath); },
+		[](const FString& PackageName, FMCPToolExecutionResult& InOutResult)
 		{
-			FMCPDiagnostic Diagnostic;
-			Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-			Diagnostic.Message = TEXT("design_time_size must be an object with x/y.");
-			OutResult.Diagnostics.Add(Diagnostic);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-
-		bHasDesignSizeMode = Request.Params->HasField(TEXT("design_size_mode"));
-		if (bHasDesignSizeMode)
-		{
-			DesignSizeModeValue = Request.Params->Values.Find(TEXT("design_size_mode"));
-			if (DesignSizeModeValue == nullptr || !DesignSizeModeValue->IsValid())
-			{
-				FMCPDiagnostic Diagnostic;
-				Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-				Diagnostic.Message = TEXT("design_size_mode must be string/number/null.");
-				OutResult.Diagnostics.Add(Diagnostic);
-				OutResult.Status = EMCPResponseStatus::Error;
-				return false;
-			}
-		}
-	}
-
-	if (ObjectPath.IsEmpty())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("object_path is required for umg.blueprint.patch.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	if (!bHasDesignTimeSize && !bHasDesignSizeMode)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("At least one of design_time_size or design_size_mode is required.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UWidgetBlueprint* WidgetBlueprint = LoadWidgetBlueprintByPath(ObjectPath);
-	if (WidgetBlueprint == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::OBJECT_NOT_FOUND;
-		Diagnostic.Message = TEXT("Widget blueprint not found.");
-		Diagnostic.Detail = ObjectPath;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	TArray<TSharedPtr<FJsonValue>> PatchOperations;
-
-	if (bHasDesignTimeSize)
-	{
-		double X = 0.0;
-		double Y = 0.0;
-		const bool bHasX = DesignTimeSizeObject != nullptr && DesignTimeSizeObject->IsValid()
-			&& ((*DesignTimeSizeObject)->TryGetNumberField(TEXT("x"), X) || (*DesignTimeSizeObject)->TryGetNumberField(TEXT("X"), X));
-		const bool bHasY = DesignTimeSizeObject != nullptr && DesignTimeSizeObject->IsValid()
-			&& ((*DesignTimeSizeObject)->TryGetNumberField(TEXT("y"), Y) || (*DesignTimeSizeObject)->TryGetNumberField(TEXT("Y"), Y));
-		if (!bHasX || !bHasY)
-		{
-			FMCPDiagnostic Diagnostic;
-			Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-			Diagnostic.Message = TEXT("design_time_size requires both x and y numeric fields.");
-			OutResult.Diagnostics.Add(Diagnostic);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-
-		TSharedRef<FJsonObject> ValueObject = MakeShared<FJsonObject>();
-		ValueObject->SetNumberField(TEXT("X"), X);
-		ValueObject->SetNumberField(TEXT("Y"), Y);
-
-		TSharedRef<FJsonObject> PatchObject = MakeShared<FJsonObject>();
-		PatchObject->SetStringField(TEXT("op"), TEXT("replace"));
-		PatchObject->SetStringField(TEXT("path"), TEXT("/DesignTimeSize"));
-		PatchObject->SetObjectField(TEXT("value"), ValueObject);
-		PatchOperations.Add(MakeShared<FJsonValueObject>(PatchObject));
-	}
-
-	if (bHasDesignSizeMode)
-	{
-		TSharedRef<FJsonObject> PatchObject = MakeShared<FJsonObject>();
-		if ((*DesignSizeModeValue)->Type == EJson::Null)
-		{
-			PatchObject->SetStringField(TEXT("op"), TEXT("remove"));
-		}
-		else
-		{
-			PatchObject->SetStringField(TEXT("op"), TEXT("replace"));
-			PatchObject->SetField(TEXT("value"), *DesignSizeModeValue);
-		}
-		PatchObject->SetStringField(TEXT("path"), TEXT("/DesignSizeMode"));
-		PatchOperations.Add(MakeShared<FJsonValueObject>(PatchObject));
-	}
-
-	TArray<FString> ChangedProperties;
-	FMCPDiagnostic PatchDiagnostic;
-
-	if (!Request.Context.bDryRun)
-	{
-		const FString TransactionLabel = ParseTransactionLabel(Request.Params, TEXT("MCP UMG Blueprint Patch"));
-		FScopedTransaction Transaction(FText::FromString(TransactionLabel));
-		WidgetBlueprint->Modify();
-
-		if (!MCPObjectUtils::ApplyPatch(WidgetBlueprint, &PatchOperations, ChangedProperties, PatchDiagnostic))
-		{
-			Transaction.Cancel();
-			OutResult.Diagnostics.Add(PatchDiagnostic);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-
-		WidgetBlueprint->PostEditChange();
-		WidgetBlueprint->MarkPackageDirty();
-	}
-	else
-	{
-		CollectChangedPropertiesFromPatchOperations(&PatchOperations, ChangedProperties);
-	}
-
-	TSharedRef<FJsonObject> CompileObject = MakeShared<FJsonObject>();
-	if (bCompileOnSuccess && !Request.Context.bDryRun)
-	{
-		FKismetEditorUtilities::CompileBlueprint(WidgetBlueprint);
-		CompileObject->SetStringField(TEXT("status"), TEXT("requested"));
-	}
-	else
-	{
-		CompileObject->SetStringField(TEXT("status"), TEXT("skipped"));
-	}
-
-	MCPObjectUtils::AppendTouchedPackage(WidgetBlueprint, OutResult.TouchedPackages);
-	bool bAllSaved = true;
-	if (!Request.Context.bDryRun && bAutoSave)
-	{
-		for (const FString& PackageName : OutResult.TouchedPackages)
-		{
-			bAllSaved &= SavePackageByName(PackageName, OutResult);
-		}
-	}
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetArrayField(TEXT("changed_properties"), ToJsonStringArray(ChangedProperties));
-	OutResult.ResultObject->SetObjectField(TEXT("compile"), CompileObject);
-	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(OutResult.TouchedPackages));
-	OutResult.Status = bAllSaved ? EMCPResponseStatus::Ok : EMCPResponseStatus::Partial;
-	return true;
+			return SavePackageByName(PackageName, InOutResult);
+		});
 }
 
 bool UMCPToolRegistrySubsystem::HandleUMGBlueprintReparent(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString ObjectPath;
-	FString NewParentClassPath;
-	bool bCompileOnSuccess = true;
-	bool bAutoSave = false;
-
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
-		Request.Params->TryGetStringField(TEXT("new_parent_class_path"), NewParentClassPath);
-		Request.Params->TryGetBoolField(TEXT("compile_on_success"), bCompileOnSuccess);
-		ParseAutoSaveOption(Request.Params, bAutoSave);
-	}
-
-	if (ObjectPath.IsEmpty() || NewParentClassPath.IsEmpty())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("object_path and new_parent_class_path are required for umg.blueprint.reparent.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UWidgetBlueprint* WidgetBlueprint = LoadWidgetBlueprintByPath(ObjectPath);
-	if (WidgetBlueprint == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::OBJECT_NOT_FOUND;
-		Diagnostic.Message = TEXT("Widget blueprint not found.");
-		Diagnostic.Detail = ObjectPath;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UClass* NewParentClass = ResolveClassByPath(NewParentClassPath);
-	if (NewParentClass == nullptr || !NewParentClass->IsChildOf(UUserWidget::StaticClass()))
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::ASSET_CREATE_FAILED;
-		Diagnostic.Message = TEXT("new_parent_class_path must resolve to a UUserWidget-derived class.");
-		Diagnostic.Detail = NewParentClassPath;
-		Diagnostic.Suggestion = TEXT("Use /Script/UMG.UserWidget or a Blueprintable UUserWidget subclass.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	if (!FKismetEditorUtilities::CanCreateBlueprintOfClass(NewParentClass))
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::ASSET_CREATE_FAILED;
-		Diagnostic.Message = TEXT("Widget Blueprint cannot be reparented to the requested parent class.");
-		Diagnostic.Detail = NewParentClass->GetPathName();
-		Diagnostic.Suggestion = TEXT("Use a Blueprintable UUserWidget parent class.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	const FString OldParentClassPath = WidgetBlueprint->ParentClass
-		? WidgetBlueprint->ParentClass->GetPathName()
-		: FString();
-	const FString ResolvedParentClassPath = NewParentClass->GetPathName();
-	const bool bNoop = WidgetBlueprint->ParentClass == NewParentClass;
-
-	TArray<FString> ChangedProperties;
-	if (!bNoop)
-	{
-		ChangedProperties.Add(TEXT("ParentClass"));
-	}
-
-	if (!Request.Context.bDryRun && !bNoop)
-	{
-		const FString TransactionLabel = ParseTransactionLabel(Request.Params, TEXT("MCP UMG Blueprint Reparent"));
-		FScopedTransaction Transaction(FText::FromString(TransactionLabel));
-		WidgetBlueprint->Modify();
-
-		WidgetBlueprint->ParentClass = NewParentClass;
-		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WidgetBlueprint);
-		WidgetBlueprint->PostEditChange();
-		WidgetBlueprint->MarkPackageDirty();
-	}
-
-	TSharedRef<FJsonObject> CompileObject = MakeShared<FJsonObject>();
-	if (bCompileOnSuccess && !Request.Context.bDryRun && !bNoop)
-	{
-		FKismetEditorUtilities::CompileBlueprint(WidgetBlueprint);
-		CompileObject->SetStringField(TEXT("status"), TEXT("requested"));
-	}
-	else
-	{
-		CompileObject->SetStringField(TEXT("status"), TEXT("skipped"));
-	}
-
-	if (!Request.Context.bDryRun && !bNoop)
-	{
-		const bool bParentApplied = WidgetBlueprint->ParentClass == NewParentClass;
-		if (!bParentApplied)
+	return FMCPToolsUMGStructureHandler::HandleBlueprintReparent(
+		Request,
+		OutResult,
+		[](const FString& ObjectPath) { return LoadWidgetBlueprintByPath(ObjectPath); },
+		[](const FString& ClassPath) { return ResolveClassByPath(ClassPath); },
+		[](const FString& ObjectPath) { return BuildGeneratedClassPathFromObjectPath(ObjectPath); },
+		[](const FString& PackageName, FMCPToolExecutionResult& InOutResult)
 		{
-			FMCPDiagnostic Diagnostic;
-			Diagnostic.Code = MCPErrorCodes::INTERNAL_EXCEPTION;
-			Diagnostic.Message = TEXT("Widget Blueprint parent class was not applied.");
-			Diagnostic.Detail = FString::Printf(TEXT("expected=%s actual=%s"), *ResolvedParentClassPath, *(WidgetBlueprint->ParentClass ? WidgetBlueprint->ParentClass->GetPathName() : FString(TEXT("None"))));
-			OutResult.Diagnostics.Add(Diagnostic);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-	}
-
-	MCPObjectUtils::AppendTouchedPackage(WidgetBlueprint, OutResult.TouchedPackages);
-	bool bAllSaved = true;
-	if (!Request.Context.bDryRun && bAutoSave)
-	{
-		for (const FString& PackageName : OutResult.TouchedPackages)
-		{
-			bAllSaved &= SavePackageByName(PackageName, OutResult);
-		}
-	}
-
-	const FString GeneratedClassPath = (WidgetBlueprint->GeneratedClass != nullptr)
-		? WidgetBlueprint->GeneratedClass->GetPathName()
-		: BuildGeneratedClassPathFromObjectPath(ObjectPath);
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetBoolField(TEXT("reparented"), !Request.Context.bDryRun && !bNoop);
-	OutResult.ResultObject->SetBoolField(TEXT("dry_run"), Request.Context.bDryRun);
-	OutResult.ResultObject->SetBoolField(TEXT("no_op"), bNoop);
-	OutResult.ResultObject->SetStringField(TEXT("old_parent_class_path"), OldParentClassPath);
-	OutResult.ResultObject->SetStringField(TEXT("new_parent_class_path"), ResolvedParentClassPath);
-	OutResult.ResultObject->SetStringField(TEXT("generated_class_path"), GeneratedClassPath);
-	OutResult.ResultObject->SetArrayField(TEXT("changed_properties"), ToJsonStringArray(ChangedProperties));
-	OutResult.ResultObject->SetObjectField(TEXT("compile"), CompileObject);
-	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(OutResult.TouchedPackages));
-	OutResult.Status = bAllSaved ? EMCPResponseStatus::Ok : EMCPResponseStatus::Partial;
-	return true;
+			return SavePackageByName(PackageName, InOutResult);
+		});
 }
 
 bool UMCPToolRegistrySubsystem::HandleSettingsGameModeCompose(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString PackagePath;
-	FString GameModeAssetName;
-	FString GameModeParentClassPath = TEXT("/Script/Engine.GameModeBase");
-	FString MapKey;
-	bool bCreateMissingClasses = true;
-	bool bSetAsDefault = false;
-	bool bOverwrite = false;
-	bool bCompileOnSuccess = true;
-	bool bAutoSave = false;
-	FMCPSettingsSaveOptions SettingsSaveOptions;
-	const TSharedPtr<FJsonObject>* ClassPathsObject = nullptr;
-	const TSharedPtr<FJsonObject>* ClassNamesObject = nullptr;
-
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("package_path"), PackagePath);
-		Request.Params->TryGetStringField(TEXT("game_mode_asset_name"), GameModeAssetName);
-		Request.Params->TryGetStringField(TEXT("game_mode_parent_class_path"), GameModeParentClassPath);
-		Request.Params->TryGetStringField(TEXT("map_key"), MapKey);
-		Request.Params->TryGetBoolField(TEXT("create_missing_classes"), bCreateMissingClasses);
-		Request.Params->TryGetBoolField(TEXT("set_as_default"), bSetAsDefault);
-		Request.Params->TryGetBoolField(TEXT("overwrite"), bOverwrite);
-		Request.Params->TryGetBoolField(TEXT("compile_on_success"), bCompileOnSuccess);
-		Request.Params->TryGetObjectField(TEXT("class_paths"), ClassPathsObject);
-		Request.Params->TryGetObjectField(TEXT("class_names"), ClassNamesObject);
-		ParseAutoSaveOption(Request.Params, bAutoSave);
-		ParseSettingsSaveOptions(Request.Params, SettingsSaveOptions);
-	}
-
-	GameModeAssetName = ObjectTools::SanitizeObjectName(GameModeAssetName);
-	MapKey.TrimStartAndEndInline();
-
-	if (PackagePath.IsEmpty() || GameModeAssetName.IsEmpty())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("package_path and game_mode_asset_name are required for settings.gamemode.compose.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	if (!IsValidAssetDestination(PackagePath, GameModeAssetName))
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::ASSET_PATH_INVALID;
-		Diagnostic.Message = TEXT("Invalid package_path or game_mode_asset_name for settings.gamemode.compose.");
-		Diagnostic.Detail = FString::Printf(TEXT("package_path=%s game_mode_asset_name=%s"), *PackagePath, *GameModeAssetName);
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UClass* GameModeParentClass = ResolveClassByPath(GameModeParentClassPath);
-	if (GameModeParentClass == nullptr || !GameModeParentClass->IsChildOf(AGameModeBase::StaticClass()))
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::GAMEMODE_CLASS_INVALID;
-		Diagnostic.Message = TEXT("game_mode_parent_class_path is invalid.");
-		Diagnostic.Detail = GameModeParentClassPath;
-		Diagnostic.Suggestion = TEXT("Provide an AGameModeBase subclass path.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	if (!FKismetEditorUtilities::CanCreateBlueprintOfClass(GameModeParentClass))
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::ASSET_CREATE_FAILED;
-		Diagnostic.Message = TEXT("Blueprint cannot be created from game_mode_parent_class_path.");
-		Diagnostic.Detail = GameModeParentClass->GetPathName();
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	const FString TransactionLabel = ParseTransactionLabel(Request.Params, TEXT("MCP GameMode Compose"));
-	FMCPBlueprintCreateOptions GameModeCreateOptions;
-	GameModeCreateOptions.PackagePath = PackagePath;
-	GameModeCreateOptions.AssetName = GameModeAssetName;
-	GameModeCreateOptions.ParentClass = GameModeParentClass;
-	GameModeCreateOptions.bOverwrite = bOverwrite;
-	GameModeCreateOptions.bDryRun = Request.Context.bDryRun;
-	GameModeCreateOptions.bCompileOnSuccess = false;
-	GameModeCreateOptions.bAutoSave = false;
-	GameModeCreateOptions.TransactionLabel = TransactionLabel;
-
-	FMCPBlueprintCreateResult GameModeCreateResult;
-	FMCPDiagnostic GameModeCreateDiagnostic;
-	if (!EnsureBlueprintClassAsset(GameModeCreateOptions, OutResult, GameModeCreateResult, GameModeCreateDiagnostic))
-	{
-		OutResult.Diagnostics.Add(GameModeCreateDiagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	struct FGameModeSlotSpec
-	{
-		FString JsonKey;
-		FString PropertyName;
-		FString DefaultNameSuffix;
-		UClass* RequiredBaseClass = nullptr;
-	};
-
-	struct FGameModeSlotState
-	{
-		FString JsonKey;
-		FString PropertyName;
-		FString ClassPath;
-		FString ObjectPath;
-		FString PackageName;
-		FString Source = TEXT("none");
-		UClass* ResolvedClass = nullptr;
-		bool bCreated = false;
-		bool bApplied = false;
-	};
-
-	const TArray<FGameModeSlotSpec> SlotSpecs{
-		{ TEXT("default_pawn_class"), TEXT("DefaultPawnClass"), TEXT("Pawn"), APawn::StaticClass() },
-		{ TEXT("hud_class"), TEXT("HUDClass"), TEXT("HUD"), AHUD::StaticClass() },
-		{ TEXT("player_controller_class"), TEXT("PlayerControllerClass"), TEXT("PlayerController"), APlayerController::StaticClass() },
-		{ TEXT("game_state_class"), TEXT("GameStateClass"), TEXT("GameState"), AGameStateBase::StaticClass() },
-		{ TEXT("player_state_class"), TEXT("PlayerStateClass"), TEXT("PlayerState"), APlayerState::StaticClass() },
-		{ TEXT("spectator_class"), TEXT("SpectatorClass"), TEXT("SpectatorPawn"), ASpectatorPawn::StaticClass() }
-	};
-
-	UClass* GameModeGeneratedClass = ResolveClassByPath(GameModeCreateResult.GeneratedClassPath);
-	if (!Request.Context.bDryRun && GameModeGeneratedClass == nullptr && GameModeCreateResult.BlueprintAsset != nullptr)
-	{
-		FKismetEditorUtilities::CompileBlueprint(GameModeCreateResult.BlueprintAsset);
-		GameModeGeneratedClass = GameModeCreateResult.BlueprintAsset->GeneratedClass;
-	}
-
-	UObject* GameModeCDO = (GameModeGeneratedClass != nullptr) ? GameModeGeneratedClass->GetDefaultObject() : nullptr;
-	TArray<FString> ChangedProperties;
-	TArray<FGameModeSlotState> SlotStates;
-	SlotStates.Reserve(SlotSpecs.Num());
-
-	auto ResolveSlotClassFromCDO = [&](const FString& PropertyName, UClass* RequiredBaseClass, FGameModeSlotState& InOutSlotState) -> void
-	{
-		if (GameModeCDO == nullptr)
+	return FMCPToolsSettingsComposeHandler::HandleGameModeCompose(
+		Request,
+		OutResult,
+		[](const TSharedPtr<FJsonObject>& Params, bool& bOutAutoSave)
 		{
-			return;
-		}
-
-		FClassProperty* ClassProperty = FindFProperty<FClassProperty>(GameModeCDO->GetClass(), FName(*PropertyName));
-		if (ClassProperty == nullptr)
+			return ParseAutoSaveOption(Params, bOutAutoSave);
+		},
+		[](const TSharedPtr<FJsonObject>& Params, FMCPToolSettingsSaveOptions& OutOptions)
 		{
-			return;
-		}
-
-		UClass* CurrentClass = Cast<UClass>(ClassProperty->GetObjectPropertyValue_InContainer(GameModeCDO));
-		if (CurrentClass == nullptr || (RequiredBaseClass != nullptr && !CurrentClass->IsChildOf(RequiredBaseClass)))
+			FMCPSettingsSaveOptions SaveOptions;
+			const bool bParsed = ParseSettingsSaveOptions(Params, SaveOptions);
+			OutOptions.bSaveConfig = SaveOptions.bSaveConfig;
+			OutOptions.bFlushIni = SaveOptions.bFlushIni;
+			OutOptions.bReloadVerify = SaveOptions.bReloadVerify;
+			return bParsed;
+		},
+		[](const TSharedPtr<FJsonObject>& Params, const FString& DefaultLabel)
 		{
-			return;
-		}
-
-		InOutSlotState.Source = TEXT("existing");
-		InOutSlotState.ResolvedClass = CurrentClass;
-		InOutSlotState.ClassPath = CurrentClass->GetPathName();
-	};
-
-	for (const FGameModeSlotSpec& SlotSpec : SlotSpecs)
-	{
-		FGameModeSlotState SlotState;
-		SlotState.JsonKey = SlotSpec.JsonKey;
-		SlotState.PropertyName = SlotSpec.PropertyName;
-
-		FString RequestedClassPath;
-		if (ClassPathsObject != nullptr && ClassPathsObject->IsValid())
+			return ParseTransactionLabel(Params, DefaultLabel);
+		},
+		[](const FString& PackagePath, const FString& AssetName)
 		{
-			(*ClassPathsObject)->TryGetStringField(SlotSpec.JsonKey, RequestedClassPath);
-		}
-		RequestedClassPath.TrimStartAndEndInline();
-
-		if (!RequestedClassPath.IsEmpty())
+			return IsValidAssetDestination(PackagePath, AssetName);
+		},
+		[](const FString& ClassPath)
 		{
-			FMCPDiagnostic ResolveDiagnostic;
-			if (!ResolveClassPathWithBase(
-				RequestedClassPath,
-				SlotSpec.RequiredBaseClass,
-				SlotState.ClassPath,
-				SlotState.ResolvedClass,
-				ResolveDiagnostic))
+			return ResolveClassByPath(ClassPath);
+		},
+		[](const FMCPComposeBlueprintRequest& InRequest, FMCPToolExecutionResult& InOutResult, FMCPComposeBlueprintResult& OutCreateResult, FMCPDiagnostic& OutDiagnostic)
+		{
+			FMCPBlueprintCreateOptions CreateOptions;
+			CreateOptions.PackagePath = InRequest.PackagePath;
+			CreateOptions.AssetName = InRequest.AssetName;
+			CreateOptions.ParentClass = InRequest.ParentClass;
+			CreateOptions.bOverwrite = InRequest.bOverwrite;
+			CreateOptions.bDryRun = InRequest.bDryRun;
+			CreateOptions.bCompileOnSuccess = InRequest.bCompileOnSuccess;
+			CreateOptions.bAutoSave = InRequest.bAutoSave;
+			CreateOptions.TransactionLabel = InRequest.TransactionLabel;
+
+			FMCPBlueprintCreateResult CreateResult;
+			const bool bSucceeded = EnsureBlueprintClassAsset(CreateOptions, InOutResult, CreateResult, OutDiagnostic);
+			if (!bSucceeded)
 			{
-				OutResult.Diagnostics.Add(ResolveDiagnostic);
-				OutResult.Status = EMCPResponseStatus::Error;
 				return false;
 			}
 
-			SlotState.Source = TEXT("provided");
-		}
-		else if (bCreateMissingClasses)
+			OutCreateResult.bCreatedNew = CreateResult.bCreatedNew;
+			OutCreateResult.BlueprintAsset = CreateResult.BlueprintAsset;
+			OutCreateResult.ObjectPath = CreateResult.ObjectPath;
+			OutCreateResult.PackageName = CreateResult.PackageName;
+			OutCreateResult.ParentClassPath = CreateResult.ParentClassPath;
+			OutCreateResult.GeneratedClassPath = CreateResult.GeneratedClassPath;
+			OutCreateResult.bSaved = CreateResult.bSaved;
+			return true;
+		},
+		[](const FString& RequestedClassPath, UClass* RequiredBaseClass, FString& OutResolvedClassPath, UClass*& OutResolvedClass, FMCPDiagnostic& OutDiagnostic)
 		{
-			FString SlotAssetName;
-			if (ClassNamesObject != nullptr && ClassNamesObject->IsValid())
-			{
-				(*ClassNamesObject)->TryGetStringField(SlotSpec.JsonKey, SlotAssetName);
-			}
-
-			SlotAssetName = ObjectTools::SanitizeObjectName(SlotAssetName);
-			if (SlotAssetName.IsEmpty())
-			{
-				SlotAssetName = ObjectTools::SanitizeObjectName(FString::Printf(TEXT("%s_%s"), *GameModeAssetName, *SlotSpec.DefaultNameSuffix));
-			}
-
-			if (SlotAssetName.IsEmpty())
-			{
-				FMCPDiagnostic Diagnostic;
-				Diagnostic.Code = MCPErrorCodes::ASSET_PATH_INVALID;
-				Diagnostic.Message = TEXT("Failed to resolve a valid asset name for compose slot.");
-				Diagnostic.Detail = SlotSpec.JsonKey;
-				OutResult.Diagnostics.Add(Diagnostic);
-				OutResult.Status = EMCPResponseStatus::Error;
-				return false;
-			}
-
-			FMCPBlueprintCreateOptions SlotCreateOptions;
-			SlotCreateOptions.PackagePath = PackagePath;
-			SlotCreateOptions.AssetName = SlotAssetName;
-			SlotCreateOptions.ParentClass = SlotSpec.RequiredBaseClass;
-			SlotCreateOptions.bOverwrite = bOverwrite;
-			SlotCreateOptions.bDryRun = Request.Context.bDryRun;
-			SlotCreateOptions.bCompileOnSuccess = bCompileOnSuccess;
-			SlotCreateOptions.bAutoSave = false;
-			SlotCreateOptions.TransactionLabel = FString::Printf(TEXT("%s - %s"), *TransactionLabel, *SlotSpec.JsonKey);
-
-			FMCPBlueprintCreateResult SlotCreateResult;
-			FMCPDiagnostic SlotCreateDiagnostic;
-			if (!EnsureBlueprintClassAsset(SlotCreateOptions, OutResult, SlotCreateResult, SlotCreateDiagnostic))
-			{
-				OutResult.Diagnostics.Add(SlotCreateDiagnostic);
-				OutResult.Status = EMCPResponseStatus::Error;
-				return false;
-			}
-
-			SlotState.Source = SlotCreateResult.bCreatedNew ? TEXT("created") : TEXT("reused");
-			SlotState.bCreated = SlotCreateResult.bCreatedNew;
-			SlotState.ObjectPath = SlotCreateResult.ObjectPath;
-			SlotState.PackageName = SlotCreateResult.PackageName;
-			SlotState.ClassPath = SlotCreateResult.GeneratedClassPath;
-
-			FMCPDiagnostic ResolveDiagnostic;
-			FString ResolvedSlotClassPath;
-			UClass* ResolvedSlotClass = nullptr;
-			if (!ResolveClassPathWithBase(
-				SlotState.ClassPath,
-				SlotSpec.RequiredBaseClass,
-				ResolvedSlotClassPath,
-				ResolvedSlotClass,
-				ResolveDiagnostic))
-			{
-				if (!Request.Context.bDryRun)
-				{
-					OutResult.Diagnostics.Add(ResolveDiagnostic);
-					OutResult.Status = EMCPResponseStatus::Error;
-					return false;
-				}
-
-				SlotState.ResolvedClass = nullptr;
-			}
-			else
-			{
-				SlotState.ClassPath = ResolvedSlotClassPath;
-				SlotState.ResolvedClass = ResolvedSlotClass;
-			}
-		}
-		else
+			return ResolveClassPathWithBase(RequestedClassPath, RequiredBaseClass, OutResolvedClassPath, OutResolvedClass, OutDiagnostic);
+		},
+		[](UObject* TargetObject, const FString& PropertyName, UClass* ValueClass, FMCPDiagnostic& OutDiagnostic)
 		{
-			ResolveSlotClassFromCDO(SlotSpec.PropertyName, SlotSpec.RequiredBaseClass, SlotState);
-			if (SlotState.Source.Equals(TEXT("none"), ESearchCase::CaseSensitive))
-			{
-				SlotState.Source = TEXT("unchanged");
-			}
-		}
-
-		SlotStates.Add(MoveTemp(SlotState));
-	}
-
-	if (!Request.Context.bDryRun)
-	{
-		if (GameModeCreateResult.BlueprintAsset == nullptr)
+			return SetClassPropertyOnObject(TargetObject, PropertyName, ValueClass, OutDiagnostic);
+		},
+		[](const FString& PackageName, FMCPToolExecutionResult& InOutResult)
 		{
-			FMCPDiagnostic Diagnostic;
-			Diagnostic.Code = MCPErrorCodes::ASSET_CREATE_FAILED;
-			Diagnostic.Message = TEXT("GameMode blueprint asset could not be resolved.");
-			Diagnostic.Detail = GameModeCreateResult.ObjectPath;
-			OutResult.Diagnostics.Add(Diagnostic);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-
-		if (GameModeGeneratedClass == nullptr)
+			return SavePackageByName(PackageName, InOutResult);
+		},
+		[this](const FMCPRequestEnvelope& InRequest, FMCPToolExecutionResult& InOutResult)
 		{
-			GameModeGeneratedClass = GameModeCreateResult.BlueprintAsset->GeneratedClass;
-		}
-		if (GameModeGeneratedClass == nullptr)
+			return HandleSettingsGameModeSetDefault(InRequest, InOutResult);
+		},
+		[this](const FMCPRequestEnvelope& InRequest, FMCPToolExecutionResult& InOutResult)
 		{
-			FKismetEditorUtilities::CompileBlueprint(GameModeCreateResult.BlueprintAsset);
-			GameModeGeneratedClass = GameModeCreateResult.BlueprintAsset->GeneratedClass;
-		}
-		if (GameModeGeneratedClass == nullptr)
+			return HandleSettingsGameModeSetMapOverride(InRequest, InOutResult);
+		},
+		[](const TSharedPtr<FJsonObject>& Params, const FString& FieldName, TArray<FString>& OutValues)
 		{
-			FMCPDiagnostic Diagnostic;
-			Diagnostic.Code = MCPErrorCodes::ASSET_CREATE_FAILED;
-			Diagnostic.Message = TEXT("Failed to resolve generated class for GameMode blueprint.");
-			Diagnostic.Detail = GameModeCreateResult.ObjectPath;
-			OutResult.Diagnostics.Add(Diagnostic);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-
-		GameModeCDO = GameModeGeneratedClass->GetDefaultObject();
-		if (GameModeCDO == nullptr)
-		{
-			FMCPDiagnostic Diagnostic;
-			Diagnostic.Code = MCPErrorCodes::ASSET_CREATE_FAILED;
-			Diagnostic.Message = TEXT("Failed to resolve default object for composed GameMode.");
-			Diagnostic.Detail = GameModeGeneratedClass->GetPathName();
-			OutResult.Diagnostics.Add(Diagnostic);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-
-		GameModeCreateResult.BlueprintAsset->Modify();
-		for (FGameModeSlotState& SlotState : SlotStates)
-		{
-			if (SlotState.ResolvedClass == nullptr)
-			{
-				continue;
-			}
-
-			FMCPDiagnostic SetPropertyDiagnostic;
-			if (!SetClassPropertyOnObject(GameModeCDO, SlotState.PropertyName, SlotState.ResolvedClass, SetPropertyDiagnostic))
-			{
-				OutResult.Diagnostics.Add(SetPropertyDiagnostic);
-				OutResult.Status = EMCPResponseStatus::Error;
-				return false;
-			}
-
-			SlotState.bApplied = true;
-			ChangedProperties.AddUnique(SlotState.PropertyName);
-		}
-
-		GameModeCDO->MarkPackageDirty();
-		GameModeCreateResult.BlueprintAsset->MarkPackageDirty();
-
-		if (bCompileOnSuccess)
-		{
-			FKismetEditorUtilities::CompileBlueprint(GameModeCreateResult.BlueprintAsset);
-		}
-
-		if (GameModeCreateResult.BlueprintAsset->GeneratedClass != nullptr)
-		{
-			GameModeGeneratedClass = GameModeCreateResult.BlueprintAsset->GeneratedClass;
-		}
-	}
-
-	const FString GameModeGeneratedClassPath = GameModeGeneratedClass != nullptr
-		? GameModeGeneratedClass->GetPathName()
-		: GameModeCreateResult.GeneratedClassPath;
-
-	bool bAllSaved = true;
-	if (!Request.Context.bDryRun && bAutoSave)
-	{
-		for (const FString& PackageName : OutResult.TouchedPackages)
-		{
-			if (!PackageName.StartsWith(TEXT("/Game"), ESearchCase::CaseSensitive))
-			{
-				continue;
-			}
-			bAllSaved &= SavePackageByName(PackageName, OutResult);
-		}
-	}
-
-	auto CreateSettingsRequest = [&](const FString& ToolName) -> FMCPRequestEnvelope
-	{
-		FMCPRequestEnvelope SettingsRequest = Request;
-		SettingsRequest.Tool = ToolName;
-		SettingsRequest.Params = MakeShared<FJsonObject>();
-
-		TSharedRef<FJsonObject> SaveObject = MakeShared<FJsonObject>();
-		SaveObject->SetBoolField(TEXT("save_config"), SettingsSaveOptions.bSaveConfig);
-		SaveObject->SetBoolField(TEXT("flush_ini"), SettingsSaveOptions.bFlushIni);
-		SaveObject->SetBoolField(TEXT("reload_verify"), SettingsSaveOptions.bReloadVerify);
-		SettingsRequest.Params->SetObjectField(TEXT("save"), SaveObject);
-
-		TSharedRef<FJsonObject> TransactionObject = MakeShared<FJsonObject>();
-		TransactionObject->SetStringField(TEXT("label"), TransactionLabel);
-		SettingsRequest.Params->SetObjectField(TEXT("transaction"), TransactionObject);
-		return SettingsRequest;
-	};
-
-	auto MergeToolResult = [&](const FMCPToolExecutionResult& ToolResult, bool& bOutVerified, TArray<FString>& OutSavedConfigFiles, bool& bOutHadPartialStatus) -> void
-	{
-		for (const FMCPDiagnostic& Diagnostic : ToolResult.Diagnostics)
-		{
-			OutResult.Diagnostics.Add(Diagnostic);
-		}
-		for (const FString& TouchedPackage : ToolResult.TouchedPackages)
-		{
-			OutResult.TouchedPackages.AddUnique(TouchedPackage);
-		}
-
-		if (ToolResult.ResultObject.IsValid())
-		{
-			TArray<FString> SavedFiles;
-			ParseStringArrayField(ToolResult.ResultObject, TEXT("saved_config_files"), SavedFiles);
-			for (const FString& SavedFile : SavedFiles)
-			{
-				OutSavedConfigFiles.AddUnique(SavedFile);
-			}
-
-			TArray<FString> ToolChangedProperties;
-			ParseStringArrayField(ToolResult.ResultObject, TEXT("changed_properties"), ToolChangedProperties);
-			for (const FString& PropertyName : ToolChangedProperties)
-			{
-				ChangedProperties.AddUnique(PropertyName);
-			}
-
-			bool bToolVerified = true;
-			if (ToolResult.ResultObject->TryGetBoolField(TEXT("verified"), bToolVerified))
-			{
-				bOutVerified &= bToolVerified;
-			}
-		}
-
-		bOutHadPartialStatus |= ToolResult.Status == EMCPResponseStatus::Partial;
-	};
-
-	TArray<FString> SavedConfigFiles;
-	bool bVerified = true;
-	bool bSettingsSetDefaultApplied = false;
-	bool bSettingsMapOverrideApplied = false;
-	bool bHadPartialStatus = !bAllSaved;
-
-	if (bSetAsDefault)
-	{
-		FMCPRequestEnvelope SettingsRequest = CreateSettingsRequest(TEXT("settings.gamemode.set_default"));
-		SettingsRequest.Params->SetStringField(TEXT("game_mode_class_path"), GameModeGeneratedClassPath);
-
-		FMCPToolExecutionResult SettingsResult;
-		if (!HandleSettingsGameModeSetDefault(SettingsRequest, SettingsResult))
-		{
-			MergeToolResult(SettingsResult, bVerified, SavedConfigFiles, bHadPartialStatus);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-
-		MergeToolResult(SettingsResult, bVerified, SavedConfigFiles, bHadPartialStatus);
-		bSettingsSetDefaultApplied = true;
-	}
-
-	if (!MapKey.IsEmpty())
-	{
-		FMCPRequestEnvelope SettingsRequest = CreateSettingsRequest(TEXT("settings.gamemode.set_map_override"));
-		SettingsRequest.Params->SetStringField(TEXT("map_key"), MapKey);
-		SettingsRequest.Params->SetStringField(TEXT("game_mode_class_path"), GameModeGeneratedClassPath);
-
-		FMCPToolExecutionResult SettingsResult;
-		if (!HandleSettingsGameModeSetMapOverride(SettingsRequest, SettingsResult))
-		{
-			MergeToolResult(SettingsResult, bVerified, SavedConfigFiles, bHadPartialStatus);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-
-		MergeToolResult(SettingsResult, bVerified, SavedConfigFiles, bHadPartialStatus);
-		bSettingsMapOverrideApplied = true;
-	}
-
-	TArray<TSharedPtr<FJsonValue>> SlotEntries;
-	SlotEntries.Reserve(SlotStates.Num());
-	for (const FGameModeSlotState& SlotState : SlotStates)
-	{
-		TSharedRef<FJsonObject> SlotObject = MakeShared<FJsonObject>();
-		SlotObject->SetStringField(TEXT("slot"), SlotState.JsonKey);
-		SlotObject->SetStringField(TEXT("property"), SlotState.PropertyName);
-		SlotObject->SetStringField(TEXT("class_path"), SlotState.ClassPath);
-		SlotObject->SetStringField(TEXT("source"), SlotState.Source);
-		SlotObject->SetBoolField(TEXT("created"), SlotState.bCreated);
-		SlotObject->SetBoolField(TEXT("applied"), SlotState.bApplied);
-		if (!SlotState.ObjectPath.IsEmpty())
-		{
-			SlotObject->SetStringField(TEXT("object_path"), SlotState.ObjectPath);
-		}
-		if (!SlotState.PackageName.IsEmpty())
-		{
-			SlotObject->SetStringField(TEXT("package"), SlotState.PackageName);
-		}
-		SlotEntries.Add(MakeShared<FJsonValueObject>(SlotObject));
-	}
-
-	TSharedRef<FJsonObject> SettingsAppliedObject = MakeShared<FJsonObject>();
-	SettingsAppliedObject->SetBoolField(TEXT("set_default"), bSettingsSetDefaultApplied);
-	SettingsAppliedObject->SetBoolField(TEXT("map_override"), bSettingsMapOverrideApplied);
-	SettingsAppliedObject->SetStringField(TEXT("map_key"), MapKey);
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetStringField(TEXT("game_mode_object_path"), GameModeCreateResult.ObjectPath);
-	OutResult.ResultObject->SetStringField(TEXT("game_mode_class_path"), GameModeGeneratedClassPath);
-	OutResult.ResultObject->SetStringField(TEXT("game_mode_parent_class_path"), GameModeParentClass->GetPathName());
-	OutResult.ResultObject->SetArrayField(TEXT("slots"), SlotEntries);
-	OutResult.ResultObject->SetObjectField(TEXT("settings_applied"), SettingsAppliedObject);
-	OutResult.ResultObject->SetArrayField(TEXT("changed_properties"), ToJsonStringArray(ChangedProperties));
-	OutResult.ResultObject->SetArrayField(TEXT("saved_config_files"), ToJsonStringArray(SavedConfigFiles));
-	OutResult.ResultObject->SetBoolField(TEXT("verified"), bVerified);
-	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(OutResult.TouchedPackages));
-	OutResult.Status = bHadPartialStatus ? EMCPResponseStatus::Partial : EMCPResponseStatus::Ok;
-	return true;
+			return ParseStringArrayField(Params, FieldName, OutValues);
+		});
 }
 
 bool UMCPToolRegistrySubsystem::HandleAssetDuplicate(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString SourceObjectPath;
-	FString DestPackagePath;
-	FString DestAssetName;
-	bool bOverwrite = false;
-	bool bAutoSave = false;
-
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("source_object_path"), SourceObjectPath);
-		Request.Params->TryGetStringField(TEXT("dest_package_path"), DestPackagePath);
-		Request.Params->TryGetStringField(TEXT("dest_asset_name"), DestAssetName);
-		Request.Params->TryGetBoolField(TEXT("overwrite"), bOverwrite);
-		ParseAutoSaveOption(Request.Params, bAutoSave);
-	}
-
-	if (SourceObjectPath.IsEmpty() || DestPackagePath.IsEmpty() || DestAssetName.IsEmpty())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("source_object_path, dest_package_path and dest_asset_name are required for asset.duplicate.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	if (!IsValidAssetDestination(DestPackagePath, DestAssetName))
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::ASSET_PATH_INVALID;
-		Diagnostic.Message = TEXT("Invalid destination path for asset.duplicate.");
-		Diagnostic.Detail = FString::Printf(TEXT("dest_package_path=%s dest_asset_name=%s"), *DestPackagePath, *DestAssetName);
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UObject* SourceObject = ResolveObjectByPath(SourceObjectPath);
-	if (SourceObject == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::ASSET_NOT_FOUND;
-		Diagnostic.Message = TEXT("source_object_path was not found.");
-		Diagnostic.Detail = SourceObjectPath;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	const FString DestPackageName = BuildPackageName(DestPackagePath, DestAssetName);
-	const FString DestObjectPath = BuildObjectPath(DestPackagePath, DestAssetName);
-
-	UObject* ExistingObject = ResolveObjectByPath(DestObjectPath);
-	if (ExistingObject != nullptr && !bOverwrite)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::ASSET_ALREADY_EXISTS;
-		Diagnostic.Message = TEXT("Destination asset already exists.");
-		Diagnostic.Detail = DestObjectPath;
-		Diagnostic.Suggestion = TEXT("Set overwrite=true or change destination.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	if (ExistingObject != nullptr && bOverwrite && !Request.Context.bDryRun)
-	{
-		if (!ObjectTools::DeleteSingleObject(ExistingObject, false))
+	return FMCPToolsAssetLifecycleHandler::HandleDuplicate(
+		Request,
+		OutResult,
+		[](const FString& DestPackagePath, const FString& DestAssetName)
 		{
-			FMCPDiagnostic Diagnostic;
-			Diagnostic.Code = MCPErrorCodes::ASSET_DELETE_FAILED;
-			Diagnostic.Message = TEXT("Failed to delete existing destination asset for overwrite.");
-			Diagnostic.Detail = DestObjectPath;
-			OutResult.Diagnostics.Add(Diagnostic);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-	}
-
-	UObject* DuplicatedAsset = nullptr;
-	bool bDuplicatedSuccessfully = false;
-	if (!Request.Context.bDryRun)
-	{
-		FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools"));
-		DuplicatedAsset = AssetToolsModule.Get().DuplicateAsset(DestAssetName, DestPackagePath, SourceObject);
-		bDuplicatedSuccessfully = DuplicatedAsset != nullptr;
-	}
-	else
-	{
-		bDuplicatedSuccessfully = true;
-	}
-
-	if (!bDuplicatedSuccessfully)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::ASSET_DUPLICATE_FAILED;
-		Diagnostic.Message = TEXT("Failed to duplicate asset.");
-		Diagnostic.Detail = FString::Printf(TEXT("source=%s destination=%s"), *SourceObjectPath, *DestObjectPath);
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	OutResult.TouchedPackages.AddUnique(DestPackageName);
-
-	bool bAllSaved = true;
-	if (!Request.Context.bDryRun && bAutoSave)
-	{
-		bAllSaved = SavePackageByName(DestPackageName, OutResult);
-	}
-
-	const FString ClassPath = SourceObject->GetClass() ? SourceObject->GetClass()->GetClassPathName().ToString() : FString();
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetBoolField(TEXT("duplicated"), true);
-	OutResult.ResultObject->SetStringField(TEXT("object_path"), DestObjectPath);
-	OutResult.ResultObject->SetStringField(TEXT("class_path"), ClassPath);
-	OutResult.ResultObject->SetStringField(TEXT("package"), DestPackageName);
-	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(OutResult.TouchedPackages));
-	OutResult.Status = bAllSaved ? EMCPResponseStatus::Ok : EMCPResponseStatus::Partial;
-	return true;
+			return IsValidAssetDestination(DestPackagePath, DestAssetName);
+		},
+		[](const FString& PackagePath, const FString& AssetName)
+		{
+			return BuildPackageName(PackagePath, AssetName);
+		},
+		[](const FString& PackagePath, const FString& AssetName)
+		{
+			return BuildObjectPath(PackagePath, AssetName);
+		},
+		[](const FString& InputPath)
+		{
+			return NormalizePackageNameFromInput(InputPath);
+		},
+		[](const FString& ObjectPath)
+		{
+			return ResolveObjectByPath(ObjectPath);
+		},
+		[](const FString& PackageName, FMCPToolExecutionResult& InOutResult)
+		{
+			return SavePackageByName(PackageName, InOutResult);
+		});
 }
 
 bool UMCPToolRegistrySubsystem::HandleAssetRename(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString ObjectPath;
-	FString NewPackagePath;
-	FString NewAssetName;
-	bool bFixupRedirectors = false;
-	bool bAutoSave = false;
-
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
-		Request.Params->TryGetStringField(TEXT("new_package_path"), NewPackagePath);
-		Request.Params->TryGetStringField(TEXT("new_asset_name"), NewAssetName);
-		Request.Params->TryGetBoolField(TEXT("fixup_redirectors"), bFixupRedirectors);
-		ParseAutoSaveOption(Request.Params, bAutoSave);
-	}
-
-	if (ObjectPath.IsEmpty() || NewPackagePath.IsEmpty() || NewAssetName.IsEmpty())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("object_path, new_package_path and new_asset_name are required for asset.rename.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	if (!IsValidAssetDestination(NewPackagePath, NewAssetName))
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::ASSET_PATH_INVALID;
-		Diagnostic.Message = TEXT("Invalid destination path for asset.rename.");
-		Diagnostic.Detail = FString::Printf(TEXT("new_package_path=%s new_asset_name=%s"), *NewPackagePath, *NewAssetName);
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UObject* AssetObject = ResolveObjectByPath(ObjectPath);
-	if (AssetObject == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::ASSET_NOT_FOUND;
-		Diagnostic.Message = TEXT("object_path was not found.");
-		Diagnostic.Detail = ObjectPath;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	const FString OldObjectPath = AssetObject->GetPathName();
-	const FString OldPackageName = NormalizePackageNameFromInput(OldObjectPath);
-	const FString NewObjectPath = BuildObjectPath(NewPackagePath, NewAssetName);
-	const FString NewPackageName = BuildPackageName(NewPackagePath, NewAssetName);
-
-	bool bRenameSucceeded = true;
-	bool bRedirectorsFixed = false;
-	if (!Request.Context.bDryRun)
-	{
-		FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools"));
-		IAssetTools& AssetTools = AssetToolsModule.Get();
-
-		TArray<FAssetRenameData> RenameData;
-		RenameData.Add(FAssetRenameData(AssetObject, NewPackagePath, NewAssetName));
-		bRenameSucceeded = AssetTools.RenameAssets(RenameData);
-		if (!bRenameSucceeded)
+	return FMCPToolsAssetLifecycleHandler::HandleRename(
+		Request,
+		OutResult,
+		[](const FString& PackagePath, const FString& AssetName)
 		{
-			FMCPDiagnostic Diagnostic;
-			Diagnostic.Code = MCPErrorCodes::ASSET_RENAME_FAILED;
-			Diagnostic.Message = TEXT("Failed to rename asset.");
-			Diagnostic.Detail = FString::Printf(TEXT("object_path=%s new_object_path=%s"), *ObjectPath, *NewObjectPath);
-			OutResult.Diagnostics.Add(Diagnostic);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-
-		if (bFixupRedirectors && !OldPackageName.IsEmpty())
+			return IsValidAssetDestination(PackagePath, AssetName);
+		},
+		[](const FString& PackagePath, const FString& AssetName)
 		{
-			FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
-			TArray<FAssetData> OldPackageAssets;
-			AssetRegistryModule.Get().GetAssetsByPackageName(*OldPackageName, OldPackageAssets, false);
-
-			TArray<UObjectRedirector*> Redirectors;
-			for (const FAssetData& AssetData : OldPackageAssets)
-			{
-				if (AssetData.AssetClassPath != UObjectRedirector::StaticClass()->GetClassPathName())
-				{
-					continue;
-				}
-
-				if (UObjectRedirector* Redirector = Cast<UObjectRedirector>(AssetData.GetAsset()))
-				{
-					Redirectors.Add(Redirector);
-				}
-			}
-
-			if (Redirectors.Num() > 0)
-			{
-				AssetTools.FixupReferencers(Redirectors, false, ERedirectFixupMode::DeleteFixedUpRedirectors);
-				bRedirectorsFixed = true;
-			}
-		}
-	}
-
-	OutResult.TouchedPackages.AddUnique(OldPackageName);
-	OutResult.TouchedPackages.AddUnique(NewPackageName);
-
-	bool bAllSaved = true;
-	if (!Request.Context.bDryRun && bAutoSave)
-	{
-		if (!OldPackageName.IsEmpty())
+			return BuildPackageName(PackagePath, AssetName);
+		},
+		[](const FString& PackagePath, const FString& AssetName)
 		{
-			UPackage* OldPackage = FindPackage(nullptr, *OldPackageName);
-			if (OldPackage != nullptr)
-			{
-				bAllSaved &= SavePackageByName(OldPackageName, OutResult);
-			}
-		}
-		bAllSaved &= SavePackageByName(NewPackageName, OutResult);
-	}
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetBoolField(TEXT("renamed"), bRenameSucceeded);
-	OutResult.ResultObject->SetStringField(TEXT("old_object_path"), OldObjectPath);
-	OutResult.ResultObject->SetStringField(TEXT("new_object_path"), NewObjectPath);
-	OutResult.ResultObject->SetBoolField(TEXT("redirectors_fixed"), bRedirectorsFixed);
-	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(OutResult.TouchedPackages));
-	OutResult.Status = bAllSaved ? EMCPResponseStatus::Ok : EMCPResponseStatus::Partial;
-	return true;
+			return BuildObjectPath(PackagePath, AssetName);
+		},
+		[](const FString& InputPath)
+		{
+			return NormalizePackageNameFromInput(InputPath);
+		},
+		[](const FString& ObjectPath)
+		{
+			return ResolveObjectByPath(ObjectPath);
+		},
+		[](const FString& PackageName, FMCPToolExecutionResult& InOutResult)
+		{
+			return SavePackageByName(PackageName, InOutResult);
+		});
 }
 
 bool UMCPToolRegistrySubsystem::HandleAssetDelete(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	TArray<FString> ObjectPaths;
-	bool bFailIfReferenced = true;
-	FString Mode = TEXT("preview");
-	FString ConfirmToken;
-
-	if (Request.Params.IsValid())
-	{
-		ParseStringArrayField(Request.Params, TEXT("object_paths"), ObjectPaths);
-		Request.Params->TryGetBoolField(TEXT("fail_if_referenced"), bFailIfReferenced);
-		Request.Params->TryGetStringField(TEXT("mode"), Mode);
-		Request.Params->TryGetStringField(TEXT("confirm_token"), ConfirmToken);
-	}
-
-	if (ObjectPaths.Num() == 0)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("object_paths is required for asset.delete.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	Mode = Mode.ToLower();
-	if (!Mode.Equals(TEXT("preview")) && !Mode.Equals(TEXT("apply")))
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("mode must be preview or apply.");
-		Diagnostic.Detail = Mode;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	if (Mode.Equals(TEXT("apply")) && !ConsumeDeleteConfirmationToken(ConfirmToken, ObjectPaths, bFailIfReferenced))
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::CONFIRM_TOKEN_INVALID;
-		Diagnostic.Message = TEXT("Invalid or expired confirm_token.");
-		Diagnostic.Suggestion = TEXT("Call asset.delete in preview mode and retry with returned confirm_token.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
-	IAssetRegistry& AssetRegistry = AssetRegistryModule.Get();
-
-	TArray<UObject*> ObjectsToDelete;
-	TArray<FString> DeleteCandidatePaths;
-	TArray<FString> Failed;
-	TArray<FString> Deleted;
-	TArray<TSharedPtr<FJsonValue>> Blocked;
-
-	for (const FString& ObjectPath : ObjectPaths)
-	{
-		UObject* AssetObject = ResolveObjectByPath(ObjectPath);
-		if (AssetObject == nullptr)
+	return FMCPToolsAssetLifecycleHandler::HandleDelete(
+		Request,
+		OutResult,
+		[](const FString& InputPath)
 		{
-			Failed.AddUnique(ObjectPath);
-			FMCPDiagnostic Diagnostic;
-			Diagnostic.Code = MCPErrorCodes::ASSET_NOT_FOUND;
-			Diagnostic.Severity = TEXT("warning");
-			Diagnostic.Message = TEXT("Asset was not found for delete request.");
-			Diagnostic.Detail = ObjectPath;
-			OutResult.Diagnostics.Add(Diagnostic);
-			continue;
-		}
-
-		const FString PackageName = NormalizePackageNameFromInput(ObjectPath);
-		TArray<FName> Referencers;
-		if (bFailIfReferenced && !PackageName.IsEmpty())
+			return NormalizePackageNameFromInput(InputPath);
+		},
+		[](const FString& ObjectPath)
 		{
-			AssetRegistry.GetReferencers(*PackageName, Referencers, UE::AssetRegistry::EDependencyCategory::Package);
-		}
-
-		TArray<FString> ReferencerPackages;
-		for (const FName Referencer : Referencers)
+			return ResolveObjectByPath(ObjectPath);
+		},
+		[this](const TArray<FString>& ObjectPaths, const bool bFailIfReferenced)
 		{
-			const FString ReferencerName = Referencer.ToString();
-			if (!ReferencerName.IsEmpty() && !ReferencerName.Equals(PackageName, ESearchCase::CaseSensitive))
-			{
-				ReferencerPackages.AddUnique(ReferencerName);
-			}
-		}
-
-		if (bFailIfReferenced && ReferencerPackages.Num() > 0)
+			return BuildDeleteConfirmationToken(ObjectPaths, bFailIfReferenced);
+		},
+		[this](const FString& Token, const TArray<FString>& ObjectPaths, const bool bFailIfReferenced)
 		{
-			Failed.AddUnique(ObjectPath);
-
-			TSharedRef<FJsonObject> BlockedEntry = MakeShared<FJsonObject>();
-			BlockedEntry->SetStringField(TEXT("object_path"), ObjectPath);
-			BlockedEntry->SetArrayField(TEXT("referencers"), ToJsonStringArray(ReferencerPackages));
-			Blocked.Add(MakeShared<FJsonValueObject>(BlockedEntry));
-
-			FMCPDiagnostic Diagnostic;
-			Diagnostic.Code = MCPErrorCodes::ASSET_REFERENCED;
-			Diagnostic.Severity = TEXT("warning");
-			Diagnostic.Message = TEXT("Asset has referencers and cannot be deleted with fail_if_referenced=true.");
-			Diagnostic.Detail = ObjectPath;
-			Diagnostic.Suggestion = TEXT("Inspect referencers or set fail_if_referenced=false.");
-			OutResult.Diagnostics.Add(Diagnostic);
-			continue;
-		}
-
-		ObjectsToDelete.Add(AssetObject);
-		DeleteCandidatePaths.Add(ObjectPath);
-	}
-
-	const bool bPreviewMode = Mode.Equals(TEXT("preview"));
-	const bool bCanDelete = Failed.Num() == 0 && Blocked.Num() == 0;
-	FString PreviewToken;
-
-	if (bPreviewMode)
-	{
-		PreviewToken = BuildDeleteConfirmationToken(ObjectPaths, bFailIfReferenced);
-	}
-	else if (Request.Context.bDryRun)
-	{
-		Deleted.Append(DeleteCandidatePaths);
-	}
-	else if (ObjectsToDelete.Num() > 0)
-	{
-		ObjectTools::DeleteObjectsUnchecked(ObjectsToDelete);
-		CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS);
-
-		auto WasDeletedFromRegistryAndDisk = [&AssetRegistry](const FString& CandidatePath, FString& OutFailureDetail) -> bool
-		{
-			OutFailureDetail.Reset();
-			const FAssetData AssetData = AssetRegistry.GetAssetByObjectPath(FSoftObjectPath(CandidatePath), true);
-			if (AssetData.IsValid())
-			{
-				OutFailureDetail = FString::Printf(TEXT("asset_registry_has_object=%s"), *CandidatePath);
-				return false;
-			}
-
-			const FString PackageName = NormalizePackageNameFromInput(CandidatePath);
-			if (PackageName.IsEmpty())
-			{
-				return true;
-			}
-
-			FString AssetFilename;
-			if (FPackageName::TryConvertLongPackageNameToFilename(PackageName, AssetFilename, FPackageName::GetAssetPackageExtension()) &&
-				IFileManager::Get().FileExists(*AssetFilename))
-			{
-				OutFailureDetail = FString::Printf(TEXT("asset_file_exists=%s"), *AssetFilename);
-				return false;
-			}
-
-			FString MapFilename;
-			if (FPackageName::TryConvertLongPackageNameToFilename(PackageName, MapFilename, FPackageName::GetMapPackageExtension()) &&
-				IFileManager::Get().FileExists(*MapFilename))
-			{
-				OutFailureDetail = FString::Printf(TEXT("map_file_exists=%s"), *MapFilename);
-				return false;
-			}
-
-			return true;
-		};
-
-		for (const FString& CandidatePath : DeleteCandidatePaths)
-		{
-			FString FailureDetail;
-			if (WasDeletedFromRegistryAndDisk(CandidatePath, FailureDetail))
-			{
-				Deleted.AddUnique(CandidatePath);
-			}
-			else
-			{
-				Failed.AddUnique(CandidatePath);
-
-				FMCPDiagnostic Diagnostic;
-				Diagnostic.Code = MCPErrorCodes::ASSET_DELETE_FAILED;
-				Diagnostic.Severity = TEXT("warning");
-				Diagnostic.Message = TEXT("Asset delete apply could not verify removal.");
-				Diagnostic.Detail = FailureDetail.IsEmpty()
-					? CandidatePath
-					: FString::Printf(TEXT("%s %s"), *CandidatePath, *FailureDetail);
-				Diagnostic.Suggestion = TEXT("Close editors referencing the asset and retry, or delete fewer assets per request.");
-				Diagnostic.bRetriable = true;
-				OutResult.Diagnostics.Add(Diagnostic);
-			}
-		}
-	}
-
-	for (const FString& DeletedPath : Deleted)
-	{
-		const FString TouchedPackage = NormalizePackageNameFromInput(DeletedPath);
-		if (!TouchedPackage.IsEmpty())
-		{
-			OutResult.TouchedPackages.AddUnique(TouchedPackage);
-		}
-	}
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetStringField(TEXT("mode"), Mode);
-	OutResult.ResultObject->SetBoolField(TEXT("can_delete"), bCanDelete);
-	OutResult.ResultObject->SetArrayField(TEXT("deleted"), ToJsonStringArray(Deleted));
-	OutResult.ResultObject->SetArrayField(TEXT("failed"), ToJsonStringArray(Failed));
-	OutResult.ResultObject->SetArrayField(TEXT("blocked"), Blocked);
-	OutResult.ResultObject->SetStringField(TEXT("confirm_token"), PreviewToken);
-	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(OutResult.TouchedPackages));
-
-	if (bPreviewMode)
-	{
-		OutResult.Status = bCanDelete ? EMCPResponseStatus::Ok : EMCPResponseStatus::Partial;
-		return true;
-	}
-
-	if (Failed.Num() == 0)
-	{
-		OutResult.Status = EMCPResponseStatus::Ok;
-		return true;
-	}
-
-	if (Deleted.Num() > 0)
-	{
-		OutResult.Status = EMCPResponseStatus::Partial;
-		return true;
-	}
-
-	FMCPDiagnostic Diagnostic;
-	Diagnostic.Code = MCPErrorCodes::ASSET_DELETE_FAILED;
-	Diagnostic.Message = TEXT("No assets were deleted in apply mode.");
-	Diagnostic.Detail = FString::Join(Failed, TEXT(","));
-	Diagnostic.Suggestion = TEXT("Inspect failed targets and retry after closing referencing editors.");
-	Diagnostic.bRetriable = true;
-	OutResult.Diagnostics.Add(Diagnostic);
-
-	OutResult.Status = EMCPResponseStatus::Error;
-	return false;
+			return ConsumeDeleteConfirmationToken(Token, ObjectPaths, bFailIfReferenced);
+		});
 }
 
 bool UMCPToolRegistrySubsystem::HandleSettingsProjectGet(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString ClassPath;
-	const TSharedPtr<FJsonObject>* FiltersObject = nullptr;
-	int32 Depth = 2;
-
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("class_path"), ClassPath);
-		Request.Params->TryGetObjectField(TEXT("filters"), FiltersObject);
-		double DepthNumber = static_cast<double>(Depth);
-		Request.Params->TryGetNumberField(TEXT("depth"), DepthNumber);
-		Depth = FMath::Clamp(static_cast<int32>(DepthNumber), 0, 5);
-	}
-
-	if (ClassPath.IsEmpty())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("class_path is required for settings.project.get.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UClass* SettingsClass = nullptr;
-	UObject* ConfigObject = nullptr;
-	FMCPDiagnostic ResolveDiagnostic;
-	if (!ResolveSettingsClass(ClassPath, SettingsClass, ConfigObject, ResolveDiagnostic))
-	{
-		OutResult.Diagnostics.Add(ResolveDiagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	TArray<TSharedPtr<FJsonValue>> Properties;
-	MCPObjectUtils::InspectObject(ConfigObject, (FiltersObject != nullptr) ? *FiltersObject : nullptr, Depth, Properties);
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetStringField(TEXT("class_path"), SettingsClass->GetClassPathName().ToString());
-	OutResult.ResultObject->SetStringField(TEXT("config_name"), SettingsClass->ClassConfigName.ToString());
-	OutResult.ResultObject->SetStringField(TEXT("config_file"), ConfigObject->GetDefaultConfigFilename());
-	OutResult.ResultObject->SetArrayField(TEXT("properties"), Properties);
-	OutResult.Status = EMCPResponseStatus::Ok;
-	return true;
+	return FMCPToolsSettingsProjectHandler::HandleProjectGet(
+		Request,
+		OutResult,
+		[](const FString& ClassPath, UClass*& OutClass, UObject*& OutConfigObject, FMCPDiagnostic& OutDiagnostic)
+		{
+			return ResolveSettingsClass(ClassPath, OutClass, OutConfigObject, OutDiagnostic);
+		});
 }
 
 bool UMCPToolRegistrySubsystem::HandleSettingsProjectPatch(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString ClassPath;
-	FString Mode = TEXT("preview");
-	FString ConfirmToken;
-	FMCPSettingsSaveOptions SaveOptions;
-	const TArray<TSharedPtr<FJsonValue>>* PatchOperations = nullptr;
-
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("class_path"), ClassPath);
-		Request.Params->TryGetStringField(TEXT("mode"), Mode);
-		Request.Params->TryGetStringField(TEXT("confirm_token"), ConfirmToken);
-		Request.Params->TryGetArrayField(TEXT("patch"), PatchOperations);
-		ParseSettingsSaveOptions(Request.Params, SaveOptions);
-	}
-
-	if (ClassPath.IsEmpty() || PatchOperations == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("class_path and patch are required for settings.project.patch.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	Mode = Mode.ToLower();
-	if (!Mode.Equals(TEXT("preview")) && !Mode.Equals(TEXT("apply")))
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("mode must be preview or apply.");
-		Diagnostic.Detail = Mode;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UClass* SettingsClass = nullptr;
-	UObject* ConfigObject = nullptr;
-	FMCPDiagnostic ResolveDiagnostic;
-	if (!ResolveSettingsClass(ClassPath, SettingsClass, ConfigObject, ResolveDiagnostic))
-	{
-		OutResult.Diagnostics.Add(ResolveDiagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	TArray<FString> PreviewChangedProperties;
-	FMCPDiagnostic ParsePatchDiagnostic;
-	if (!ParseTopLevelPatchProperties(PatchOperations, ConfigObject, PreviewChangedProperties, ParsePatchDiagnostic))
-	{
-		OutResult.Diagnostics.Add(ParsePatchDiagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	const FString Signature = BuildSettingsPatchSignature(SettingsClass->GetClassPathName().ToString(), PatchOperations, SaveOptions);
-	if (Mode.Equals(TEXT("apply")) && !ConsumeSettingsConfirmationToken(ConfirmToken, Signature))
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SETTINGS_CONFIRM_TOKEN_INVALID;
-		Diagnostic.Message = TEXT("Invalid or expired confirm_token.");
-		Diagnostic.Suggestion = TEXT("Run settings.project.patch in preview mode and retry with returned confirm_token.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	FString PreviewToken;
-	TArray<FString> ChangedProperties = PreviewChangedProperties;
-	TArray<FString> SavedConfigFiles;
-	bool bVerified = false;
-	bool bPersistSucceeded = true;
-
-	if (Mode.Equals(TEXT("preview")))
-	{
-		PreviewToken = BuildSettingsConfirmationToken(Signature);
-	}
-	else if (!Request.Context.bDryRun)
-	{
-		const FString TransactionLabel = ParseTransactionLabel(Request.Params, TEXT("MCP Project Settings Patch"));
-		FScopedTransaction Transaction(FText::FromString(TransactionLabel));
-		ConfigObject->Modify();
-
-		FMCPDiagnostic PatchDiagnostic;
-		if (!MCPObjectUtils::ApplyPatch(ConfigObject, PatchOperations, ChangedProperties, PatchDiagnostic))
+	return FMCPToolsSettingsProjectHandler::HandleProjectPatch(
+		Request,
+		OutResult,
+		[](const FString& ClassPath, UClass*& OutClass, UObject*& OutConfigObject, FMCPDiagnostic& OutDiagnostic)
 		{
-			Transaction.Cancel();
-			OutResult.Diagnostics.Add(PatchDiagnostic);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-
-		ConfigObject->PostEditChange();
-		ConfigObject->MarkPackageDirty();
-		bPersistSucceeded = PersistConfigObject(ConfigObject, SaveOptions, SavedConfigFiles, bVerified, OutResult);
-	}
-
-	MCPObjectUtils::AppendTouchedPackage(ConfigObject, OutResult.TouchedPackages);
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetStringField(TEXT("mode"), Mode);
-	OutResult.ResultObject->SetStringField(TEXT("class_path"), SettingsClass->GetClassPathName().ToString());
-	OutResult.ResultObject->SetArrayField(TEXT("changed_properties"), ToJsonStringArray(ChangedProperties));
-	OutResult.ResultObject->SetStringField(TEXT("confirm_token"), PreviewToken);
-	OutResult.ResultObject->SetArrayField(TEXT("saved_config_files"), ToJsonStringArray(SavedConfigFiles));
-	OutResult.ResultObject->SetBoolField(TEXT("verified"), bVerified);
-	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(OutResult.TouchedPackages));
-
-	if (!Mode.Equals(TEXT("preview")) && SaveOptions.bReloadVerify && SaveOptions.bSaveConfig && !bVerified)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SETTINGS_VERIFY_FAILED;
-		Diagnostic.Severity = TEXT("warning");
-		Diagnostic.Message = TEXT("Settings reload verification did not run.");
-		Diagnostic.Detail = SettingsClass->GetClassPathName().ToString();
-		OutResult.Diagnostics.Add(Diagnostic);
-	}
-
-	if (Mode.Equals(TEXT("preview")))
-	{
-		OutResult.Status = EMCPResponseStatus::Ok;
-		return true;
-	}
-
-	OutResult.Status = bPersistSucceeded ? EMCPResponseStatus::Ok : EMCPResponseStatus::Partial;
-	return true;
+			return ResolveSettingsClass(ClassPath, OutClass, OutConfigObject, OutDiagnostic);
+		},
+		[](const TArray<TSharedPtr<FJsonValue>>* PatchOperations, UObject* TargetObject, TArray<FString>& OutChangedProperties, FMCPDiagnostic& OutDiagnostic)
+		{
+			return ParseTopLevelPatchProperties(PatchOperations, TargetObject, OutChangedProperties, OutDiagnostic);
+		},
+		[](const FString& ClassPath, const TArray<TSharedPtr<FJsonValue>>* PatchOperations, const FMCPToolSettingsSaveOptions& SaveOptions)
+		{
+			FMCPSettingsSaveOptions InternalSaveOptions;
+			InternalSaveOptions.bSaveConfig = SaveOptions.bSaveConfig;
+			InternalSaveOptions.bFlushIni = SaveOptions.bFlushIni;
+			InternalSaveOptions.bReloadVerify = SaveOptions.bReloadVerify;
+			return BuildSettingsPatchSignature(ClassPath, PatchOperations, InternalSaveOptions);
+		},
+		[this](const FString& Signature)
+		{
+			return BuildSettingsConfirmationToken(Signature);
+		},
+		[this](const FString& Token, const FString& Signature)
+		{
+			return ConsumeSettingsConfirmationToken(Token, Signature);
+		},
+		[](UObject* ConfigObject, const FMCPToolSettingsSaveOptions& SaveOptions, TArray<FString>& OutSavedConfigFiles, bool& bOutVerified, FMCPToolExecutionResult& InOutResult)
+		{
+			FMCPSettingsSaveOptions InternalSaveOptions;
+			InternalSaveOptions.bSaveConfig = SaveOptions.bSaveConfig;
+			InternalSaveOptions.bFlushIni = SaveOptions.bFlushIni;
+			InternalSaveOptions.bReloadVerify = SaveOptions.bReloadVerify;
+			return PersistConfigObject(ConfigObject, InternalSaveOptions, OutSavedConfigFiles, bOutVerified, InOutResult);
+		});
 }
 
 bool UMCPToolRegistrySubsystem::HandleSettingsProjectApply(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	if (!Request.Params.IsValid())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("params are required for settings.project.apply.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	FMCPRequestEnvelope ApplyRequest = Request;
-	ApplyRequest.Params = MakeShared<FJsonObject>(*Request.Params);
-	ApplyRequest.Params->SetStringField(TEXT("mode"), TEXT("apply"));
-	return HandleSettingsProjectPatch(ApplyRequest, OutResult);
+	return FMCPToolsSettingsProjectHandler::HandleProjectApply(
+		Request,
+		OutResult,
+		[](const FString& ClassPath, UClass*& OutClass, UObject*& OutConfigObject, FMCPDiagnostic& OutDiagnostic)
+		{
+			return ResolveSettingsClass(ClassPath, OutClass, OutConfigObject, OutDiagnostic);
+		},
+		[](const TArray<TSharedPtr<FJsonValue>>* PatchOperations, UObject* TargetObject, TArray<FString>& OutChangedProperties, FMCPDiagnostic& OutDiagnostic)
+		{
+			return ParseTopLevelPatchProperties(PatchOperations, TargetObject, OutChangedProperties, OutDiagnostic);
+		},
+		[](const FString& ClassPath, const TArray<TSharedPtr<FJsonValue>>* PatchOperations, const FMCPToolSettingsSaveOptions& SaveOptions)
+		{
+			FMCPSettingsSaveOptions InternalSaveOptions;
+			InternalSaveOptions.bSaveConfig = SaveOptions.bSaveConfig;
+			InternalSaveOptions.bFlushIni = SaveOptions.bFlushIni;
+			InternalSaveOptions.bReloadVerify = SaveOptions.bReloadVerify;
+			return BuildSettingsPatchSignature(ClassPath, PatchOperations, InternalSaveOptions);
+		},
+		[this](const FString& Signature)
+		{
+			return BuildSettingsConfirmationToken(Signature);
+		},
+		[this](const FString& Token, const FString& Signature)
+		{
+			return ConsumeSettingsConfirmationToken(Token, Signature);
+		},
+		[](UObject* ConfigObject, const FMCPToolSettingsSaveOptions& SaveOptions, TArray<FString>& OutSavedConfigFiles, bool& bOutVerified, FMCPToolExecutionResult& InOutResult)
+		{
+			FMCPSettingsSaveOptions InternalSaveOptions;
+			InternalSaveOptions.bSaveConfig = SaveOptions.bSaveConfig;
+			InternalSaveOptions.bFlushIni = SaveOptions.bFlushIni;
+			InternalSaveOptions.bReloadVerify = SaveOptions.bReloadVerify;
+			return PersistConfigObject(ConfigObject, InternalSaveOptions, OutSavedConfigFiles, bOutVerified, InOutResult);
+		});
 }
 
 bool UMCPToolRegistrySubsystem::HandleSettingsGameModeGet(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	(void)Request;
-
-	UGameMapsSettings* GameMapsSettings = GetMutableDefault<UGameMapsSettings>();
-	if (GameMapsSettings == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SETTINGS_CLASS_NOT_FOUND;
-		Diagnostic.Message = TEXT("UGameMapsSettings default object is unavailable.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	TArray<TSharedPtr<FJsonValue>> RawMapOverrides;
-	if (!GetGameModeMapOverrideRawArray(GameMapsSettings, RawMapOverrides))
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SETTINGS_VERIFY_FAILED;
-		Diagnostic.Message = TEXT("Failed to inspect GameModeMapPrefixes from UGameMapsSettings.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetStringField(TEXT("class_path"), UGameMapsSettings::StaticClass()->GetClassPathName().ToString());
-	OutResult.ResultObject->SetStringField(TEXT("config_file"), GameMapsSettings->GetDefaultConfigFilename());
-	OutResult.ResultObject->SetStringField(TEXT("global_default_game_mode"), UGameMapsSettings::GetGlobalDefaultGameMode());
-	OutResult.ResultObject->SetStringField(TEXT("global_default_server_game_mode"), GetSettingsStringProperty(GameMapsSettings, TEXT("GlobalDefaultServerGameMode")));
-	OutResult.ResultObject->SetArrayField(TEXT("map_overrides"), BuildMapOverrideEntriesFromRaw(RawMapOverrides));
-	OutResult.Status = EMCPResponseStatus::Ok;
-	return true;
+	return FMCPToolsSettingsGameModeHandler::HandleGameModeGet(
+		Request,
+		OutResult,
+		[](UObject* ConfigObject, const FString& PropertyName)
+		{
+			return GetSettingsStringProperty(ConfigObject, PropertyName);
+		},
+		[](UObject* ConfigObject, TArray<TSharedPtr<FJsonValue>>& OutRawArray)
+		{
+			return GetGameModeMapOverrideRawArray(ConfigObject, OutRawArray);
+		},
+		[](const TArray<TSharedPtr<FJsonValue>>& RawArray)
+		{
+			return BuildMapOverrideEntriesFromRaw(RawArray);
+		});
 }
 
 bool UMCPToolRegistrySubsystem::HandleSettingsGameModeSetDefault(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString GameModeClassPath;
-	FString ServerGameModeClassPath;
-	FMCPSettingsSaveOptions SaveOptions;
-
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("game_mode_class_path"), GameModeClassPath);
-		Request.Params->TryGetStringField(TEXT("server_game_mode_class_path"), ServerGameModeClassPath);
-		ParseSettingsSaveOptions(Request.Params, SaveOptions);
-	}
-
-	if (GameModeClassPath.IsEmpty())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("game_mode_class_path is required for settings.gamemode.set_default.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	FMCPDiagnostic ClassDiagnostic;
-	FString ResolvedGameModeClassPath;
-	if (!ResolveGameModeClassPath(GameModeClassPath, ResolvedGameModeClassPath, ClassDiagnostic))
-	{
-		OutResult.Diagnostics.Add(ClassDiagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	FString ResolvedServerGameModeClassPath;
-	if (!ResolveGameModeClassPath(ServerGameModeClassPath, ResolvedServerGameModeClassPath, ClassDiagnostic))
-	{
-		OutResult.Diagnostics.Add(ClassDiagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UGameMapsSettings* GameMapsSettings = GetMutableDefault<UGameMapsSettings>();
-	if (GameMapsSettings == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SETTINGS_CLASS_NOT_FOUND;
-		Diagnostic.Message = TEXT("UGameMapsSettings default object is unavailable.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	TArray<FString> ChangedProperties;
-	const FString CurrentDefaultGameModeBefore = UGameMapsSettings::GetGlobalDefaultGameMode();
-	const FString CurrentServerGameModeBefore = GetSettingsStringProperty(GameMapsSettings, TEXT("GlobalDefaultServerGameMode"));
-	const bool bDefaultChanged = !CurrentDefaultGameModeBefore.Equals(ResolvedGameModeClassPath, ESearchCase::CaseSensitive);
-	if (bDefaultChanged)
-	{
-		ChangedProperties.Add(TEXT("GlobalDefaultGameMode"));
-	}
-	const bool bServerChanged =
-		!ServerGameModeClassPath.IsEmpty() &&
-		!CurrentServerGameModeBefore.Equals(ResolvedServerGameModeClassPath, ESearchCase::CaseSensitive);
-	if (bServerChanged)
-	{
-		ChangedProperties.Add(TEXT("GlobalDefaultServerGameMode"));
-	}
-
-	TArray<FString> SavedConfigFiles;
-	bool bVerified = false;
-	bool bPersistSucceeded = true;
-
-	if (!Request.Context.bDryRun && (bDefaultChanged || bServerChanged))
-	{
-		const FString TransactionLabel = ParseTransactionLabel(Request.Params, TEXT("MCP GameMode Set Default"));
-		FScopedTransaction Transaction(FText::FromString(TransactionLabel));
-		GameMapsSettings->Modify();
-		if (bDefaultChanged)
+	return FMCPToolsSettingsGameModeHandler::HandleGameModeSetDefault(
+		Request,
+		OutResult,
+		[](const FString& InputClassPath, FString& OutResolvedPath, FMCPDiagnostic& OutDiagnostic)
 		{
-			UGameMapsSettings::SetGlobalDefaultGameMode(ResolvedGameModeClassPath);
-		}
-
-		if (bServerChanged)
+			return ResolveGameModeClassPath(InputClassPath, OutResolvedPath, OutDiagnostic);
+		},
+		[](UObject* ConfigObject, const FString& PropertyName)
 		{
-			TSharedRef<FJsonObject> PatchEntry = MakeShared<FJsonObject>();
-			PatchEntry->SetStringField(TEXT("op"), TEXT("replace"));
-			PatchEntry->SetStringField(TEXT("path"), TEXT("/GlobalDefaultServerGameMode"));
-			PatchEntry->SetField(TEXT("value"), MakeShared<FJsonValueString>(ResolvedServerGameModeClassPath));
-			const TArray<TSharedPtr<FJsonValue>> PatchOperations{ MakeShared<FJsonValueObject>(PatchEntry) };
-
-			FMCPDiagnostic PatchDiagnostic;
-			TArray<FString> PatchedProperties;
-			if (!MCPObjectUtils::ApplyPatch(GameMapsSettings, &PatchOperations, PatchedProperties, PatchDiagnostic))
-			{
-				Transaction.Cancel();
-				OutResult.Diagnostics.Add(PatchDiagnostic);
-				OutResult.Status = EMCPResponseStatus::Error;
-				return false;
-			}
-		}
-
-		GameMapsSettings->PostEditChange();
-		GameMapsSettings->MarkPackageDirty();
-		bPersistSucceeded = PersistConfigObject(GameMapsSettings, SaveOptions, SavedConfigFiles, bVerified, OutResult);
-	}
-
-	MCPObjectUtils::AppendTouchedPackage(GameMapsSettings, OutResult.TouchedPackages);
-	const FString CurrentDefaultGameModeAfter = UGameMapsSettings::GetGlobalDefaultGameMode();
-	const FString CurrentServerGameModeAfter = GetSettingsStringProperty(GameMapsSettings, TEXT("GlobalDefaultServerGameMode"));
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetArrayField(TEXT("changed_properties"), ToJsonStringArray(ChangedProperties));
-	OutResult.ResultObject->SetStringField(TEXT("global_default_game_mode"), CurrentDefaultGameModeAfter);
-	OutResult.ResultObject->SetStringField(TEXT("global_default_server_game_mode"), CurrentServerGameModeAfter);
-	OutResult.ResultObject->SetArrayField(TEXT("saved_config_files"), ToJsonStringArray(SavedConfigFiles));
-	OutResult.ResultObject->SetBoolField(TEXT("verified"), bVerified);
-	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(OutResult.TouchedPackages));
-	OutResult.Status = bPersistSucceeded ? EMCPResponseStatus::Ok : EMCPResponseStatus::Partial;
-	return true;
+			return GetSettingsStringProperty(ConfigObject, PropertyName);
+		},
+		[](UObject* ConfigObject, const FMCPToolSettingsSaveOptions& SaveOptions, TArray<FString>& OutSavedConfigFiles, bool& bOutVerified, FMCPToolExecutionResult& InOutResult)
+		{
+			FMCPSettingsSaveOptions InternalSaveOptions;
+			InternalSaveOptions.bSaveConfig = SaveOptions.bSaveConfig;
+			InternalSaveOptions.bFlushIni = SaveOptions.bFlushIni;
+			InternalSaveOptions.bReloadVerify = SaveOptions.bReloadVerify;
+			return PersistConfigObject(ConfigObject, InternalSaveOptions, OutSavedConfigFiles, bOutVerified, InOutResult);
+		});
 }
 
 bool UMCPToolRegistrySubsystem::HandleSettingsGameModeSetMapOverride(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString MapKey;
-	FString GameModeClassPath;
-	FMCPSettingsSaveOptions SaveOptions;
-
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("map_key"), MapKey);
-		Request.Params->TryGetStringField(TEXT("game_mode_class_path"), GameModeClassPath);
-		ParseSettingsSaveOptions(Request.Params, SaveOptions);
-	}
-
-	MapKey.TrimStartAndEndInline();
-	if (MapKey.IsEmpty() || GameModeClassPath.IsEmpty())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("map_key and game_mode_class_path are required for settings.gamemode.set_map_override.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	FMCPDiagnostic ClassDiagnostic;
-	FString ResolvedGameModeClassPath;
-	if (!ResolveGameModeClassPath(GameModeClassPath, ResolvedGameModeClassPath, ClassDiagnostic))
-	{
-		OutResult.Diagnostics.Add(ClassDiagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UGameMapsSettings* GameMapsSettings = GetMutableDefault<UGameMapsSettings>();
-	if (GameMapsSettings == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SETTINGS_CLASS_NOT_FOUND;
-		Diagnostic.Message = TEXT("UGameMapsSettings default object is unavailable.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	TArray<TSharedPtr<FJsonValue>> CurrentRawArray;
-	if (!GetGameModeMapOverrideRawArray(GameMapsSettings, CurrentRawArray))
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SETTINGS_VERIFY_FAILED;
-		Diagnostic.Message = TEXT("Failed to inspect GameModeMapPrefixes from UGameMapsSettings.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	auto GetRawEntryName = [](const TSharedPtr<FJsonValue>& EntryValue) -> FString
-	{
-		if (!EntryValue.IsValid() || EntryValue->Type != EJson::Object)
+	return FMCPToolsSettingsGameModeHandler::HandleGameModeSetMapOverride(
+		Request,
+		OutResult,
+		[](const FString& InputClassPath, FString& OutResolvedPath, FMCPDiagnostic& OutDiagnostic)
 		{
-			return FString();
-		}
-		const TSharedPtr<FJsonObject> EntryObject = EntryValue->AsObject();
-		FString Name;
-		EntryObject->TryGetStringField(TEXT("Name"), Name);
-		if (Name.IsEmpty())
+			return ResolveGameModeClassPath(InputClassPath, OutResolvedPath, OutDiagnostic);
+		},
+		[](UObject* ConfigObject, TArray<TSharedPtr<FJsonValue>>& OutRawArray)
 		{
-			EntryObject->TryGetStringField(TEXT("name"), Name);
-		}
-		return Name;
-	};
-
-	auto GetRawEntryGameMode = [](const TSharedPtr<FJsonValue>& EntryValue) -> FString
-	{
-		if (!EntryValue.IsValid() || EntryValue->Type != EJson::Object)
+			return GetGameModeMapOverrideRawArray(ConfigObject, OutRawArray);
+		},
+		[](const TSharedPtr<FJsonObject>& RawEntry, FString& OutClassPath)
 		{
-			return FString();
-		}
-		const TSharedPtr<FJsonObject> EntryObject = EntryValue->AsObject();
-		FString GameMode;
-		TryGetMapOverrideGameModeClassPath(EntryObject, GameMode);
-		return GameMode;
-	};
-
-	TArray<TSharedPtr<FJsonValue>> UpdatedRawArray = CurrentRawArray;
-	int32 ExistingIndex = INDEX_NONE;
-	for (int32 Index = 0; Index < UpdatedRawArray.Num(); ++Index)
-	{
-		if (GetRawEntryName(UpdatedRawArray[Index]).Equals(MapKey, ESearchCase::IgnoreCase))
+			return TryGetMapOverrideGameModeClassPath(RawEntry, OutClassPath);
+		},
+		[](const FString& ClassPath)
 		{
-			ExistingIndex = Index;
-			break;
-		}
-	}
-
-	const bool bUpdated = ExistingIndex != INDEX_NONE;
-	bool bChanged = true;
-	if (ExistingIndex != INDEX_NONE)
-	{
-		bChanged = !GetRawEntryGameMode(UpdatedRawArray[ExistingIndex]).Equals(ResolvedGameModeClassPath, ESearchCase::CaseSensitive);
-		if (bChanged)
+			return BuildSoftClassPathJsonValue(ClassPath);
+		},
+		[](const TArray<TSharedPtr<FJsonValue>>& RawArray)
 		{
-			TSharedRef<FJsonObject> UpdatedObject = MakeShared<FJsonObject>();
-			UpdatedObject->SetStringField(TEXT("Name"), MapKey);
-			UpdatedObject->SetField(TEXT("GameMode"), BuildSoftClassPathJsonValue(ResolvedGameModeClassPath));
-			UpdatedRawArray[ExistingIndex] = MakeShared<FJsonValueObject>(UpdatedObject);
-		}
-	}
-	else
-	{
-		TSharedRef<FJsonObject> NewEntry = MakeShared<FJsonObject>();
-		NewEntry->SetStringField(TEXT("Name"), MapKey);
-		NewEntry->SetField(TEXT("GameMode"), BuildSoftClassPathJsonValue(ResolvedGameModeClassPath));
-		UpdatedRawArray.Add(MakeShared<FJsonValueObject>(NewEntry));
-	}
-
-	TArray<FString> SavedConfigFiles;
-	bool bVerified = false;
-	bool bPersistSucceeded = true;
-	TArray<FString> ChangedProperties;
-
-	if (bChanged)
-	{
-		TSharedRef<FJsonObject> PatchEntry = MakeShared<FJsonObject>();
-		PatchEntry->SetStringField(TEXT("op"), TEXT("replace"));
-		PatchEntry->SetStringField(TEXT("path"), TEXT("/GameModeMapPrefixes"));
-		PatchEntry->SetField(TEXT("value"), MakeShared<FJsonValueArray>(UpdatedRawArray));
-		const TArray<TSharedPtr<FJsonValue>> PatchOperations{ MakeShared<FJsonValueObject>(PatchEntry) };
-
-		FMCPDiagnostic PatchDiagnostic;
-		if (Request.Context.bDryRun)
+			return BuildMapOverrideEntriesFromRaw(RawArray);
+		},
+		[](const TArray<TSharedPtr<FJsonValue>>* PatchOperations, UObject* TargetObject, TArray<FString>& OutChangedProperties, FMCPDiagnostic& OutDiagnostic)
 		{
-			if (!ParseTopLevelPatchProperties(&PatchOperations, GameMapsSettings, ChangedProperties, PatchDiagnostic))
-			{
-				OutResult.Diagnostics.Add(PatchDiagnostic);
-				OutResult.Status = EMCPResponseStatus::Error;
-				return false;
-			}
-		}
-		else
+			return ParseTopLevelPatchProperties(PatchOperations, TargetObject, OutChangedProperties, OutDiagnostic);
+		},
+		[](UObject* ConfigObject, const FMCPToolSettingsSaveOptions& SaveOptions, TArray<FString>& OutSavedConfigFiles, bool& bOutVerified, FMCPToolExecutionResult& InOutResult)
 		{
-			const FString TransactionLabel = ParseTransactionLabel(Request.Params, TEXT("MCP GameMode Set Map Override"));
-			FScopedTransaction Transaction(FText::FromString(TransactionLabel));
-			GameMapsSettings->Modify();
-
-			if (!MCPObjectUtils::ApplyPatch(GameMapsSettings, &PatchOperations, ChangedProperties, PatchDiagnostic))
-			{
-				Transaction.Cancel();
-				OutResult.Diagnostics.Add(PatchDiagnostic);
-				OutResult.Status = EMCPResponseStatus::Error;
-				return false;
-			}
-
-			GameMapsSettings->PostEditChange();
-			GameMapsSettings->MarkPackageDirty();
-			bPersistSucceeded = PersistConfigObject(GameMapsSettings, SaveOptions, SavedConfigFiles, bVerified, OutResult);
-		}
-	}
-
-	TArray<TSharedPtr<FJsonValue>> ResultRawArray = UpdatedRawArray;
-	if (!Request.Context.bDryRun && !GetGameModeMapOverrideRawArray(GameMapsSettings, ResultRawArray))
-	{
-		ResultRawArray = UpdatedRawArray;
-	}
-
-	MCPObjectUtils::AppendTouchedPackage(GameMapsSettings, OutResult.TouchedPackages);
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetStringField(TEXT("map_key"), MapKey);
-	OutResult.ResultObject->SetBoolField(TEXT("updated"), bUpdated);
-	OutResult.ResultObject->SetStringField(TEXT("game_mode_class_path"), ResolvedGameModeClassPath);
-	OutResult.ResultObject->SetArrayField(TEXT("map_overrides"), BuildMapOverrideEntriesFromRaw(ResultRawArray));
-	OutResult.ResultObject->SetArrayField(TEXT("changed_properties"), ToJsonStringArray(ChangedProperties));
-	OutResult.ResultObject->SetArrayField(TEXT("saved_config_files"), ToJsonStringArray(SavedConfigFiles));
-	OutResult.ResultObject->SetBoolField(TEXT("verified"), bVerified);
-	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(OutResult.TouchedPackages));
-	OutResult.Status = bPersistSucceeded ? EMCPResponseStatus::Ok : EMCPResponseStatus::Partial;
-	return true;
+			FMCPSettingsSaveOptions InternalSaveOptions;
+			InternalSaveOptions.bSaveConfig = SaveOptions.bSaveConfig;
+			InternalSaveOptions.bFlushIni = SaveOptions.bFlushIni;
+			InternalSaveOptions.bReloadVerify = SaveOptions.bReloadVerify;
+			return PersistConfigObject(ConfigObject, InternalSaveOptions, OutSavedConfigFiles, bOutVerified, InOutResult);
+		});
 }
 
 bool UMCPToolRegistrySubsystem::HandleSettingsGameModeRemoveMapOverride(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString MapKey;
-	FMCPSettingsSaveOptions SaveOptions;
-
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("map_key"), MapKey);
-		ParseSettingsSaveOptions(Request.Params, SaveOptions);
-	}
-
-	MapKey.TrimStartAndEndInline();
-	if (MapKey.IsEmpty())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("map_key is required for settings.gamemode.remove_map_override.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UGameMapsSettings* GameMapsSettings = GetMutableDefault<UGameMapsSettings>();
-	if (GameMapsSettings == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SETTINGS_CLASS_NOT_FOUND;
-		Diagnostic.Message = TEXT("UGameMapsSettings default object is unavailable.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	TArray<TSharedPtr<FJsonValue>> CurrentRawArray;
-	if (!GetGameModeMapOverrideRawArray(GameMapsSettings, CurrentRawArray))
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SETTINGS_VERIFY_FAILED;
-		Diagnostic.Message = TEXT("Failed to inspect GameModeMapPrefixes from UGameMapsSettings.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	auto GetRawEntryName = [](const TSharedPtr<FJsonValue>& EntryValue) -> FString
-	{
-		if (!EntryValue.IsValid() || EntryValue->Type != EJson::Object)
+	return FMCPToolsSettingsGameModeHandler::HandleGameModeRemoveMapOverride(
+		Request,
+		OutResult,
+		[](UObject* ConfigObject, TArray<TSharedPtr<FJsonValue>>& OutRawArray)
 		{
-			return FString();
-		}
-		const TSharedPtr<FJsonObject> EntryObject = EntryValue->AsObject();
-		FString Name;
-		EntryObject->TryGetStringField(TEXT("Name"), Name);
-		if (Name.IsEmpty())
+			return GetGameModeMapOverrideRawArray(ConfigObject, OutRawArray);
+		},
+		[](const TArray<TSharedPtr<FJsonValue>>& RawArray)
 		{
-			EntryObject->TryGetStringField(TEXT("name"), Name);
-		}
-		return Name;
-	};
-
-	TArray<TSharedPtr<FJsonValue>> UpdatedRawArray;
-	UpdatedRawArray.Reserve(CurrentRawArray.Num());
-	int32 RemovedCount = 0;
-	for (const TSharedPtr<FJsonValue>& EntryValue : CurrentRawArray)
-	{
-		if (GetRawEntryName(EntryValue).Equals(MapKey, ESearchCase::IgnoreCase))
+			return BuildMapOverrideEntriesFromRaw(RawArray);
+		},
+		[](const TArray<TSharedPtr<FJsonValue>>* PatchOperations, UObject* TargetObject, TArray<FString>& OutChangedProperties, FMCPDiagnostic& OutDiagnostic)
 		{
-			RemovedCount++;
-			continue;
-		}
-		UpdatedRawArray.Add(EntryValue);
-	}
-
-	if (RemovedCount == 0)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::GAMEMODE_OVERRIDE_NOT_FOUND;
-		Diagnostic.Message = TEXT("No map override entry matched map_key.");
-		Diagnostic.Detail = MapKey;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	TArray<FString> SavedConfigFiles;
-	bool bVerified = false;
-	bool bPersistSucceeded = true;
-	TArray<FString> ChangedProperties;
-
-	TSharedRef<FJsonObject> PatchEntry = MakeShared<FJsonObject>();
-	PatchEntry->SetStringField(TEXT("op"), TEXT("replace"));
-	PatchEntry->SetStringField(TEXT("path"), TEXT("/GameModeMapPrefixes"));
-	PatchEntry->SetField(TEXT("value"), MakeShared<FJsonValueArray>(UpdatedRawArray));
-	const TArray<TSharedPtr<FJsonValue>> PatchOperations{ MakeShared<FJsonValueObject>(PatchEntry) };
-
-	FMCPDiagnostic PatchDiagnostic;
-	if (Request.Context.bDryRun)
-	{
-		if (!ParseTopLevelPatchProperties(&PatchOperations, GameMapsSettings, ChangedProperties, PatchDiagnostic))
+			return ParseTopLevelPatchProperties(PatchOperations, TargetObject, OutChangedProperties, OutDiagnostic);
+		},
+		[](UObject* ConfigObject, const FMCPToolSettingsSaveOptions& SaveOptions, TArray<FString>& OutSavedConfigFiles, bool& bOutVerified, FMCPToolExecutionResult& InOutResult)
 		{
-			OutResult.Diagnostics.Add(PatchDiagnostic);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-	}
-	else
-	{
-		const FString TransactionLabel = ParseTransactionLabel(Request.Params, TEXT("MCP GameMode Remove Map Override"));
-		FScopedTransaction Transaction(FText::FromString(TransactionLabel));
-		GameMapsSettings->Modify();
-
-		if (!MCPObjectUtils::ApplyPatch(GameMapsSettings, &PatchOperations, ChangedProperties, PatchDiagnostic))
-		{
-			Transaction.Cancel();
-			OutResult.Diagnostics.Add(PatchDiagnostic);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-
-		GameMapsSettings->PostEditChange();
-		GameMapsSettings->MarkPackageDirty();
-		bPersistSucceeded = PersistConfigObject(GameMapsSettings, SaveOptions, SavedConfigFiles, bVerified, OutResult);
-	}
-
-	TArray<TSharedPtr<FJsonValue>> ResultRawArray = UpdatedRawArray;
-	if (!Request.Context.bDryRun && !GetGameModeMapOverrideRawArray(GameMapsSettings, ResultRawArray))
-	{
-		ResultRawArray = UpdatedRawArray;
-	}
-
-	MCPObjectUtils::AppendTouchedPackage(GameMapsSettings, OutResult.TouchedPackages);
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetStringField(TEXT("map_key"), MapKey);
-	OutResult.ResultObject->SetNumberField(TEXT("removed_count"), RemovedCount);
-	OutResult.ResultObject->SetArrayField(TEXT("map_overrides"), BuildMapOverrideEntriesFromRaw(ResultRawArray));
-	OutResult.ResultObject->SetArrayField(TEXT("changed_properties"), ToJsonStringArray(ChangedProperties));
-	OutResult.ResultObject->SetArrayField(TEXT("saved_config_files"), ToJsonStringArray(SavedConfigFiles));
-	OutResult.ResultObject->SetBoolField(TEXT("verified"), bVerified);
-	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(OutResult.TouchedPackages));
-	OutResult.Status = bPersistSucceeded ? EMCPResponseStatus::Ok : EMCPResponseStatus::Partial;
-	return true;
+			FMCPSettingsSaveOptions InternalSaveOptions;
+			InternalSaveOptions.bSaveConfig = SaveOptions.bSaveConfig;
+			InternalSaveOptions.bFlushIni = SaveOptions.bFlushIni;
+			InternalSaveOptions.bReloadVerify = SaveOptions.bReloadVerify;
+			return PersistConfigObject(ConfigObject, InternalSaveOptions, OutSavedConfigFiles, bOutVerified, InOutResult);
+		});
 }
 
 FString UMCPToolRegistrySubsystem::BuildDeleteConfirmationToken(const TArray<FString>& ObjectPaths, const bool bFailIfReferenced) const
@@ -7833,4379 +1961,458 @@ void UMCPToolRegistrySubsystem::ReclaimExpiredSettingsConfirmationTokens() const
 
 bool UMCPToolRegistrySubsystem::HandleObjectInspect(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	const TSharedPtr<FJsonObject>* TargetObject = nullptr;
-	const TSharedPtr<FJsonObject>* FiltersObject = nullptr;
-	int32 Depth = 2;
-
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetObjectField(TEXT("target"), TargetObject);
-		Request.Params->TryGetObjectField(TEXT("filters"), FiltersObject);
-
-		double DepthNumber = static_cast<double>(Depth);
-		Request.Params->TryGetNumberField(TEXT("depth"), DepthNumber);
-		Depth = FMath::Clamp(static_cast<int32>(DepthNumber), 0, 5);
-	}
-
-	if (TargetObject == nullptr || !TargetObject->IsValid())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("target is required for object.inspect.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UObject* ResolvedObject = nullptr;
-	FMCPDiagnostic ResolveDiagnostic;
-	if (!MCPObjectUtils::ResolveTargetObject(*TargetObject, ResolvedObject, ResolveDiagnostic))
-	{
-		OutResult.Diagnostics.Add(ResolveDiagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	TArray<TSharedPtr<FJsonValue>> Properties;
-	MCPObjectUtils::InspectObject(
-		ResolvedObject,
-		(FiltersObject != nullptr) ? *FiltersObject : nullptr,
-		Depth,
-		Properties);
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetArrayField(TEXT("properties"), Properties);
-	OutResult.Status = EMCPResponseStatus::Ok;
-	return true;
+	return FMCPToolsObjectHandler::HandleInspect(Request, OutResult);
 }
 
 bool UMCPToolRegistrySubsystem::HandleObjectPatch(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	const TSharedPtr<FJsonObject>* TargetObject = nullptr;
-	const TArray<TSharedPtr<FJsonValue>>* PatchOperations = nullptr;
-	FString TransactionLabel = TEXT("MCP Patch");
-
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetObjectField(TEXT("target"), TargetObject);
-		Request.Params->TryGetArrayField(TEXT("patch"), PatchOperations);
-
-		const TSharedPtr<FJsonObject>* TransactionObject = nullptr;
-		if (Request.Params->TryGetObjectField(TEXT("transaction"), TransactionObject) && TransactionObject != nullptr && TransactionObject->IsValid())
-		{
-			(*TransactionObject)->TryGetStringField(TEXT("label"), TransactionLabel);
-		}
-	}
-
-	if (TargetObject == nullptr || !TargetObject->IsValid() || PatchOperations == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("target and patch are required for object.patch.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UObject* ResolvedObject = nullptr;
-	FMCPDiagnostic ResolveDiagnostic;
-	if (!MCPObjectUtils::ResolveTargetObject(*TargetObject, ResolvedObject, ResolveDiagnostic))
-	{
-		OutResult.Diagnostics.Add(ResolveDiagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	TArray<FString> ChangedProperties;
-	FMCPDiagnostic PatchDiagnostic;
-
-	if (Request.Context.bDryRun)
-	{
-		for (const TSharedPtr<FJsonValue>& PatchValue : *PatchOperations)
-		{
-			if (!PatchValue.IsValid() || PatchValue->Type != EJson::Object)
-			{
-				continue;
-			}
-
-			const TSharedPtr<FJsonObject> PatchObject = PatchValue->AsObject();
-			FString PropertyPath;
-			PatchObject->TryGetStringField(TEXT("path"), PropertyPath);
-			TArray<FString> Tokens;
-			PropertyPath.ParseIntoArray(Tokens, TEXT("/"), true);
-			if (Tokens.Num() == 1)
-			{
-				ChangedProperties.AddUnique(Tokens[0]);
-			}
-		}
-	}
-	else
-	{
-		FScopedTransaction Transaction(FText::FromString(TransactionLabel));
-		ResolvedObject->Modify();
-		if (!MCPObjectUtils::ApplyPatch(ResolvedObject, PatchOperations, ChangedProperties, PatchDiagnostic))
-		{
-			Transaction.Cancel();
-			OutResult.Diagnostics.Add(PatchDiagnostic);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-
-		ResolvedObject->PostEditChange();
-		ResolvedObject->MarkPackageDirty();
-	}
-
-	MCPObjectUtils::AppendTouchedPackage(ResolvedObject, OutResult.TouchedPackages);
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetArrayField(TEXT("changed_properties"), ToJsonStringArray(ChangedProperties));
-	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(OutResult.TouchedPackages));
-	OutResult.Status = EMCPResponseStatus::Ok;
-	return true;
+	return FMCPToolsObjectHandler::HandlePatch(Request, OutResult);
 }
 
 bool UMCPToolRegistrySubsystem::HandleWorldOutlinerList(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	UWorld* World = GetEditorWorld();
-	if (World == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::INTERNAL_EXCEPTION;
-		Diagnostic.Message = TEXT("Editor world is unavailable.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	int32 Limit = 200;
-	const int32 Cursor = ParseCursor(Request.Params);
-	bool bIncludeClassPath = true;
-	bool bIncludeFolderPath = true;
-	bool bIncludeTags = false;
-	bool bIncludeTransform = false;
-	FString NameGlob;
-	TSet<FString> AllowedClassPaths;
-
-	if (Request.Params.IsValid())
-	{
-		double LimitNumber = static_cast<double>(Limit);
-		Request.Params->TryGetNumberField(TEXT("limit"), LimitNumber);
-		Limit = FMath::Clamp(static_cast<int32>(LimitNumber), 1, 2000);
-
-		const TSharedPtr<FJsonObject>* IncludeObject = nullptr;
-		if (Request.Params->TryGetObjectField(TEXT("include"), IncludeObject) && IncludeObject != nullptr && IncludeObject->IsValid())
-		{
-			(*IncludeObject)->TryGetBoolField(TEXT("class"), bIncludeClassPath);
-			(*IncludeObject)->TryGetBoolField(TEXT("folder_path"), bIncludeFolderPath);
-			(*IncludeObject)->TryGetBoolField(TEXT("tags"), bIncludeTags);
-			(*IncludeObject)->TryGetBoolField(TEXT("transform"), bIncludeTransform);
-		}
-
-		const TSharedPtr<FJsonObject>* FiltersObject = nullptr;
-		if (Request.Params->TryGetObjectField(TEXT("filters"), FiltersObject) && FiltersObject != nullptr && FiltersObject->IsValid())
-		{
-			(*FiltersObject)->TryGetStringField(TEXT("name_glob"), NameGlob);
-			const TArray<TSharedPtr<FJsonValue>>* ClassPathArray = nullptr;
-			if ((*FiltersObject)->TryGetArrayField(TEXT("class_path_in"), ClassPathArray) && ClassPathArray != nullptr)
-			{
-				for (const TSharedPtr<FJsonValue>& ClassPathValue : *ClassPathArray)
-				{
-					FString ClassPath;
-					if (ClassPathValue.IsValid() && ClassPathValue->TryGetString(ClassPath) && !ClassPath.IsEmpty())
-					{
-						AllowedClassPaths.Add(ClassPath);
-					}
-				}
-			}
-		}
-	}
-
-	TArray<TSharedPtr<FJsonObject>> AllNodes;
-	TSet<FString> FolderPaths;
-	USelection* Selection = GEditor ? GEditor->GetSelectedActors() : nullptr;
-
-	for (TActorIterator<AActor> It(World); It; ++It)
-	{
-		AActor* Actor = *It;
-		if (Actor == nullptr)
-		{
-			continue;
-		}
-
-		const FString ActorLabel = Actor->GetActorLabel();
-		if (!NameGlob.IsEmpty() && !ActorLabel.MatchesWildcard(NameGlob))
-		{
-			continue;
-		}
-
-		const FString ClassPath = Actor->GetClass() ? Actor->GetClass()->GetPathName() : FString();
-		if (AllowedClassPaths.Num() > 0 && !AllowedClassPaths.Contains(ClassPath))
-		{
-			continue;
-		}
-
-		const FString FolderPath = Actor->GetFolderPath().ToString();
-		if (bIncludeFolderPath && !FolderPath.IsEmpty())
-		{
-			FolderPaths.Add(FolderPath);
-		}
-
-		TSharedRef<FJsonObject> NodeObject = MakeShared<FJsonObject>();
-		NodeObject->SetStringField(TEXT("node_type"), TEXT("actor"));
-		NodeObject->SetStringField(TEXT("id"), Actor->GetActorGuid().IsValid() ? Actor->GetActorGuid().ToString(EGuidFormats::DigitsWithHyphens) : MCPObjectUtils::BuildActorPath(Actor));
-		NodeObject->SetStringField(TEXT("name"), ActorLabel);
-		NodeObject->SetStringField(TEXT("actor_path"), MCPObjectUtils::BuildActorPath(Actor));
-		NodeObject->SetStringField(TEXT("folder_path"), FolderPath);
-		NodeObject->SetStringField(TEXT("parent_id"), FolderPath.IsEmpty() ? TEXT("") : FString::Printf(TEXT("folder:%s"), *FolderPath));
-		NodeObject->SetStringField(TEXT("class_path"), bIncludeClassPath ? ClassPath : TEXT(""));
-		NodeObject->SetBoolField(TEXT("is_selected"), Selection != nullptr && Selection->IsSelected(Actor));
-		NodeObject->SetBoolField(TEXT("is_hidden_in_editor"), Actor->IsHiddenEd());
-
-		if (bIncludeTags)
-		{
-			TArray<FString> TagStrings;
-			TagStrings.Reserve(Actor->Tags.Num());
-			for (const FName& Tag : Actor->Tags)
-			{
-				TagStrings.Add(Tag.ToString());
-			}
-			NodeObject->SetArrayField(TEXT("tags"), ToJsonStringArray(TagStrings));
-		}
-
-		if (bIncludeTransform)
-		{
-			const FTransform Transform = Actor->GetActorTransform();
-			TSharedRef<FJsonObject> TransformObject = MakeShared<FJsonObject>();
-			TransformObject->SetStringField(TEXT("location"), Transform.GetLocation().ToCompactString());
-			TransformObject->SetStringField(TEXT("rotation"), Transform.GetRotation().Rotator().ToCompactString());
-			TransformObject->SetStringField(TEXT("scale"), Transform.GetScale3D().ToCompactString());
-			NodeObject->SetObjectField(TEXT("transform"), TransformObject);
-		}
-
-		AllNodes.Add(NodeObject);
-	}
-
-	if (bIncludeFolderPath)
-	{
-		TArray<FString> SortedFolders = FolderPaths.Array();
-		SortedFolders.Sort();
-		for (const FString& FolderPath : SortedFolders)
-		{
-			TSharedRef<FJsonObject> FolderNode = MakeShared<FJsonObject>();
-			FolderNode->SetStringField(TEXT("node_type"), TEXT("folder"));
-			FolderNode->SetStringField(TEXT("id"), FString::Printf(TEXT("folder:%s"), *FolderPath));
-			FolderNode->SetStringField(TEXT("folder_path"), FolderPath);
-
-			FString ParentFolderPath;
-			FString FolderName = FolderPath;
-			int32 SeparatorIndex = INDEX_NONE;
-			if (FolderPath.FindLastChar(TEXT('/'), SeparatorIndex))
-			{
-				FolderName = FolderPath.Mid(SeparatorIndex + 1);
-				ParentFolderPath = FolderPath.Left(SeparatorIndex);
-			}
-
-			FolderNode->SetStringField(TEXT("name"), FolderName);
-			FolderNode->SetStringField(TEXT("parent_id"), ParentFolderPath.IsEmpty() ? TEXT("") : FString::Printf(TEXT("folder:%s"), *ParentFolderPath));
-			AllNodes.Add(FolderNode);
-		}
-	}
-
-	AllNodes.Sort([](const TSharedPtr<FJsonObject>& Left, const TSharedPtr<FJsonObject>& Right)
-	{
-		FString LeftType;
-		FString RightType;
-		Left->TryGetStringField(TEXT("node_type"), LeftType);
-		Right->TryGetStringField(TEXT("node_type"), RightType);
-		if (LeftType != RightType)
-		{
-			return LeftType < RightType;
-		}
-
-		FString LeftName;
-		FString RightName;
-		Left->TryGetStringField(TEXT("name"), LeftName);
-		Right->TryGetStringField(TEXT("name"), RightName);
-		return LeftName < RightName;
-	});
-
-	const int32 SafeCursor = FMath::Max(0, Cursor);
-	const int32 EndIndex = FMath::Min(SafeCursor + Limit, AllNodes.Num());
-	TArray<TSharedPtr<FJsonValue>> OutputNodes;
-	for (int32 Index = SafeCursor; Index < EndIndex; ++Index)
-	{
-		OutputNodes.Add(MakeShared<FJsonValueObject>(AllNodes[Index].ToSharedRef()));
-	}
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetArrayField(TEXT("nodes"), OutputNodes);
-	if (EndIndex < AllNodes.Num())
-	{
-		OutResult.ResultObject->SetStringField(TEXT("next_cursor"), FString::FromInt(EndIndex));
-	}
-	OutResult.Status = EMCPResponseStatus::Ok;
-	return true;
+	return FMCPToolsWorldHandler::HandleOutlinerList(Request, OutResult);
 }
 
 bool UMCPToolRegistrySubsystem::HandleWorldSelectionGet(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	(void)Request;
-
-	USelection* Selection = GEditor ? GEditor->GetSelectedActors() : nullptr;
-	TArray<FString> SelectedActorPaths;
-	if (Selection != nullptr)
-	{
-		for (FSelectionIterator It(*Selection); It; ++It)
-		{
-			AActor* Actor = Cast<AActor>(*It);
-			if (Actor != nullptr)
-			{
-				SelectedActorPaths.Add(MCPObjectUtils::BuildActorPath(Actor));
-			}
-		}
-	}
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetArrayField(TEXT("actors"), ToJsonStringArray(SelectedActorPaths));
-	OutResult.Status = EMCPResponseStatus::Ok;
-	return true;
+	return FMCPToolsWorldHandler::HandleSelectionGet(Request, OutResult);
 }
 
 bool UMCPToolRegistrySubsystem::HandleWorldSelectionSet(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	UWorld* World = GetEditorWorld();
-	if (World == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::INTERNAL_EXCEPTION;
-		Diagnostic.Message = TEXT("Editor world is unavailable.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	FString Mode = TEXT("replace");
-	const TArray<TSharedPtr<FJsonValue>>* ActorValues = nullptr;
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("mode"), Mode);
-		Request.Params->TryGetArrayField(TEXT("actors"), ActorValues);
-	}
-
-	if (ActorValues == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("actors array is required for world.selection.set.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	if (Mode.Equals(TEXT("replace"), ESearchCase::IgnoreCase))
-	{
-		GEditor->SelectNone(false, true, false);
-	}
-
-	int32 MissingActorCount = 0;
-	for (const TSharedPtr<FJsonValue>& ActorValue : *ActorValues)
-	{
-		FString ActorReference;
-		if (!ActorValue.IsValid() || !ActorValue->TryGetString(ActorReference) || ActorReference.IsEmpty())
-		{
-			continue;
-		}
-
-		AActor* Actor = FindActorByReference(World, ActorReference);
-		if (Actor == nullptr)
-		{
-			++MissingActorCount;
-			FMCPDiagnostic Diagnostic;
-			Diagnostic.Code = MCPErrorCodes::OBJECT_NOT_FOUND;
-			Diagnostic.Severity = TEXT("warning");
-			Diagnostic.Message = TEXT("Actor reference could not be resolved.");
-			Diagnostic.Detail = ActorReference;
-			Diagnostic.bRetriable = true;
-			OutResult.Diagnostics.Add(Diagnostic);
-			continue;
-		}
-
-		if (Mode.Equals(TEXT("remove"), ESearchCase::IgnoreCase))
-		{
-			GEditor->SelectActor(Actor, false, false, true);
-		}
-		else
-		{
-			GEditor->SelectActor(Actor, true, false, true);
-		}
-	}
-
-	GEditor->NoteSelectionChange();
-
-	USelection* Selection = GEditor->GetSelectedActors();
-	TArray<FString> SelectedActorPaths;
-	for (FSelectionIterator It(*Selection); It; ++It)
-	{
-		AActor* Actor = Cast<AActor>(*It);
-		if (Actor != nullptr)
-		{
-			SelectedActorPaths.Add(MCPObjectUtils::BuildActorPath(Actor));
-		}
-	}
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetArrayField(TEXT("selected"), ToJsonStringArray(SelectedActorPaths));
-	OutResult.Status = (MissingActorCount > 0 && SelectedActorPaths.Num() > 0) ? EMCPResponseStatus::Partial : EMCPResponseStatus::Ok;
-	if (MissingActorCount > 0 && SelectedActorPaths.Num() == 0)
-	{
-		OutResult.Status = EMCPResponseStatus::Error;
-	}
-
-	return OutResult.Status != EMCPResponseStatus::Error;
+	return FMCPToolsWorldHandler::HandleSelectionSet(Request, OutResult);
 }
 
 bool UMCPToolRegistrySubsystem::HandleMatInstanceParamsGet(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString ObjectPath;
-	bool bIncludeInherited = true;
-	TSet<FString> AllowedKinds;
-
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
-		Request.Params->TryGetBoolField(TEXT("include_inherited"), bIncludeInherited);
-
-		const TArray<TSharedPtr<FJsonValue>>* Kinds = nullptr;
-		if (Request.Params->TryGetArrayField(TEXT("kinds"), Kinds) && Kinds != nullptr)
-		{
-			for (const TSharedPtr<FJsonValue>& KindValue : *Kinds)
-			{
-				FString Kind;
-				if (KindValue.IsValid() && KindValue->TryGetString(Kind))
-				{
-					AllowedKinds.Add(Kind);
-				}
-			}
-		}
-	}
-
-	if (ObjectPath.IsEmpty())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("object_path is required for mat.instance.params.get.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UMaterialInstance* MaterialInstance = LoadObject<UMaterialInstance>(nullptr, *ObjectPath);
-	if (MaterialInstance == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::OBJECT_NOT_FOUND;
-		Diagnostic.Message = TEXT("Material instance not found.");
-		Diagnostic.Detail = ObjectPath;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	(void)bIncludeInherited;
-	TArray<TSharedPtr<FJsonValue>> Params;
-
-	if (IsKindAllowed(AllowedKinds, TEXT("scalar")))
-	{
-		TArray<FMaterialParameterInfo> Infos;
-		TArray<FGuid> Ids;
-		MaterialInstance->GetAllScalarParameterInfo(Infos, Ids);
-		for (const FMaterialParameterInfo& Info : Infos)
-		{
-			float Value = 0.0f;
-			if (!MaterialInstance->GetScalarParameterValue(Info, Value))
-			{
-				continue;
-			}
-
-			TSharedRef<FJsonObject> ParamObject = MakeShared<FJsonObject>();
-			ParamObject->SetStringField(TEXT("name"), Info.Name.ToString());
-			ParamObject->SetStringField(TEXT("kind"), TEXT("scalar"));
-			ParamObject->SetNumberField(TEXT("value"), Value);
-			ParamObject->SetBoolField(TEXT("overridden"), true);
-			ParamObject->SetStringField(TEXT("source"), TEXT("local"));
-			Params.Add(MakeShared<FJsonValueObject>(ParamObject));
-		}
-	}
-
-	if (IsKindAllowed(AllowedKinds, TEXT("vector")))
-	{
-		TArray<FMaterialParameterInfo> Infos;
-		TArray<FGuid> Ids;
-		MaterialInstance->GetAllVectorParameterInfo(Infos, Ids);
-		for (const FMaterialParameterInfo& Info : Infos)
-		{
-			FLinearColor Value = FLinearColor::Black;
-			if (!MaterialInstance->GetVectorParameterValue(Info, Value))
-			{
-				continue;
-			}
-
-			TSharedRef<FJsonObject> ValueObject = MakeShared<FJsonObject>();
-			ValueObject->SetNumberField(TEXT("r"), Value.R);
-			ValueObject->SetNumberField(TEXT("g"), Value.G);
-			ValueObject->SetNumberField(TEXT("b"), Value.B);
-			ValueObject->SetNumberField(TEXT("a"), Value.A);
-
-			TSharedRef<FJsonObject> ParamObject = MakeShared<FJsonObject>();
-			ParamObject->SetStringField(TEXT("name"), Info.Name.ToString());
-			ParamObject->SetStringField(TEXT("kind"), TEXT("vector"));
-			ParamObject->SetObjectField(TEXT("value"), ValueObject);
-			ParamObject->SetBoolField(TEXT("overridden"), true);
-			ParamObject->SetStringField(TEXT("source"), TEXT("local"));
-			Params.Add(MakeShared<FJsonValueObject>(ParamObject));
-		}
-	}
-
-	if (IsKindAllowed(AllowedKinds, TEXT("texture")))
-	{
-		TArray<FMaterialParameterInfo> Infos;
-		TArray<FGuid> Ids;
-		MaterialInstance->GetAllTextureParameterInfo(Infos, Ids);
-		for (const FMaterialParameterInfo& Info : Infos)
-		{
-			UTexture* Value = nullptr;
-			if (!MaterialInstance->GetTextureParameterValue(Info, Value))
-			{
-				continue;
-			}
-
-			TSharedRef<FJsonObject> ParamObject = MakeShared<FJsonObject>();
-			ParamObject->SetStringField(TEXT("name"), Info.Name.ToString());
-			ParamObject->SetStringField(TEXT("kind"), TEXT("texture"));
-			ParamObject->SetStringField(TEXT("value"), Value ? Value->GetPathName() : TEXT(""));
-			ParamObject->SetBoolField(TEXT("overridden"), true);
-			ParamObject->SetStringField(TEXT("source"), TEXT("local"));
-			Params.Add(MakeShared<FJsonValueObject>(ParamObject));
-		}
-	}
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetArrayField(TEXT("params"), Params);
-	OutResult.Status = EMCPResponseStatus::Ok;
-	return true;
+	return FMCPToolsMaterialHandler::HandleInstanceParamsGet(Request, OutResult);
 }
 
 bool UMCPToolRegistrySubsystem::HandleMatInstanceParamsSet(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString ObjectPath;
-	FString Recompile = TEXT("auto");
-	const TArray<TSharedPtr<FJsonValue>>* SetValues = nullptr;
-	const TArray<TSharedPtr<FJsonValue>>* ClearValues = nullptr;
-
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
-		Request.Params->TryGetStringField(TEXT("recompile"), Recompile);
-		Request.Params->TryGetArrayField(TEXT("set"), SetValues);
-		Request.Params->TryGetArrayField(TEXT("clear"), ClearValues);
-	}
-
-	if (ObjectPath.IsEmpty())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("object_path is required for mat.instance.params.set.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UMaterialInstanceConstant* MaterialInstance = LoadObject<UMaterialInstanceConstant>(nullptr, *ObjectPath);
-	if (MaterialInstance == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::OBJECT_NOT_FOUND;
-		Diagnostic.Message = TEXT("Material instance constant not found.");
-		Diagnostic.Detail = ObjectPath;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	TArray<FString> UpdatedNames;
-	FScopedTransaction Transaction(FText::FromString(TEXT("MCP Material Params Set")));
-	MaterialInstance->Modify();
-
-	auto EmitParamNotFound = [&OutResult](const FString& Name, const FString& Kind)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::MATERIAL_PARAM_NOT_FOUND;
-		Diagnostic.Severity = TEXT("warning");
-		Diagnostic.Message = TEXT("Unsupported or invalid material parameter update request.");
-		Diagnostic.Detail = FString::Printf(TEXT("name=%s kind=%s"), *Name, *Kind);
-		Diagnostic.bRetriable = false;
-		OutResult.Diagnostics.Add(Diagnostic);
-	};
-
-	if (SetValues != nullptr)
-	{
-		for (const TSharedPtr<FJsonValue>& SetValue : *SetValues)
-		{
-			if (!SetValue.IsValid() || SetValue->Type != EJson::Object)
-			{
-				continue;
-			}
-
-			const TSharedPtr<FJsonObject> SetObject = SetValue->AsObject();
-			FString Name;
-			FString Kind;
-			SetObject->TryGetStringField(TEXT("name"), Name);
-			SetObject->TryGetStringField(TEXT("kind"), Kind);
-			const TSharedPtr<FJsonValue>* ValueField = SetObject->Values.Find(TEXT("value"));
-
-			if (Name.IsEmpty() || Kind.IsEmpty() || ValueField == nullptr || !ValueField->IsValid())
-			{
-				continue;
-			}
-
-				const FMaterialParameterInfo ParamInfo{ FName(*Name) };
-			if (Kind.Equals(TEXT("scalar"), ESearchCase::IgnoreCase))
-			{
-				double ScalarValue = 0;
-				if ((*ValueField)->TryGetNumber(ScalarValue))
-				{
-						MaterialInstance->SetScalarParameterValueEditorOnly(ParamInfo, static_cast<float>(ScalarValue));
-					UpdatedNames.AddUnique(Name);
-				}
-				else
-				{
-					EmitParamNotFound(Name, Kind);
-				}
-				continue;
-			}
-
-			if (Kind.Equals(TEXT("vector"), ESearchCase::IgnoreCase))
-			{
-				FLinearColor ColorValue = FLinearColor::Black;
-				if (JsonToLinearColor(*ValueField, ColorValue))
-				{
-						MaterialInstance->SetVectorParameterValueEditorOnly(ParamInfo, ColorValue);
-					UpdatedNames.AddUnique(Name);
-				}
-				else
-				{
-					EmitParamNotFound(Name, Kind);
-				}
-				continue;
-			}
-
-			if (Kind.Equals(TEXT("texture"), ESearchCase::IgnoreCase))
-			{
-				FString TexturePath;
-				if ((*ValueField)->TryGetString(TexturePath))
-				{
-					UTexture* Texture = TexturePath.IsEmpty() ? nullptr : LoadObject<UTexture>(nullptr, *TexturePath);
-						MaterialInstance->SetTextureParameterValueEditorOnly(ParamInfo, Texture);
-					UpdatedNames.AddUnique(Name);
-				}
-				else
-				{
-					EmitParamNotFound(Name, Kind);
-				}
-				continue;
-			}
-
-			EmitParamNotFound(Name, Kind);
-		}
-	}
-
-	if (ClearValues != nullptr)
-	{
-		for (const TSharedPtr<FJsonValue>& ClearValue : *ClearValues)
-		{
-			if (!ClearValue.IsValid() || ClearValue->Type != EJson::Object)
-			{
-				continue;
-			}
-
-			const TSharedPtr<FJsonObject> ClearObject = ClearValue->AsObject();
-			FString Name;
-			FString Kind;
-			ClearObject->TryGetStringField(TEXT("name"), Name);
-			ClearObject->TryGetStringField(TEXT("kind"), Kind);
-			if (Name.IsEmpty() || Kind.IsEmpty())
-			{
-				continue;
-			}
-
-				const FMaterialParameterInfo ParamInfo{ FName(*Name) };
-			if (Kind.Equals(TEXT("scalar"), ESearchCase::IgnoreCase))
-			{
-					MaterialInstance->SetScalarParameterValueEditorOnly(ParamInfo, 0.0f);
-				UpdatedNames.AddUnique(Name);
-			}
-			else if (Kind.Equals(TEXT("vector"), ESearchCase::IgnoreCase))
-			{
-					MaterialInstance->SetVectorParameterValueEditorOnly(ParamInfo, FLinearColor::Black);
-				UpdatedNames.AddUnique(Name);
-			}
-			else if (Kind.Equals(TEXT("texture"), ESearchCase::IgnoreCase))
-			{
-					MaterialInstance->SetTextureParameterValueEditorOnly(ParamInfo, nullptr);
-				UpdatedNames.AddUnique(Name);
-			}
-			else
-			{
-				EmitParamNotFound(Name, Kind);
-			}
-		}
-	}
-
-	if (!Request.Context.bDryRun)
-	{
-		MaterialInstance->PostEditChange();
-		MaterialInstance->MarkPackageDirty();
-	}
-	else
-	{
-		Transaction.Cancel();
-	}
-
-	MCPObjectUtils::AppendTouchedPackage(MaterialInstance, OutResult.TouchedPackages);
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetArrayField(TEXT("updated"), ToJsonStringArray(UpdatedNames));
-	OutResult.ResultObject->SetStringField(TEXT("compile_status"), Recompile.Equals(TEXT("never"), ESearchCase::IgnoreCase) ? TEXT("skipped") : TEXT("unknown"));
-	OutResult.Status = OutResult.Diagnostics.Num() > 0 ? EMCPResponseStatus::Partial : EMCPResponseStatus::Ok;
-	return true;
+	return FMCPToolsMaterialHandler::HandleInstanceParamsSet(Request, OutResult);
 }
 
 bool UMCPToolRegistrySubsystem::HandleNiagaraParamsGet(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString ObjectPath;
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
-	}
-
-	if (ObjectPath.IsEmpty())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("object_path is required for niagara.params.get.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UObject* NiagaraObject = LoadObject<UObject>(nullptr, *ObjectPath);
-	if (NiagaraObject == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::OBJECT_NOT_FOUND;
-		Diagnostic.Message = TEXT("Niagara object not found.");
-		Diagnostic.Detail = ObjectPath;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	TArray<TSharedPtr<FJsonValue>> InspectedProperties;
-	MCPObjectUtils::InspectObject(NiagaraObject, nullptr, 1, InspectedProperties);
-
-	TArray<TSharedPtr<FJsonValue>> Params;
-	for (const TSharedPtr<FJsonValue>& PropertyValue : InspectedProperties)
-	{
-		if (!PropertyValue.IsValid() || PropertyValue->Type != EJson::Object)
-		{
-			continue;
-		}
-
-		const TSharedPtr<FJsonObject> PropertyObject = PropertyValue->AsObject();
-		FString Name;
-		FString CppType;
-		PropertyObject->TryGetStringField(TEXT("name"), Name);
-		PropertyObject->TryGetStringField(TEXT("cpp_type"), CppType);
-		const TSharedPtr<FJsonValue>* ValueField = PropertyObject->Values.Find(TEXT("value"));
-
-		TSharedRef<FJsonObject> ParamObject = MakeShared<FJsonObject>();
-		ParamObject->SetStringField(TEXT("name"), Name);
-		ParamObject->SetStringField(TEXT("type"), CppType);
-		ParamObject->SetField(TEXT("value"), ValueField != nullptr ? *ValueField : MakeShared<FJsonValueNull>());
-		ParamObject->SetBoolField(TEXT("exposed"), true);
-		Params.Add(MakeShared<FJsonValueObject>(ParamObject));
-	}
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetArrayField(TEXT("params"), Params);
-	OutResult.ResultObject->SetStringField(TEXT("compile_status"), TEXT("unknown"));
-	OutResult.Status = EMCPResponseStatus::Ok;
-	return true;
+	return FMCPToolsNiagaraHandler::HandleParamsGet(Request, OutResult);
 }
 
 bool UMCPToolRegistrySubsystem::HandleNiagaraParamsSet(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString ObjectPath;
-	bool bStrictTypes = true;
-	const TArray<TSharedPtr<FJsonValue>>* SetValues = nullptr;
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
-		Request.Params->TryGetBoolField(TEXT("strict_types"), bStrictTypes);
-		Request.Params->TryGetArrayField(TEXT("set"), SetValues);
-	}
-
-	(void)bStrictTypes;
-
-	if (ObjectPath.IsEmpty() || SetValues == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("object_path and set are required for niagara.params.set.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UObject* NiagaraObject = LoadObject<UObject>(nullptr, *ObjectPath);
-	if (NiagaraObject == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::OBJECT_NOT_FOUND;
-		Diagnostic.Message = TEXT("Niagara object not found.");
-		Diagnostic.Detail = ObjectPath;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	TArray<TSharedPtr<FJsonValue>> PatchOperations;
-	TArray<FString> UpdatedNames;
-	for (const TSharedPtr<FJsonValue>& SetValue : *SetValues)
-	{
-		if (!SetValue.IsValid() || SetValue->Type != EJson::Object)
-		{
-			continue;
-		}
-
-		const TSharedPtr<FJsonObject> SetObject = SetValue->AsObject();
-		FString Name;
-		SetObject->TryGetStringField(TEXT("name"), Name);
-		const TSharedPtr<FJsonValue>* ValueField = SetObject->Values.Find(TEXT("value"));
-		if (Name.IsEmpty() || ValueField == nullptr || !ValueField->IsValid())
-		{
-			continue;
-		}
-
-		TSharedRef<FJsonObject> PatchObject = MakeShared<FJsonObject>();
-		PatchObject->SetStringField(TEXT("op"), TEXT("replace"));
-		PatchObject->SetStringField(TEXT("path"), FString::Printf(TEXT("/%s"), *Name));
-		PatchObject->SetField(TEXT("value"), *ValueField);
-		PatchOperations.Add(MakeShared<FJsonValueObject>(PatchObject));
-		UpdatedNames.AddUnique(Name);
-	}
-
-	FScopedTransaction Transaction(FText::FromString(TEXT("MCP Niagara Params Set")));
-	NiagaraObject->Modify();
-
-	FMCPDiagnostic PatchDiagnostic;
-	TArray<FString> ChangedProperties;
-	if (!MCPObjectUtils::ApplyPatch(NiagaraObject, &PatchOperations, ChangedProperties, PatchDiagnostic))
-	{
-		Transaction.Cancel();
-		OutResult.Diagnostics.Add(PatchDiagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	if (!Request.Context.bDryRun)
-	{
-		NiagaraObject->PostEditChange();
-		NiagaraObject->MarkPackageDirty();
-	}
-	else
-	{
-		Transaction.Cancel();
-	}
-
-	MCPObjectUtils::AppendTouchedPackage(NiagaraObject, OutResult.TouchedPackages);
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetArrayField(TEXT("updated"), ToJsonStringArray(UpdatedNames));
-	OutResult.ResultObject->SetStringField(TEXT("compile_status"), TEXT("unknown"));
-	OutResult.ResultObject->SetArrayField(TEXT("errors"), ToJsonStringArray({}));
-	OutResult.Status = EMCPResponseStatus::Ok;
-	return true;
+	return FMCPToolsNiagaraHandler::HandleParamsSet(Request, OutResult);
 }
 
 bool UMCPToolRegistrySubsystem::HandleNiagaraStackList(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString ObjectPath;
-	FString EmitterName;
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
-		Request.Params->TryGetStringField(TEXT("emitter_name"), EmitterName);
-	}
-
-	if (ObjectPath.IsEmpty())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("object_path is required for niagara.stack.list.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UObject* NiagaraObject = LoadObject<UObject>(nullptr, *ObjectPath);
-	if (NiagaraObject == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::OBJECT_NOT_FOUND;
-		Diagnostic.Message = TEXT("Niagara object not found.");
-		Diagnostic.Detail = ObjectPath;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	TSharedRef<FJsonObject> ModuleObject = MakeShared<FJsonObject>();
-	ModuleObject->SetStringField(TEXT("module_key"), BuildNiagaraCompatModuleKey(ObjectPath));
-	ModuleObject->SetStringField(TEXT("display_name"), TEXT("CompatibilityParameters"));
-	ModuleObject->SetBoolField(TEXT("enabled"), true);
-	ModuleObject->SetStringField(TEXT("category"), EmitterName.IsEmpty() ? TEXT("compat") : EmitterName);
-
-	TArray<TSharedPtr<FJsonValue>> Modules;
-	Modules.Add(MakeShared<FJsonValueObject>(ModuleObject));
-
-	FMCPDiagnostic Diagnostic;
-	Diagnostic.Code = MCPErrorCodes::NIAGARA_MODULE_KEY_NOT_FOUND;
-	Diagnostic.Severity = TEXT("info");
-	Diagnostic.Message = TEXT("Niagara stack adapter is running in compatibility mode.");
-	Diagnostic.Suggestion = TEXT("Use returned module_key for niagara.stack.module.set_param.");
-	OutResult.Diagnostics.Add(Diagnostic);
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetArrayField(TEXT("modules"), Modules);
-	OutResult.Status = EMCPResponseStatus::Ok;
-	return true;
+	return FMCPToolsNiagaraHandler::HandleStackList(Request, OutResult);
 }
 
 bool UMCPToolRegistrySubsystem::HandleNiagaraStackModuleSetParam(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString ObjectPath;
-	FString ModuleKey;
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
-		Request.Params->TryGetStringField(TEXT("module_key"), ModuleKey);
-	}
-
-	if (ObjectPath.IsEmpty())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("object_path is required for niagara.stack.module.set_param.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	const FString ExpectedModuleKey = BuildNiagaraCompatModuleKey(ObjectPath);
-	if (!ModuleKey.Equals(ExpectedModuleKey, ESearchCase::IgnoreCase))
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::NIAGARA_MODULE_KEY_NOT_FOUND;
-		Diagnostic.Message = TEXT("module_key does not match compatibility key for the target object.");
-		Diagnostic.Detail = FString::Printf(TEXT("expected=%s actual=%s"), *ExpectedModuleKey, *ModuleKey);
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	return HandleNiagaraParamsSet(Request, OutResult);
+	return FMCPToolsNiagaraHandler::HandleStackModuleSetParam(Request, OutResult);
 }
 
 bool UMCPToolRegistrySubsystem::HandleUMGWidgetClassList(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString ClassPathGlob = TEXT("/Script/UMG.*");
-	FString NameGlob;
-	bool bIncludeAbstract = false;
-	bool bIncludeDeprecated = false;
-	bool bIncludeEditorOnly = false;
-	int32 Limit = 200;
-	int32 Cursor = 0;
-
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("class_path_glob"), ClassPathGlob);
-		Request.Params->TryGetStringField(TEXT("name_glob"), NameGlob);
-		Request.Params->TryGetBoolField(TEXT("include_abstract"), bIncludeAbstract);
-		Request.Params->TryGetBoolField(TEXT("include_deprecated"), bIncludeDeprecated);
-		Request.Params->TryGetBoolField(TEXT("include_editor_only"), bIncludeEditorOnly);
-
-		double LimitNumber = static_cast<double>(Limit);
-		Request.Params->TryGetNumberField(TEXT("limit"), LimitNumber);
-		Limit = FMath::Clamp(static_cast<int32>(LimitNumber), 1, 2000);
-
-		double CursorNumber = static_cast<double>(Cursor);
-		Request.Params->TryGetNumberField(TEXT("cursor"), CursorNumber);
-		Cursor = FMath::Max(0, static_cast<int32>(CursorNumber));
-	}
-
-	struct FWidgetClassEntry
-	{
-		FString ClassPath;
-		FString ClassName;
-		FString ModulePath;
-		bool bIsAbstract = false;
-		bool bIsDeprecated = false;
-		bool bIsEditorOnly = false;
-	};
-
-	TArray<FWidgetClassEntry> Entries;
-	for (TObjectIterator<UClass> ClassIt; ClassIt; ++ClassIt)
-	{
-		UClass* WidgetClass = *ClassIt;
-		if (WidgetClass == nullptr || !WidgetClass->IsChildOf(UWidget::StaticClass()))
-		{
-			continue;
-		}
-
-		const FString ClassName = WidgetClass->GetName();
-		if (ClassName.StartsWith(TEXT("SKEL_")) || ClassName.StartsWith(TEXT("REINST_")))
-		{
-			continue;
-		}
-
-		const bool bIsAbstract = WidgetClass->HasAnyClassFlags(CLASS_Abstract);
-		const bool bIsDeprecated = WidgetClass->HasAnyClassFlags(CLASS_Deprecated | CLASS_NewerVersionExists);
-		const bool bIsEditorOnly = WidgetClass->IsEditorOnly();
-
-		if (!bIncludeAbstract && bIsAbstract)
-		{
-			continue;
-		}
-		if (!bIncludeDeprecated && bIsDeprecated)
-		{
-			continue;
-		}
-		if (!bIncludeEditorOnly && bIsEditorOnly)
-		{
-			continue;
-		}
-
-		const FString ClassPath = WidgetClass->GetClassPathName().ToString();
-		if (!ClassPathGlob.IsEmpty() && !ClassPath.MatchesWildcard(ClassPathGlob))
-		{
-			continue;
-		}
-		if (!NameGlob.IsEmpty() && !ClassName.MatchesWildcard(NameGlob))
-		{
-			continue;
-		}
-
-		FWidgetClassEntry Entry;
-		Entry.ClassPath = ClassPath;
-		Entry.ClassName = ClassName;
-		Entry.ModulePath = WidgetClass->GetClassPathName().GetPackageName().ToString();
-		Entry.bIsAbstract = bIsAbstract;
-		Entry.bIsDeprecated = bIsDeprecated;
-		Entry.bIsEditorOnly = bIsEditorOnly;
-		Entries.Add(MoveTemp(Entry));
-	}
-
-	Entries.Sort([](const FWidgetClassEntry& Left, const FWidgetClassEntry& Right)
-	{
-		return Left.ClassPath < Right.ClassPath;
-	});
-
-	const int32 SafeCursor = FMath::Clamp(Cursor, 0, Entries.Num());
-	const int32 EndIndex = FMath::Min(SafeCursor + Limit, Entries.Num());
-	TArray<TSharedPtr<FJsonValue>> ClassValues;
-	ClassValues.Reserve(EndIndex - SafeCursor);
-	for (int32 Index = SafeCursor; Index < EndIndex; ++Index)
-	{
-		const FWidgetClassEntry& Entry = Entries[Index];
-		TSharedRef<FJsonObject> ClassObject = MakeShared<FJsonObject>();
-		ClassObject->SetStringField(TEXT("class_path"), Entry.ClassPath);
-		ClassObject->SetStringField(TEXT("class_name"), Entry.ClassName);
-		ClassObject->SetStringField(TEXT("module_path"), Entry.ModulePath);
-		ClassObject->SetBoolField(TEXT("is_abstract"), Entry.bIsAbstract);
-		ClassObject->SetBoolField(TEXT("is_deprecated"), Entry.bIsDeprecated);
-		ClassObject->SetBoolField(TEXT("is_editor_only"), Entry.bIsEditorOnly);
-		ClassValues.Add(MakeShared<FJsonValueObject>(ClassObject));
-	}
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetArrayField(TEXT("classes"), ClassValues);
-	OutResult.ResultObject->SetNumberField(TEXT("total_count"), Entries.Num());
-	if (EndIndex < Entries.Num())
-	{
-		OutResult.ResultObject->SetStringField(TEXT("next_cursor"), FString::FromInt(EndIndex));
-	}
-	OutResult.Status = EMCPResponseStatus::Ok;
-	return true;
+	return FMCPToolsUMGReadHandler::HandleWidgetClassList(Request, OutResult);
 }
 
 bool UMCPToolRegistrySubsystem::HandleUMGWidgetAdd(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString ObjectPath;
-	FString WidgetClassPath;
-	FString WidgetName;
-	FString NamedSlotName;
-	const TSharedPtr<FJsonObject>* ParentRef = nullptr;
-	const TArray<TSharedPtr<FJsonValue>>* WidgetPatchOperations = nullptr;
-	const TArray<TSharedPtr<FJsonValue>>* SlotPatchOperations = nullptr;
-	bool bCompileOnSuccess = true;
-	bool bReplaceContent = false;
-	bool bAutoSave = false;
-	int32 InsertIndex = -1;
-
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
-		Request.Params->TryGetStringField(TEXT("widget_class_path"), WidgetClassPath);
-		Request.Params->TryGetStringField(TEXT("widget_name"), WidgetName);
-		Request.Params->TryGetStringField(TEXT("named_slot_name"), NamedSlotName);
-		Request.Params->TryGetObjectField(TEXT("parent_ref"), ParentRef);
-		Request.Params->TryGetArrayField(TEXT("widget_patch"), WidgetPatchOperations);
-		Request.Params->TryGetArrayField(TEXT("slot_patch"), SlotPatchOperations);
-		Request.Params->TryGetBoolField(TEXT("compile_on_success"), bCompileOnSuccess);
-		Request.Params->TryGetBoolField(TEXT("replace_content"), bReplaceContent);
-
-		double InsertIndexNumber = static_cast<double>(InsertIndex);
-		Request.Params->TryGetNumberField(TEXT("insert_index"), InsertIndexNumber);
-		InsertIndex = FMath::Clamp(static_cast<int32>(InsertIndexNumber), -1, 10000);
-		ParseAutoSaveOption(Request.Params, bAutoSave);
-	}
-
-	if (ObjectPath.IsEmpty() || WidgetClassPath.IsEmpty())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("object_path and widget_class_path are required for umg.widget.add.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UWidgetBlueprint* WidgetBlueprint = LoadWidgetBlueprintByPath(ObjectPath);
-	if (WidgetBlueprint == nullptr || WidgetBlueprint->WidgetTree == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::OBJECT_NOT_FOUND;
-		Diagnostic.Message = TEXT("Widget blueprint not found.");
-		Diagnostic.Detail = ObjectPath;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UClass* WidgetClass = ResolveWidgetClassByPath(WidgetClassPath);
-	if (WidgetClass == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("widget_class_path must resolve to a concrete UWidget class.");
-		Diagnostic.Detail = WidgetClassPath;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UWidget* ParentWidget = nullptr;
-	if (ParentRef != nullptr && ParentRef->IsValid())
-	{
-		ParentWidget = ResolveWidgetFromRef(WidgetBlueprint, ParentRef);
-		if (ParentWidget == nullptr)
+	return FMCPToolsUMGStructureHandler::HandleWidgetAdd(
+		Request,
+		OutResult,
+		[](const FString& ObjectPath) { return LoadWidgetBlueprintByPath(ObjectPath); },
+		[](UWidgetBlueprint* WidgetBlueprint, const TSharedPtr<FJsonObject>* WidgetRef)
 		{
-			FMCPDiagnostic Diagnostic;
-			Diagnostic.Code = MCPErrorCodes::UMG_WIDGET_NOT_FOUND;
-			Diagnostic.Message = TEXT("parent_ref could not be resolved.");
-			Diagnostic.Detail = ObjectPath;
-			OutResult.Diagnostics.Add(Diagnostic);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-	}
-	else if (WidgetBlueprint->WidgetTree->RootWidget != nullptr && NamedSlotName.IsEmpty())
-	{
-		ParentWidget = WidgetBlueprint->WidgetTree->RootWidget;
-	}
-
-	const FName GeneratedWidgetName = BuildUniqueWidgetName(WidgetBlueprint, WidgetClass, WidgetName);
-	if (GeneratedWidgetName.IsNone())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::INTERNAL_EXCEPTION;
-		Diagnostic.Message = TEXT("Failed to allocate widget name.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	TArray<FString> ChangedWidgetProperties;
-	TArray<FString> ChangedSlotProperties;
-	FString AddedWidgetId = FString::Printf(TEXT("name:%s"), *GeneratedWidgetName.ToString());
-	FString ParentId = ParentWidget ? GetWidgetStableId(WidgetBlueprint, ParentWidget) : FString();
-	FString SlotType;
-	FString ResolvedNamedSlotName;
-
-	if (!Request.Context.bDryRun)
-	{
-		EnsureWidgetGuidMap(WidgetBlueprint);
-		FScopedTransaction Transaction(FText::FromString(TEXT("MCP UMG Widget Add")));
-		WidgetBlueprint->Modify();
-
-		UWidget* NewWidget = WidgetBlueprint->WidgetTree->ConstructWidget<UWidget>(WidgetClass, GeneratedWidgetName);
-		if (NewWidget == nullptr)
+			return ResolveWidgetFromRef(WidgetBlueprint, WidgetRef);
+		},
+		[](const FString& WidgetClassPath)
 		{
-			Transaction.Cancel();
-			FMCPDiagnostic Diagnostic;
-			Diagnostic.Code = MCPErrorCodes::INTERNAL_EXCEPTION;
-			Diagnostic.Message = TEXT("Failed to construct widget instance.");
-			Diagnostic.Detail = WidgetClassPath;
-			OutResult.Diagnostics.Add(Diagnostic);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-
-		NewWidget->Modify();
-		FMCPDiagnostic AttachDiagnostic;
-		if (!AttachWidgetToParent(
-			WidgetBlueprint,
-			ParentWidget,
-			NewWidget,
-			InsertIndex,
-			bReplaceContent,
-			NamedSlotName,
-			ResolvedNamedSlotName,
-			SlotType,
-			AttachDiagnostic))
+			return ResolveWidgetClassByPath(WidgetClassPath);
+		},
+		[](UWidgetBlueprint* WidgetBlueprint, UClass* WidgetClass, const FString& WidgetName)
 		{
-			Transaction.Cancel();
-			OutResult.Diagnostics.Add(AttachDiagnostic);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-
-		EnsureWidgetGuidEntry(WidgetBlueprint, NewWidget);
-
-		if (WidgetPatchOperations != nullptr && WidgetPatchOperations->Num() > 0)
+			return BuildUniqueWidgetName(WidgetBlueprint, WidgetClass, WidgetName);
+		},
+		[](const UWidgetBlueprint* WidgetBlueprint, const UWidget* Widget)
 		{
-			FMCPDiagnostic PatchDiagnostic;
-			if (!MCPObjectUtils::ApplyPatch(NewWidget, WidgetPatchOperations, ChangedWidgetProperties, PatchDiagnostic))
-			{
-				Transaction.Cancel();
-				OutResult.Diagnostics.Add(PatchDiagnostic);
-				OutResult.Status = EMCPResponseStatus::Error;
-				return false;
-			}
-		}
-
-		if (SlotPatchOperations != nullptr && SlotPatchOperations->Num() > 0)
+			return GetWidgetStableId(WidgetBlueprint, Widget);
+		},
+		[](const UWidgetBlueprint* WidgetBlueprint, const UWidget* Widget)
 		{
-			if (NewWidget->Slot == nullptr)
-			{
-				Transaction.Cancel();
-				FMCPDiagnostic Diagnostic;
-				Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-				Diagnostic.Message = TEXT("slot_patch requires the widget to have a slot.");
-				OutResult.Diagnostics.Add(Diagnostic);
-				OutResult.Status = EMCPResponseStatus::Error;
-				return false;
-			}
-
-			NewWidget->Slot->Modify();
-			FMCPDiagnostic SlotPatchDiagnostic;
-			if (!MCPObjectUtils::ApplyPatch(NewWidget->Slot, SlotPatchOperations, ChangedSlotProperties, SlotPatchDiagnostic))
-			{
-				Transaction.Cancel();
-				OutResult.Diagnostics.Add(SlotPatchDiagnostic);
-				OutResult.Status = EMCPResponseStatus::Error;
-				return false;
-			}
-		}
-
-		NewWidget->PostEditChange();
-		if (NewWidget->Slot != nullptr)
+			return GetParentWidgetId(WidgetBlueprint, Widget);
+		},
+		[](const UWidgetBlueprint* WidgetBlueprint, const UWidget* Widget, FString* OutNamedSlotName)
 		{
-			NewWidget->Slot->PostEditChange();
-		}
-
-		EnsureWidgetGuidMap(WidgetBlueprint);
-		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WidgetBlueprint);
-		WidgetBlueprint->MarkPackageDirty();
-		AddedWidgetId = GetWidgetStableId(WidgetBlueprint, NewWidget);
-		ParentId = GetParentWidgetId(WidgetBlueprint, NewWidget);
-		SlotType = GetWidgetSlotType(WidgetBlueprint, NewWidget, &ResolvedNamedSlotName);
-	}
-	else
-	{
-		CollectChangedPropertiesFromPatchOperations(WidgetPatchOperations, ChangedWidgetProperties);
-		CollectChangedPropertiesFromPatchOperations(SlotPatchOperations, ChangedSlotProperties);
-
-		if (ParentWidget == nullptr && !NamedSlotName.IsEmpty())
+			return GetWidgetSlotType(WidgetBlueprint, Widget, OutNamedSlotName);
+		},
+		[](UPanelWidget* PanelWidget)
 		{
-			FName ResolvedNamedSlot = NAME_None;
-			FMCPDiagnostic NamedSlotDiagnostic;
-			if (!ResolveWidgetTreeNamedSlotName(WidgetBlueprint, NamedSlotName, ResolvedNamedSlot, NamedSlotDiagnostic))
-			{
-				OutResult.Diagnostics.Add(NamedSlotDiagnostic);
-				OutResult.Status = EMCPResponseStatus::Error;
-				return false;
-			}
-
-			ResolvedNamedSlotName = ResolvedNamedSlot.ToString();
-			if (WidgetBlueprint->WidgetTree->GetContentForSlot(ResolvedNamedSlot) != nullptr && !bReplaceContent)
-			{
-				FMCPDiagnostic Diagnostic;
-				Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-				Diagnostic.Message = TEXT("Target top-level named slot already has content. Set replace_content=true to replace it.");
-				Diagnostic.Detail = ResolvedNamedSlotName;
-				OutResult.Diagnostics.Add(Diagnostic);
-				OutResult.Status = EMCPResponseStatus::Error;
-				return false;
-			}
-
-			SlotType = FString::Printf(TEXT("NamedSlot:%s"), *ResolvedNamedSlotName);
-		}
-		else if (ParentWidget != nullptr)
+			return GetPanelSlotTypeName(PanelWidget);
+		},
+		[](UWidgetBlueprint* WidgetBlueprint, const FString& RequestedSlotName, FName& OutResolvedSlotName, FMCPDiagnostic& OutDiagnostic)
 		{
-			const bool bIsPanelParent = Cast<UPanelWidget>(ParentWidget) != nullptr;
-			const bool bIsContentParent = Cast<UContentWidget>(ParentWidget) != nullptr;
-			const bool bUseNamedSlot =
-				!NamedSlotName.IsEmpty() || (!bIsPanelParent && !bIsContentParent && Cast<INamedSlotInterface>(ParentWidget) != nullptr);
-			if (bUseNamedSlot)
-			{
-				FName ResolvedNamedSlot = NAME_None;
-				FMCPDiagnostic NamedSlotDiagnostic;
-				if (!ResolveNamedSlotName(ParentWidget, NamedSlotName, ResolvedNamedSlot, NamedSlotDiagnostic))
-				{
-					OutResult.Diagnostics.Add(NamedSlotDiagnostic);
-					OutResult.Status = EMCPResponseStatus::Error;
-					return false;
-				}
-
-				ResolvedNamedSlotName = ResolvedNamedSlot.ToString();
-				if (INamedSlotInterface* NamedSlotHost = Cast<INamedSlotInterface>(ParentWidget))
-				{
-					if (NamedSlotHost->GetContentForSlot(ResolvedNamedSlot) != nullptr && !bReplaceContent)
-					{
-						FMCPDiagnostic Diagnostic;
-						Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-						Diagnostic.Message = TEXT("Target named slot already has content. Set replace_content=true to replace it.");
-						Diagnostic.Detail = ResolvedNamedSlotName;
-						OutResult.Diagnostics.Add(Diagnostic);
-						OutResult.Status = EMCPResponseStatus::Error;
-						return false;
-					}
-				}
-				SlotType = FString::Printf(TEXT("NamedSlot:%s"), *ResolvedNamedSlotName);
-			}
-			else if (UContentWidget* ContentParent = Cast<UContentWidget>(ParentWidget))
-			{
-				if (ContentParent->GetContent() != nullptr && !bReplaceContent)
-				{
-					FMCPDiagnostic Diagnostic;
-					Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-					Diagnostic.Message = TEXT("Target content widget already has a child. Set replace_content=true to replace it.");
-					OutResult.Diagnostics.Add(Diagnostic);
-					OutResult.Status = EMCPResponseStatus::Error;
-					return false;
-				}
-			}
-			else if (!Cast<UPanelWidget>(ParentWidget))
-			{
-				FMCPDiagnostic Diagnostic;
-				Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-				Diagnostic.Message = TEXT("parent_ref must point to a panel/content/named-slot widget.");
-				OutResult.Diagnostics.Add(Diagnostic);
-				OutResult.Status = EMCPResponseStatus::Error;
-				return false;
-			}
-
-			if (UPanelWidget* ParentPanel = Cast<UPanelWidget>(ParentWidget))
-			{
-				SlotType = GetPanelSlotTypeName(ParentPanel);
-			}
-		}
-		else if (WidgetBlueprint->WidgetTree->RootWidget != nullptr)
+			return ResolveWidgetTreeNamedSlotName(WidgetBlueprint, RequestedSlotName, OutResolvedSlotName, OutDiagnostic);
+		},
+		[](UWidget* ParentWidget, const FString& RequestedSlotName, FName& OutResolvedSlotName, FMCPDiagnostic& OutDiagnostic)
 		{
-			FMCPDiagnostic Diagnostic;
-			Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-			Diagnostic.Message = TEXT("WidgetTree root already exists. Provide parent_ref or named_slot_name.");
-			OutResult.Diagnostics.Add(Diagnostic);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-	}
-
-	TSharedRef<FJsonObject> CompileObject = MakeShared<FJsonObject>();
-	if (bCompileOnSuccess && !Request.Context.bDryRun)
-	{
-		FKismetEditorUtilities::CompileBlueprint(WidgetBlueprint);
-		CompileObject->SetStringField(TEXT("status"), TEXT("requested"));
-	}
-	else
-	{
-		CompileObject->SetStringField(TEXT("status"), TEXT("skipped"));
-	}
-
-	MCPObjectUtils::AppendTouchedPackage(WidgetBlueprint, OutResult.TouchedPackages);
-	bool bAllSaved = true;
-	if (!Request.Context.bDryRun && bAutoSave)
-	{
-		for (const FString& PackageName : OutResult.TouchedPackages)
+			return ResolveNamedSlotName(ParentWidget, RequestedSlotName, OutResolvedSlotName, OutDiagnostic);
+		},
+		[](UWidgetBlueprint* WidgetBlueprint,
+			UWidget* ParentWidget,
+			UWidget* ChildWidget,
+			int32 InsertIndex,
+			bool bReplaceContent,
+			const FString& NamedSlotName,
+			FString& OutResolvedNamedSlotName,
+			FString& OutSlotType,
+			FMCPDiagnostic& OutDiagnostic)
 		{
-			bAllSaved &= SavePackageByName(PackageName, OutResult);
-		}
-	}
-
-	TSharedRef<FJsonObject> WidgetObject = MakeShared<FJsonObject>();
-	WidgetObject->SetStringField(TEXT("widget_id"), AddedWidgetId);
-	WidgetObject->SetStringField(TEXT("name"), GeneratedWidgetName.ToString());
-	WidgetObject->SetStringField(TEXT("class_path"), WidgetClass->GetPathName());
-	WidgetObject->SetStringField(TEXT("parent_id"), ParentId);
-	WidgetObject->SetStringField(TEXT("slot_type"), SlotType);
-	if (!ResolvedNamedSlotName.IsEmpty())
-	{
-		WidgetObject->SetStringField(TEXT("named_slot_name"), ResolvedNamedSlotName);
-	}
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetBoolField(TEXT("created"), !Request.Context.bDryRun);
-	OutResult.ResultObject->SetBoolField(TEXT("dry_run"), Request.Context.bDryRun);
-	OutResult.ResultObject->SetObjectField(TEXT("widget"), WidgetObject);
-	OutResult.ResultObject->SetArrayField(TEXT("changed_properties"), ToJsonStringArray(ChangedWidgetProperties));
-	OutResult.ResultObject->SetArrayField(TEXT("slot_changed_properties"), ToJsonStringArray(ChangedSlotProperties));
-	OutResult.ResultObject->SetObjectField(TEXT("compile"), CompileObject);
-	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(OutResult.TouchedPackages));
-	OutResult.Status = bAllSaved ? EMCPResponseStatus::Ok : EMCPResponseStatus::Partial;
-	return true;
+			return AttachWidgetToParent(
+				WidgetBlueprint,
+				ParentWidget,
+				ChildWidget,
+				InsertIndex,
+				bReplaceContent,
+				NamedSlotName,
+				OutResolvedNamedSlotName,
+				OutSlotType,
+				OutDiagnostic);
+		},
+		[](UWidgetBlueprint* WidgetBlueprint)
+		{
+			EnsureWidgetGuidMap(WidgetBlueprint);
+		},
+		[](UWidgetBlueprint* WidgetBlueprint, UWidget* Widget)
+		{
+			EnsureWidgetGuidEntry(WidgetBlueprint, Widget);
+		},
+		[](const FString& PackageName, FMCPToolExecutionResult& InOutResult)
+		{
+			return SavePackageByName(PackageName, InOutResult);
+		});
 }
 
 bool UMCPToolRegistrySubsystem::HandleUMGWidgetRemove(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString ObjectPath;
-	const TSharedPtr<FJsonObject>* WidgetRef = nullptr;
-	bool bCompileOnSuccess = true;
-	bool bAutoSave = false;
-
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
-		Request.Params->TryGetObjectField(TEXT("widget_ref"), WidgetRef);
-		Request.Params->TryGetBoolField(TEXT("compile_on_success"), bCompileOnSuccess);
-		ParseAutoSaveOption(Request.Params, bAutoSave);
-	}
-
-	UWidgetBlueprint* WidgetBlueprint = LoadWidgetBlueprintByPath(ObjectPath);
-	UWidget* Widget = ResolveWidgetFromRef(WidgetBlueprint, WidgetRef);
-	if (WidgetBlueprint == nullptr || WidgetBlueprint->WidgetTree == nullptr || Widget == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::UMG_WIDGET_NOT_FOUND;
-		Diagnostic.Message = TEXT("object_path and widget_ref must resolve to an existing widget.");
-		Diagnostic.Detail = ObjectPath;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	const FString RemovedWidgetId = GetWidgetStableId(WidgetBlueprint, Widget);
-	const FString RemovedWidgetName = Widget->GetName();
-	const FString RemovedClassPath = Widget->GetClass() ? Widget->GetClass()->GetPathName() : FString();
-	const int32 RemovedChildrenCount = Cast<UPanelWidget>(Widget) ? Cast<UPanelWidget>(Widget)->GetChildrenCount() : 0;
-	const FString RemovedParentId = GetParentWidgetId(WidgetBlueprint, Widget);
-
-	bool bRemoved = true;
-	TArray<FName> RemovedVariableNames;
-	if (!Request.Context.bDryRun)
-	{
-		EnsureWidgetGuidMap(WidgetBlueprint);
-		CollectWidgetSubtreeVariableNames(Widget, RemovedVariableNames);
-		FScopedTransaction Transaction(FText::FromString(TEXT("MCP UMG Widget Remove")));
-		WidgetBlueprint->Modify();
-
-		bRemoved = WidgetBlueprint->WidgetTree->RemoveWidget(Widget);
-		if (!bRemoved)
+	return FMCPToolsUMGStructureHandler::HandleWidgetRemove(
+		Request,
+		OutResult,
+		[](const FString& ObjectPath) { return LoadWidgetBlueprintByPath(ObjectPath); },
+		[](UWidgetBlueprint* WidgetBlueprint, const TSharedPtr<FJsonObject>* WidgetRef)
 		{
-			Transaction.Cancel();
-			FMCPDiagnostic Diagnostic;
-			Diagnostic.Code = MCPErrorCodes::INTERNAL_EXCEPTION;
-			Diagnostic.Message = TEXT("Failed to remove widget from widget tree.");
-			Diagnostic.Detail = RemovedWidgetName;
-			OutResult.Diagnostics.Add(Diagnostic);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-
-		for (const FName& RemovedVariableName : RemovedVariableNames)
+			return ResolveWidgetFromRef(WidgetBlueprint, WidgetRef);
+		},
+		[](const UWidgetBlueprint* WidgetBlueprint, const UWidget* Widget)
 		{
-			RemoveWidgetGuidEntry(WidgetBlueprint, RemovedVariableName);
-		}
-
-		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WidgetBlueprint);
-		WidgetBlueprint->MarkPackageDirty();
-		EnsureWidgetGuidMap(WidgetBlueprint);
-	}
-
-	TSharedRef<FJsonObject> CompileObject = MakeShared<FJsonObject>();
-	if (bCompileOnSuccess && !Request.Context.bDryRun)
-	{
-		FKismetEditorUtilities::CompileBlueprint(WidgetBlueprint);
-		CompileObject->SetStringField(TEXT("status"), TEXT("requested"));
-	}
-	else
-	{
-		CompileObject->SetStringField(TEXT("status"), TEXT("skipped"));
-	}
-
-	MCPObjectUtils::AppendTouchedPackage(WidgetBlueprint, OutResult.TouchedPackages);
-	bool bAllSaved = true;
-	if (!Request.Context.bDryRun && bAutoSave)
-	{
-		for (const FString& PackageName : OutResult.TouchedPackages)
+			return GetWidgetStableId(WidgetBlueprint, Widget);
+		},
+		[](const UWidgetBlueprint* WidgetBlueprint, const UWidget* Widget)
 		{
-			bAllSaved &= SavePackageByName(PackageName, OutResult);
-		}
-	}
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetBoolField(TEXT("removed"), !Request.Context.bDryRun && bRemoved);
-	OutResult.ResultObject->SetBoolField(TEXT("dry_run"), Request.Context.bDryRun);
-	OutResult.ResultObject->SetStringField(TEXT("removed_widget_id"), RemovedWidgetId);
-	OutResult.ResultObject->SetStringField(TEXT("removed_widget_name"), RemovedWidgetName);
-	OutResult.ResultObject->SetStringField(TEXT("removed_class_path"), RemovedClassPath);
-	OutResult.ResultObject->SetStringField(TEXT("old_parent_id"), RemovedParentId);
-	OutResult.ResultObject->SetNumberField(TEXT("removed_children_count"), RemovedChildrenCount);
-	OutResult.ResultObject->SetObjectField(TEXT("compile"), CompileObject);
-	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(OutResult.TouchedPackages));
-	OutResult.Status = bAllSaved ? EMCPResponseStatus::Ok : EMCPResponseStatus::Partial;
-	return true;
+			return GetParentWidgetId(WidgetBlueprint, Widget);
+		},
+		[](UWidgetBlueprint* WidgetBlueprint)
+		{
+			EnsureWidgetGuidMap(WidgetBlueprint);
+		},
+		[](UWidget* Widget, TArray<FName>& OutVariableNames)
+		{
+			CollectWidgetSubtreeVariableNames(Widget, OutVariableNames);
+		},
+		[](UWidgetBlueprint* WidgetBlueprint, const FName VariableName)
+		{
+			RemoveWidgetGuidEntry(WidgetBlueprint, VariableName);
+		},
+		[](const FString& PackageName, FMCPToolExecutionResult& InOutResult)
+		{
+			return SavePackageByName(PackageName, InOutResult);
+		});
 }
 
 bool UMCPToolRegistrySubsystem::HandleUMGWidgetReparent(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString ObjectPath;
-	FString NamedSlotName;
-	const TSharedPtr<FJsonObject>* WidgetRef = nullptr;
-	const TSharedPtr<FJsonObject>* NewParentRef = nullptr;
-	const TArray<TSharedPtr<FJsonValue>>* SlotPatchOperations = nullptr;
-	bool bCompileOnSuccess = true;
-	bool bReplaceContent = false;
-	bool bSetAsRoot = false;
-	bool bAutoSave = false;
-	int32 InsertIndex = -1;
-
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
-		Request.Params->TryGetStringField(TEXT("named_slot_name"), NamedSlotName);
-		Request.Params->TryGetObjectField(TEXT("widget_ref"), WidgetRef);
-		Request.Params->TryGetObjectField(TEXT("new_parent_ref"), NewParentRef);
-		Request.Params->TryGetArrayField(TEXT("slot_patch"), SlotPatchOperations);
-		Request.Params->TryGetBoolField(TEXT("compile_on_success"), bCompileOnSuccess);
-		Request.Params->TryGetBoolField(TEXT("replace_content"), bReplaceContent);
-		Request.Params->TryGetBoolField(TEXT("set_as_root"), bSetAsRoot);
-		ParseAutoSaveOption(Request.Params, bAutoSave);
-
-		double InsertIndexNumber = static_cast<double>(InsertIndex);
-		Request.Params->TryGetNumberField(TEXT("insert_index"), InsertIndexNumber);
-		InsertIndex = FMath::Clamp(static_cast<int32>(InsertIndexNumber), -1, 10000);
-	}
-
-	const bool bUseTopLevelNamedSlotTarget = !bSetAsRoot
-		&& (NewParentRef == nullptr || !NewParentRef->IsValid())
-		&& !NamedSlotName.IsEmpty();
-
-	if (!bSetAsRoot && !bUseTopLevelNamedSlotTarget && (NewParentRef == nullptr || !NewParentRef->IsValid()))
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("new_parent_ref is required unless set_as_root=true or named_slot_name targets a top-level named slot.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UWidgetBlueprint* WidgetBlueprint = LoadWidgetBlueprintByPath(ObjectPath);
-	UWidget* Widget = ResolveWidgetFromRef(WidgetBlueprint, WidgetRef);
-	if (WidgetBlueprint == nullptr || WidgetBlueprint->WidgetTree == nullptr || Widget == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::UMG_WIDGET_NOT_FOUND;
-		Diagnostic.Message = TEXT("object_path and widget_ref must resolve to an existing widget.");
-		Diagnostic.Detail = ObjectPath;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UWidget* NewParentWidget = nullptr;
-	if (!bSetAsRoot)
-	{
-		if (!bUseTopLevelNamedSlotTarget)
+	return FMCPToolsUMGStructureHandler::HandleWidgetReparent(
+		Request,
+		OutResult,
+		[](const FString& ObjectPath) { return LoadWidgetBlueprintByPath(ObjectPath); },
+		[](UWidgetBlueprint* WidgetBlueprint, const TSharedPtr<FJsonObject>* WidgetRef)
 		{
-			NewParentWidget = ResolveWidgetFromRef(WidgetBlueprint, NewParentRef);
-			if (NewParentWidget == nullptr)
-			{
-				FMCPDiagnostic Diagnostic;
-				Diagnostic.Code = MCPErrorCodes::UMG_WIDGET_NOT_FOUND;
-				Diagnostic.Message = TEXT("new_parent_ref could not be resolved.");
-				Diagnostic.Detail = ObjectPath;
-				OutResult.Diagnostics.Add(Diagnostic);
-				OutResult.Status = EMCPResponseStatus::Error;
-				return false;
-			}
-
-			if (NewParentWidget == Widget)
-			{
-				FMCPDiagnostic Diagnostic;
-				Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-				Diagnostic.Message = TEXT("Widget cannot be reparented to itself.");
-				OutResult.Diagnostics.Add(Diagnostic);
-				OutResult.Status = EMCPResponseStatus::Error;
-				return false;
-			}
-
-			UWidget* CursorWidget = NewParentWidget;
-			while (CursorWidget != nullptr)
-			{
-				if (CursorWidget == Widget)
-				{
-					FMCPDiagnostic Diagnostic;
-					Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-					Diagnostic.Message = TEXT("Widget cannot be reparented into its own subtree.");
-					OutResult.Diagnostics.Add(Diagnostic);
-					OutResult.Status = EMCPResponseStatus::Error;
-					return false;
-				}
-				CursorWidget = (CursorWidget->Slot != nullptr) ? CursorWidget->Slot->Parent : nullptr;
-			}
-		}
-	}
-	else if (WidgetBlueprint->WidgetTree->RootWidget != nullptr && WidgetBlueprint->WidgetTree->RootWidget != Widget)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("WidgetTree already has a root widget. set_as_root=true requires replacing root manually.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	if (bSetAsRoot && !NamedSlotName.IsEmpty())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("named_slot_name cannot be used when set_as_root=true.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	const FString WidgetId = GetWidgetStableId(WidgetBlueprint, Widget);
-	const FString WidgetName = Widget->GetName();
-	const FString WidgetClassPath = Widget->GetClass() ? Widget->GetClass()->GetPathName() : FString();
-	const FString OldParentId = GetParentWidgetId(WidgetBlueprint, Widget);
-	TArray<FString> ChangedSlotProperties;
-	FString NewParentId = bSetAsRoot ? FString() : (NewParentWidget ? GetWidgetStableId(WidgetBlueprint, NewParentWidget) : FString());
-	FString SlotType;
-	FString ResolvedNamedSlotName;
-
-	if (!Request.Context.bDryRun)
-	{
-		EnsureWidgetGuidMap(WidgetBlueprint);
-		FScopedTransaction Transaction(FText::FromString(TEXT("MCP UMG Widget Reparent")));
-		WidgetBlueprint->Modify();
-		Widget->Modify();
-
-		FMCPDiagnostic DetachDiagnostic;
-		if (!DetachWidgetFromParent(WidgetBlueprint, Widget, DetachDiagnostic))
+			return ResolveWidgetFromRef(WidgetBlueprint, WidgetRef);
+		},
+		[](const UWidgetBlueprint* WidgetBlueprint, const UWidget* Widget)
 		{
-			Transaction.Cancel();
-			OutResult.Diagnostics.Add(DetachDiagnostic);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-
-		if (bSetAsRoot)
+			return GetWidgetStableId(WidgetBlueprint, Widget);
+		},
+		[](const UWidgetBlueprint* WidgetBlueprint, const UWidget* Widget)
 		{
-			WidgetBlueprint->WidgetTree->RootWidget = Widget;
-		}
-		else
+			return GetParentWidgetId(WidgetBlueprint, Widget);
+		},
+		[](const UWidgetBlueprint* WidgetBlueprint, const UWidget* Widget, FString* OutNamedSlotName)
 		{
-			FMCPDiagnostic AttachDiagnostic;
-			if (!AttachWidgetToParent(
+			return GetWidgetSlotType(WidgetBlueprint, Widget, OutNamedSlotName);
+		},
+		[](UPanelWidget* PanelWidget)
+		{
+			return GetPanelSlotTypeName(PanelWidget);
+		},
+		[](UWidgetBlueprint* WidgetBlueprint, const FString& RequestedSlotName, FName& OutResolvedSlotName, FMCPDiagnostic& OutDiagnostic)
+		{
+			return ResolveWidgetTreeNamedSlotName(WidgetBlueprint, RequestedSlotName, OutResolvedSlotName, OutDiagnostic);
+		},
+		[](UWidget* ParentWidget, const FString& RequestedSlotName, FName& OutResolvedSlotName, FMCPDiagnostic& OutDiagnostic)
+		{
+			return ResolveNamedSlotName(ParentWidget, RequestedSlotName, OutResolvedSlotName, OutDiagnostic);
+		},
+		[](UWidgetBlueprint* WidgetBlueprint,
+			UWidget* ParentWidget,
+			UWidget* ChildWidget,
+			int32 InsertIndex,
+			bool bReplaceContent,
+			const FString& NamedSlotName,
+			FString& OutResolvedNamedSlotName,
+			FString& OutSlotType,
+			FMCPDiagnostic& OutDiagnostic)
+		{
+			return AttachWidgetToParent(
 				WidgetBlueprint,
-				NewParentWidget,
-				Widget,
+				ParentWidget,
+				ChildWidget,
 				InsertIndex,
 				bReplaceContent,
 				NamedSlotName,
-				ResolvedNamedSlotName,
-				SlotType,
-				AttachDiagnostic))
-			{
-				Transaction.Cancel();
-				OutResult.Diagnostics.Add(AttachDiagnostic);
-				OutResult.Status = EMCPResponseStatus::Error;
-				return false;
-			}
-		}
-
-		if (SlotPatchOperations != nullptr && SlotPatchOperations->Num() > 0)
+				OutResolvedNamedSlotName,
+				OutSlotType,
+				OutDiagnostic);
+		},
+		[](UWidgetBlueprint* WidgetBlueprint, UWidget* Widget, FMCPDiagnostic& OutDiagnostic)
 		{
-			if (Widget->Slot == nullptr)
-			{
-				Transaction.Cancel();
-				FMCPDiagnostic Diagnostic;
-				Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-				Diagnostic.Message = TEXT("slot_patch requires the widget to have a slot after reparent.");
-				OutResult.Diagnostics.Add(Diagnostic);
-				OutResult.Status = EMCPResponseStatus::Error;
-				return false;
-			}
-
-			Widget->Slot->Modify();
-			FMCPDiagnostic PatchDiagnostic;
-			if (!MCPObjectUtils::ApplyPatch(Widget->Slot, SlotPatchOperations, ChangedSlotProperties, PatchDiagnostic))
-			{
-				Transaction.Cancel();
-				OutResult.Diagnostics.Add(PatchDiagnostic);
-				OutResult.Status = EMCPResponseStatus::Error;
-				return false;
-			}
-			Widget->Slot->PostEditChange();
-		}
-
-		Widget->PostEditChange();
-		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WidgetBlueprint);
-		WidgetBlueprint->MarkPackageDirty();
-		EnsureWidgetGuidMap(WidgetBlueprint);
-
-		NewParentId = GetParentWidgetId(WidgetBlueprint, Widget);
-		SlotType = GetWidgetSlotType(WidgetBlueprint, Widget, &ResolvedNamedSlotName);
-	}
-	else
-	{
-		CollectChangedPropertiesFromPatchOperations(SlotPatchOperations, ChangedSlotProperties);
-
-		if (!bSetAsRoot && NewParentWidget == nullptr && !NamedSlotName.IsEmpty())
+			return DetachWidgetFromParent(WidgetBlueprint, Widget, OutDiagnostic);
+		},
+		[](UWidgetBlueprint* WidgetBlueprint)
 		{
-			FName ResolvedNamedSlot = NAME_None;
-			FMCPDiagnostic NamedSlotDiagnostic;
-			if (!ResolveWidgetTreeNamedSlotName(WidgetBlueprint, NamedSlotName, ResolvedNamedSlot, NamedSlotDiagnostic))
-			{
-				OutResult.Diagnostics.Add(NamedSlotDiagnostic);
-				OutResult.Status = EMCPResponseStatus::Error;
-				return false;
-			}
-
-			ResolvedNamedSlotName = ResolvedNamedSlot.ToString();
-			UWidget* ExistingContent = WidgetBlueprint->WidgetTree->GetContentForSlot(ResolvedNamedSlot);
-			if (ExistingContent != nullptr && ExistingContent != Widget && !bReplaceContent)
-			{
-				FMCPDiagnostic Diagnostic;
-				Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-				Diagnostic.Message = TEXT("Target top-level named slot already has content. Set replace_content=true to replace it.");
-				Diagnostic.Detail = ResolvedNamedSlotName;
-				OutResult.Diagnostics.Add(Diagnostic);
-				OutResult.Status = EMCPResponseStatus::Error;
-				return false;
-			}
-
-			NewParentId = TEXT("this");
-			SlotType = FString::Printf(TEXT("NamedSlot:%s"), *ResolvedNamedSlotName);
-		}
-		else if (!bSetAsRoot && NewParentWidget != nullptr)
+			EnsureWidgetGuidMap(WidgetBlueprint);
+		},
+		[](const FString& PackageName, FMCPToolExecutionResult& InOutResult)
 		{
-			const bool bIsPanelParent = Cast<UPanelWidget>(NewParentWidget) != nullptr;
-			const bool bIsContentParent = Cast<UContentWidget>(NewParentWidget) != nullptr;
-			const bool bUseNamedSlot =
-				!NamedSlotName.IsEmpty() || (!bIsPanelParent && !bIsContentParent && Cast<INamedSlotInterface>(NewParentWidget) != nullptr);
-			if (bUseNamedSlot)
-			{
-				FName ResolvedNamedSlot = NAME_None;
-				FMCPDiagnostic NamedSlotDiagnostic;
-				if (!ResolveNamedSlotName(NewParentWidget, NamedSlotName, ResolvedNamedSlot, NamedSlotDiagnostic))
-				{
-					OutResult.Diagnostics.Add(NamedSlotDiagnostic);
-					OutResult.Status = EMCPResponseStatus::Error;
-					return false;
-				}
-
-				ResolvedNamedSlotName = ResolvedNamedSlot.ToString();
-				if (INamedSlotInterface* NamedSlotHost = Cast<INamedSlotInterface>(NewParentWidget))
-				{
-					UWidget* ExistingContent = NamedSlotHost->GetContentForSlot(ResolvedNamedSlot);
-					if (ExistingContent != nullptr && ExistingContent != Widget && !bReplaceContent)
-					{
-						FMCPDiagnostic Diagnostic;
-						Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-						Diagnostic.Message = TEXT("Target named slot already has content. Set replace_content=true to replace it.");
-						Diagnostic.Detail = ResolvedNamedSlotName;
-						OutResult.Diagnostics.Add(Diagnostic);
-						OutResult.Status = EMCPResponseStatus::Error;
-						return false;
-					}
-				}
-				SlotType = FString::Printf(TEXT("NamedSlot:%s"), *ResolvedNamedSlotName);
-			}
-			else if (UPanelWidget* PanelWidget = Cast<UPanelWidget>(NewParentWidget))
-			{
-				SlotType = GetPanelSlotTypeName(PanelWidget);
-			}
-		}
-	}
-
-	TSharedRef<FJsonObject> CompileObject = MakeShared<FJsonObject>();
-	if (bCompileOnSuccess && !Request.Context.bDryRun)
-	{
-		FKismetEditorUtilities::CompileBlueprint(WidgetBlueprint);
-		CompileObject->SetStringField(TEXT("status"), TEXT("requested"));
-	}
-	else
-	{
-		CompileObject->SetStringField(TEXT("status"), TEXT("skipped"));
-	}
-
-	MCPObjectUtils::AppendTouchedPackage(WidgetBlueprint, OutResult.TouchedPackages);
-	bool bAllSaved = true;
-	if (!Request.Context.bDryRun && bAutoSave)
-	{
-		for (const FString& PackageName : OutResult.TouchedPackages)
-		{
-			bAllSaved &= SavePackageByName(PackageName, OutResult);
-		}
-	}
-
-	TSharedRef<FJsonObject> WidgetObject = MakeShared<FJsonObject>();
-	WidgetObject->SetStringField(TEXT("widget_id"), WidgetId);
-	WidgetObject->SetStringField(TEXT("name"), WidgetName);
-	WidgetObject->SetStringField(TEXT("class_path"), WidgetClassPath);
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetBoolField(TEXT("moved"), !Request.Context.bDryRun);
-	OutResult.ResultObject->SetBoolField(TEXT("dry_run"), Request.Context.bDryRun);
-	OutResult.ResultObject->SetObjectField(TEXT("widget"), WidgetObject);
-	OutResult.ResultObject->SetStringField(TEXT("old_parent_id"), OldParentId);
-	OutResult.ResultObject->SetStringField(TEXT("new_parent_id"), NewParentId);
-	OutResult.ResultObject->SetStringField(TEXT("slot_type"), SlotType);
-	if (!ResolvedNamedSlotName.IsEmpty())
-	{
-		OutResult.ResultObject->SetStringField(TEXT("named_slot_name"), ResolvedNamedSlotName);
-	}
-	OutResult.ResultObject->SetArrayField(TEXT("slot_changed_properties"), ToJsonStringArray(ChangedSlotProperties));
-	OutResult.ResultObject->SetObjectField(TEXT("compile"), CompileObject);
-	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(OutResult.TouchedPackages));
-	OutResult.Status = bAllSaved ? EMCPResponseStatus::Ok : EMCPResponseStatus::Partial;
-	return true;
+			return SavePackageByName(PackageName, InOutResult);
+		});
 }
 
 bool UMCPToolRegistrySubsystem::HandleUMGTreeGet(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString ObjectPath;
-	int32 Depth = 10;
-	FString NameGlob;
-	TSet<FString> AllowedClassPaths;
-	bool bIncludeSlotSummary = true;
-	bool bIncludeLayoutSummary = false;
-
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
-		double DepthNumber = static_cast<double>(Depth);
-		Request.Params->TryGetNumberField(TEXT("depth"), DepthNumber);
-		Depth = FMath::Clamp(static_cast<int32>(DepthNumber), 0, 20);
-
-		const TSharedPtr<FJsonObject>* IncludeObject = nullptr;
-		if (Request.Params->TryGetObjectField(TEXT("include"), IncludeObject) && IncludeObject != nullptr && IncludeObject->IsValid())
-		{
-			(*IncludeObject)->TryGetBoolField(TEXT("slot_summary"), bIncludeSlotSummary);
-			(*IncludeObject)->TryGetBoolField(TEXT("layout_summary"), bIncludeLayoutSummary);
-		}
-
-		const TSharedPtr<FJsonObject>* FiltersObject = nullptr;
-		if (Request.Params->TryGetObjectField(TEXT("filters"), FiltersObject) && FiltersObject != nullptr && FiltersObject->IsValid())
-		{
-			(*FiltersObject)->TryGetStringField(TEXT("name_glob"), NameGlob);
-			const TArray<TSharedPtr<FJsonValue>>* ClassPaths = nullptr;
-			if ((*FiltersObject)->TryGetArrayField(TEXT("class_path_in"), ClassPaths) && ClassPaths != nullptr)
-			{
-				for (const TSharedPtr<FJsonValue>& ClassPathValue : *ClassPaths)
-				{
-					FString ClassPath;
-					if (ClassPathValue.IsValid() && ClassPathValue->TryGetString(ClassPath))
-					{
-						AllowedClassPaths.Add(ClassPath);
-					}
-				}
-			}
-		}
-	}
-
-	UWidgetBlueprint* WidgetBlueprint = LoadWidgetBlueprintByPath(ObjectPath);
-	if (WidgetBlueprint == nullptr || WidgetBlueprint->WidgetTree == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::OBJECT_NOT_FOUND;
-		Diagnostic.Message = TEXT("Widget blueprint not found.");
-		Diagnostic.Detail = ObjectPath;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	TArray<TSharedPtr<FJsonValue>> Nodes;
-	UWidget* RootWidget = WidgetBlueprint->WidgetTree->RootWidget;
-	if (RootWidget != nullptr)
-	{
-		BuildWidgetTreeNodesRecursive(
-			WidgetBlueprint,
-			RootWidget,
-			TEXT(""),
-			TEXT(""),
-			NameGlob,
-			AllowedClassPaths,
-			Depth,
-			0,
-			bIncludeSlotSummary,
-			bIncludeLayoutSummary,
-			Nodes);
-	}
-
-	TArray<FName> TopLevelSlotNames;
-	WidgetBlueprint->WidgetTree->GetSlotNames(TopLevelSlotNames);
-	TSet<UWidget*> TopLevelVisited;
-	for (const FName SlotName : TopLevelSlotNames)
-	{
-		if (SlotName.IsNone())
-		{
-			continue;
-		}
-
-		UWidget* SlotContent = WidgetBlueprint->WidgetTree->GetContentForSlot(SlotName);
-		if (SlotContent == nullptr || TopLevelVisited.Contains(SlotContent))
-		{
-			continue;
-		}
-
-		bool bReachableFromRoot = false;
-		if (RootWidget != nullptr)
-		{
-			UWidgetTree::ForEachWidgetAndChildrenUntil(RootWidget, [&bReachableFromRoot, SlotContent](UWidget* CandidateWidget)
-			{
-				if (CandidateWidget == SlotContent)
-				{
-					bReachableFromRoot = true;
-					return false;
-				}
-
-				return true;
-			});
-		}
-
-		if (bReachableFromRoot)
-		{
-			continue;
-		}
-
-		TopLevelVisited.Add(SlotContent);
-		const FString SlotType = FString::Printf(TEXT("NamedSlot:%s"), *SlotName.ToString());
-		BuildWidgetTreeNodesRecursive(
-			WidgetBlueprint,
-			SlotContent,
-			TEXT("this"),
-			SlotType,
-			NameGlob,
-			AllowedClassPaths,
-			Depth,
-			0,
-			bIncludeSlotSummary,
-			bIncludeLayoutSummary,
-			Nodes);
-	}
-
-	TArray<TSharedPtr<FJsonValue>> Warnings;
-	if (RootWidget == nullptr)
-	{
-		Warnings.Add(MakeShared<FJsonValueString>(TEXT("WidgetTree has no root widget.")));
-	}
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetStringField(TEXT("root_id"), RootWidget ? GetWidgetStableId(WidgetBlueprint, RootWidget) : TEXT(""));
-	OutResult.ResultObject->SetArrayField(TEXT("nodes"), Nodes);
-	OutResult.ResultObject->SetArrayField(TEXT("warnings"), Warnings);
-	OutResult.Status = EMCPResponseStatus::Ok;
-	return true;
+	return FMCPToolsUMGReadHandler::HandleTreeGet(Request, OutResult);
 }
 
 bool UMCPToolRegistrySubsystem::HandleUMGWidgetInspect(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString ObjectPath;
-	const TSharedPtr<FJsonObject>* WidgetRef = nullptr;
-	int32 Depth = 2;
-	bool bIncludeProperties = true;
-	bool bIncludeMetadata = true;
-	bool bIncludeStyle = false;
-
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
-		Request.Params->TryGetObjectField(TEXT("widget_ref"), WidgetRef);
-		double DepthNumber = static_cast<double>(Depth);
-		Request.Params->TryGetNumberField(TEXT("depth"), DepthNumber);
-		Depth = FMath::Clamp(static_cast<int32>(DepthNumber), 0, 5);
-
-		const TSharedPtr<FJsonObject>* IncludeObject = nullptr;
-		if (Request.Params->TryGetObjectField(TEXT("include"), IncludeObject) && IncludeObject != nullptr && IncludeObject->IsValid())
-		{
-			(*IncludeObject)->TryGetBoolField(TEXT("properties"), bIncludeProperties);
-			(*IncludeObject)->TryGetBoolField(TEXT("metadata"), bIncludeMetadata);
-			(*IncludeObject)->TryGetBoolField(TEXT("style"), bIncludeStyle);
-		}
-	}
-
-	UWidgetBlueprint* WidgetBlueprint = LoadWidgetBlueprintByPath(ObjectPath);
-	UWidget* Widget = ResolveWidgetFromRef(WidgetBlueprint, WidgetRef);
-	if (WidgetBlueprint == nullptr || Widget == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::UMG_WIDGET_NOT_FOUND;
-		Diagnostic.Message = TEXT("UMG widget could not be resolved.");
-		Diagnostic.Detail = ObjectPath;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	TSharedRef<FJsonObject> WidgetObject = MakeShared<FJsonObject>();
-	WidgetObject->SetStringField(TEXT("widget_id"), GetWidgetStableId(WidgetBlueprint, Widget));
-	WidgetObject->SetStringField(TEXT("name"), Widget->GetName());
-	WidgetObject->SetStringField(TEXT("class_path"), Widget->GetClass()->GetPathName());
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetObjectField(TEXT("widget"), WidgetObject);
-
-	TArray<TSharedPtr<FJsonValue>> Properties;
-	if (bIncludeProperties)
-	{
-		MCPObjectUtils::InspectObject(Widget, nullptr, Depth, Properties);
-	}
-	OutResult.ResultObject->SetArrayField(TEXT("properties"), Properties);
-
-	if (bIncludeMetadata)
-	{
-		TSharedRef<FJsonObject> MetadataObject = MakeShared<FJsonObject>();
-		UClass* WidgetClass = Widget->GetClass();
-		MetadataObject->SetStringField(TEXT("class_name"), WidgetClass->GetName());
-		MetadataObject->SetStringField(TEXT("class_path"), WidgetClass->GetPathName());
-		MetadataObject->SetBoolField(TEXT("is_variable"), Widget->bIsVariable);
-
-		const FString DisplayName = WidgetClass->GetMetaData(TEXT("DisplayName"));
-		if (!DisplayName.IsEmpty())
-		{
-			MetadataObject->SetStringField(TEXT("display_name"), DisplayName);
-		}
-		const FString ToolTip = WidgetClass->GetMetaData(TEXT("ToolTip"));
-		if (!ToolTip.IsEmpty())
-		{
-			MetadataObject->SetStringField(TEXT("tooltip"), ToolTip);
-		}
-
-		OutResult.ResultObject->SetObjectField(TEXT("metadata"), MetadataObject);
-	}
-
-	if (bIncludeStyle)
-	{
-		TSharedRef<FJsonObject> StyleFilters = MakeShared<FJsonObject>();
-		StyleFilters->SetBoolField(TEXT("only_editable"), false);
-		StyleFilters->SetStringField(TEXT("property_name_glob"), TEXT("*Style*"));
-		TArray<TSharedPtr<FJsonValue>> StyleProperties;
-		MCPObjectUtils::InspectObject(Widget, StyleFilters, Depth, StyleProperties);
-		OutResult.ResultObject->SetArrayField(TEXT("style"), StyleProperties);
-	}
-
-	OutResult.Status = EMCPResponseStatus::Ok;
-	return true;
+	return FMCPToolsUMGReadHandler::HandleWidgetInspect(Request, OutResult);
 }
 
 bool UMCPToolRegistrySubsystem::HandleUMGSlotInspect(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString ObjectPath;
-	const TSharedPtr<FJsonObject>* WidgetRef = nullptr;
-	int32 Depth = 2;
-	bool bIncludeLayout = true;
-	bool bIncludeAnchors = true;
-	bool bIncludePadding = true;
-	bool bIncludeAlignment = true;
-	bool bIncludeZOrder = true;
-
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
-		Request.Params->TryGetObjectField(TEXT("widget_ref"), WidgetRef);
-		double DepthNumber = static_cast<double>(Depth);
-		Request.Params->TryGetNumberField(TEXT("depth"), DepthNumber);
-		Depth = FMath::Clamp(static_cast<int32>(DepthNumber), 0, 5);
-
-		const TSharedPtr<FJsonObject>* IncludeObject = nullptr;
-		if (Request.Params->TryGetObjectField(TEXT("include"), IncludeObject) && IncludeObject != nullptr && IncludeObject->IsValid())
-		{
-			(*IncludeObject)->TryGetBoolField(TEXT("layout"), bIncludeLayout);
-			(*IncludeObject)->TryGetBoolField(TEXT("anchors"), bIncludeAnchors);
-			(*IncludeObject)->TryGetBoolField(TEXT("padding"), bIncludePadding);
-			(*IncludeObject)->TryGetBoolField(TEXT("alignment"), bIncludeAlignment);
-			(*IncludeObject)->TryGetBoolField(TEXT("zorder"), bIncludeZOrder);
-		}
-	}
-
-	UWidgetBlueprint* WidgetBlueprint = LoadWidgetBlueprintByPath(ObjectPath);
-	UWidget* Widget = ResolveWidgetFromRef(WidgetBlueprint, WidgetRef);
-	if (WidgetBlueprint == nullptr || Widget == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::UMG_WIDGET_NOT_FOUND;
-		Diagnostic.Message = TEXT("UMG widget could not be resolved.");
-		Diagnostic.Detail = ObjectPath;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	if (Widget->Slot == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("Resolved widget does not have a slot.");
-		Diagnostic.Detail = Widget->GetName();
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	TArray<TSharedPtr<FJsonValue>> SlotProperties;
-	MCPObjectUtils::InspectObject(Widget->Slot, nullptr, Depth, SlotProperties);
-
-	TSharedRef<FJsonObject> WidgetObject = MakeShared<FJsonObject>();
-	WidgetObject->SetStringField(TEXT("widget_id"), GetWidgetStableId(WidgetBlueprint, Widget));
-	WidgetObject->SetStringField(TEXT("name"), Widget->GetName());
-	WidgetObject->SetStringField(TEXT("class_path"), Widget->GetClass()->GetPathName());
-
-	TSharedRef<FJsonObject> SlotObject = MakeShared<FJsonObject>();
-	SlotObject->SetStringField(TEXT("slot_class"), Widget->Slot->GetClass()->GetPathName());
-	SlotObject->SetArrayField(TEXT("slot_properties"), SlotProperties);
-
-	TSharedRef<FJsonObject> LayoutSummary = MakeShared<FJsonObject>();
-	if (bIncludeLayout || bIncludeAnchors || bIncludePadding || bIncludeAlignment || bIncludeZOrder)
-	{
-		const TArray<TPair<FString, FString>> Fields{
-			{TEXT("LayoutData"), TEXT("layout_data")},
-			{TEXT("Offsets"), TEXT("offsets")},
-			{TEXT("Anchors"), TEXT("anchors")},
-			{TEXT("Padding"), TEXT("padding")},
-			{TEXT("Alignment"), TEXT("alignment")},
-			{TEXT("HorizontalAlignment"), TEXT("horizontal_alignment")},
-			{TEXT("VerticalAlignment"), TEXT("vertical_alignment")},
-			{TEXT("ZOrder"), TEXT("z_order")}
-		};
-
-		for (const TPair<FString, FString>& Field : Fields)
-		{
-			const bool bAllowed =
-				bIncludeLayout
-				|| (Field.Key.Equals(TEXT("Anchors")) && bIncludeAnchors)
-				|| ((Field.Key.Equals(TEXT("Padding"))) && bIncludePadding)
-				|| ((Field.Key.Equals(TEXT("Alignment")) || Field.Key.Equals(TEXT("HorizontalAlignment")) || Field.Key.Equals(TEXT("VerticalAlignment"))) && bIncludeAlignment)
-				|| ((Field.Key.Equals(TEXT("ZOrder"))) && bIncludeZOrder);
-
-			if (!bAllowed)
-			{
-				continue;
-			}
-
-			FString ExportedText;
-			if (TryExportObjectPropertyAsText(Widget->Slot, Field.Key, ExportedText))
-			{
-				LayoutSummary->SetStringField(Field.Value, ExportedText);
-			}
-		}
-	}
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetObjectField(TEXT("widget"), WidgetObject);
-	OutResult.ResultObject->SetObjectField(TEXT("slot"), SlotObject);
-	OutResult.ResultObject->SetObjectField(TEXT("layout_summary"), LayoutSummary);
-	OutResult.Status = EMCPResponseStatus::Ok;
-	return true;
+	return FMCPToolsUMGReadHandler::HandleSlotInspect(Request, OutResult);
 }
 
 bool UMCPToolRegistrySubsystem::HandleUMGWidgetPatch(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString ObjectPath;
-	const TSharedPtr<FJsonObject>* WidgetRef = nullptr;
-	const TArray<TSharedPtr<FJsonValue>>* PatchOperations = nullptr;
-	bool bCompileOnSuccess = true;
-
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
-		Request.Params->TryGetObjectField(TEXT("widget_ref"), WidgetRef);
-		Request.Params->TryGetArrayField(TEXT("patch"), PatchOperations);
-		Request.Params->TryGetBoolField(TEXT("compile_on_success"), bCompileOnSuccess);
-	}
-
-	UWidgetBlueprint* WidgetBlueprint = LoadWidgetBlueprintByPath(ObjectPath);
-	UWidget* Widget = ResolveWidgetFromRef(WidgetBlueprint, WidgetRef);
-	if (WidgetBlueprint == nullptr || Widget == nullptr || PatchOperations == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("object_path, widget_ref, and patch are required for umg.widget.patch.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	TArray<FString> ChangedProperties;
-	FMCPDiagnostic PatchDiagnostic;
-	if (!Request.Context.bDryRun)
-	{
-		EnsureWidgetGuidMap(WidgetBlueprint);
-	}
-
-	if (!Request.Context.bDryRun)
-	{
-		FScopedTransaction Transaction(FText::FromString(TEXT("MCP UMG Widget Patch")));
-		WidgetBlueprint->Modify();
-		Widget->Modify();
-		if (!MCPObjectUtils::ApplyPatch(Widget, PatchOperations, ChangedProperties, PatchDiagnostic))
+	return FMCPToolsUMGStructureHandler::HandleWidgetPatch(
+		Request,
+		OutResult,
+		[](const FString& ObjectPath) { return LoadWidgetBlueprintByPath(ObjectPath); },
+		[](UWidgetBlueprint* WidgetBlueprint, const TSharedPtr<FJsonObject>* WidgetRef)
 		{
-			Transaction.Cancel();
-			OutResult.Diagnostics.Add(PatchDiagnostic);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-
-		Widget->PostEditChange();
-		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WidgetBlueprint);
-		WidgetBlueprint->MarkPackageDirty();
-	}
-	else
-	{
-		for (const TSharedPtr<FJsonValue>& PatchValue : *PatchOperations)
-		{
-			if (!PatchValue.IsValid() || PatchValue->Type != EJson::Object)
-			{
-				continue;
-			}
-			const TSharedPtr<FJsonObject> PatchObject = PatchValue->AsObject();
-			FString PropertyPath;
-			PatchObject->TryGetStringField(TEXT("path"), PropertyPath);
-			TArray<FString> Tokens;
-			PropertyPath.ParseIntoArray(Tokens, TEXT("/"), true);
-			if (Tokens.Num() == 1)
-			{
-				ChangedProperties.AddUnique(Tokens[0]);
-			}
-		}
-	}
-
-	TSharedRef<FJsonObject> CompileObject = MakeShared<FJsonObject>();
-	if (bCompileOnSuccess && !Request.Context.bDryRun)
-	{
-		FKismetEditorUtilities::CompileBlueprint(WidgetBlueprint);
-		CompileObject->SetStringField(TEXT("status"), TEXT("requested"));
-	}
-	else
-	{
-		CompileObject->SetStringField(TEXT("status"), TEXT("skipped"));
-	}
-
-	MCPObjectUtils::AppendTouchedPackage(WidgetBlueprint, OutResult.TouchedPackages);
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetArrayField(TEXT("changed_properties"), ToJsonStringArray(ChangedProperties));
-	OutResult.ResultObject->SetObjectField(TEXT("compile"), CompileObject);
-	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(OutResult.TouchedPackages));
-	OutResult.Status = EMCPResponseStatus::Ok;
-	return true;
+			return ResolveWidgetFromRef(WidgetBlueprint, WidgetRef);
+		},
+		[](UWidgetBlueprint* WidgetBlueprint) { EnsureWidgetGuidMap(WidgetBlueprint); });
 }
 
 bool UMCPToolRegistrySubsystem::HandleUMGSlotPatch(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString ObjectPath;
-	const TSharedPtr<FJsonObject>* WidgetRef = nullptr;
-	const TArray<TSharedPtr<FJsonValue>>* PatchOperations = nullptr;
-
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
-		Request.Params->TryGetObjectField(TEXT("widget_ref"), WidgetRef);
-		Request.Params->TryGetArrayField(TEXT("patch"), PatchOperations);
-	}
-
-	UWidgetBlueprint* WidgetBlueprint = LoadWidgetBlueprintByPath(ObjectPath);
-	UWidget* Widget = ResolveWidgetFromRef(WidgetBlueprint, WidgetRef);
-	if (WidgetBlueprint == nullptr || Widget == nullptr || PatchOperations == nullptr || Widget->Slot == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("object_path, widget_ref, and patch are required and widget must have a slot.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	TArray<FString> ChangedProperties;
-	FMCPDiagnostic PatchDiagnostic;
-	if (!Request.Context.bDryRun)
-	{
-		EnsureWidgetGuidMap(WidgetBlueprint);
-	}
-	if (!Request.Context.bDryRun)
-	{
-		FScopedTransaction Transaction(FText::FromString(TEXT("MCP UMG Slot Patch")));
-		WidgetBlueprint->Modify();
-		Widget->Slot->Modify();
-		if (!MCPObjectUtils::ApplyPatch(Widget->Slot, PatchOperations, ChangedProperties, PatchDiagnostic))
+	return FMCPToolsUMGStructureHandler::HandleSlotPatch(
+		Request,
+		OutResult,
+		[](const FString& ObjectPath) { return LoadWidgetBlueprintByPath(ObjectPath); },
+		[](UWidgetBlueprint* WidgetBlueprint, const TSharedPtr<FJsonObject>* WidgetRef)
 		{
-			Transaction.Cancel();
-			OutResult.Diagnostics.Add(PatchDiagnostic);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-
-		Widget->Slot->PostEditChange();
-		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WidgetBlueprint);
-		WidgetBlueprint->MarkPackageDirty();
-	}
-	else
-	{
-		for (const TSharedPtr<FJsonValue>& PatchValue : *PatchOperations)
-		{
-			if (!PatchValue.IsValid() || PatchValue->Type != EJson::Object)
-			{
-				continue;
-			}
-			const TSharedPtr<FJsonObject> PatchObject = PatchValue->AsObject();
-			FString PropertyPath;
-			PatchObject->TryGetStringField(TEXT("path"), PropertyPath);
-			TArray<FString> Tokens;
-			PropertyPath.ParseIntoArray(Tokens, TEXT("/"), true);
-			if (Tokens.Num() == 1)
-			{
-				ChangedProperties.AddUnique(Tokens[0]);
-			}
-		}
-	}
-
-	MCPObjectUtils::AppendTouchedPackage(WidgetBlueprint, OutResult.TouchedPackages);
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetArrayField(TEXT("changed_properties"), ToJsonStringArray(ChangedProperties));
-	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(OutResult.TouchedPackages));
-	OutResult.Status = EMCPResponseStatus::Ok;
-	return true;
+			return ResolveWidgetFromRef(WidgetBlueprint, WidgetRef);
+		},
+		[](UWidgetBlueprint* WidgetBlueprint) { EnsureWidgetGuidMap(WidgetBlueprint); });
 }
 
 bool UMCPToolRegistrySubsystem::HandleUMGWidgetPatchV2(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString ObjectPath;
-	const TSharedPtr<FJsonObject>* WidgetRef = nullptr;
-	const TArray<TSharedPtr<FJsonValue>>* PatchOperations = nullptr;
-	bool bCompileOnSuccess = true;
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
-		Request.Params->TryGetObjectField(TEXT("widget_ref"), WidgetRef);
-		Request.Params->TryGetArrayField(TEXT("patch"), PatchOperations);
-		Request.Params->TryGetBoolField(TEXT("compile_on_success"), bCompileOnSuccess);
-	}
-
-	UWidgetBlueprint* WidgetBlueprint = LoadWidgetBlueprintByPath(ObjectPath);
-	UWidget* Widget = ResolveWidgetFromRef(WidgetBlueprint, WidgetRef);
-	if (WidgetBlueprint == nullptr || Widget == nullptr || PatchOperations == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("object_path, widget_ref, and patch are required for umg.widget.patch.v2.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	TArray<FString> ChangedProperties;
-	FMCPDiagnostic PatchDiagnostic;
-	if (!Request.Context.bDryRun)
-	{
-		EnsureWidgetGuidMap(WidgetBlueprint);
-		FScopedTransaction Transaction(FText::FromString(TEXT("MCP UMG Widget Patch V2")));
-		WidgetBlueprint->Modify();
-		Widget->Modify();
-		if (!MCPObjectUtils::ApplyPatchV2(Widget, PatchOperations, ChangedProperties, PatchDiagnostic))
+	return FMCPToolsUMGStructureHandler::HandleWidgetPatchV2(
+		Request,
+		OutResult,
+		[](const FString& ObjectPath) { return LoadWidgetBlueprintByPath(ObjectPath); },
+		[](UWidgetBlueprint* WidgetBlueprint, const TSharedPtr<FJsonObject>* WidgetRef)
 		{
-			Transaction.Cancel();
-			OutResult.Diagnostics.Add(PatchDiagnostic);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-
-		Widget->PostEditChange();
-		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WidgetBlueprint);
-		WidgetBlueprint->MarkPackageDirty();
-	}
-	else
-	{
-		CollectChangedPropertiesFromPatchOperations(PatchOperations, ChangedProperties);
-	}
-
-	TSharedRef<FJsonObject> CompileObject = MakeShared<FJsonObject>();
-	if (bCompileOnSuccess && !Request.Context.bDryRun)
-	{
-		FKismetEditorUtilities::CompileBlueprint(WidgetBlueprint);
-		CompileObject->SetStringField(TEXT("status"), TEXT("requested"));
-	}
-	else
-	{
-		CompileObject->SetStringField(TEXT("status"), TEXT("skipped"));
-	}
-
-	MCPObjectUtils::AppendTouchedPackage(WidgetBlueprint, OutResult.TouchedPackages);
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetArrayField(TEXT("changed_properties"), ToJsonStringArray(ChangedProperties));
-	OutResult.ResultObject->SetObjectField(TEXT("compile"), CompileObject);
-	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(OutResult.TouchedPackages));
-	OutResult.Status = EMCPResponseStatus::Ok;
-	return true;
+			return ResolveWidgetFromRef(WidgetBlueprint, WidgetRef);
+		},
+		[](UWidgetBlueprint* WidgetBlueprint) { EnsureWidgetGuidMap(WidgetBlueprint); });
 }
 
 bool UMCPToolRegistrySubsystem::HandleUMGSlotPatchV2(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString ObjectPath;
-	const TSharedPtr<FJsonObject>* WidgetRef = nullptr;
-	const TArray<TSharedPtr<FJsonValue>>* PatchOperations = nullptr;
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
-		Request.Params->TryGetObjectField(TEXT("widget_ref"), WidgetRef);
-		Request.Params->TryGetArrayField(TEXT("patch"), PatchOperations);
-	}
-
-	UWidgetBlueprint* WidgetBlueprint = LoadWidgetBlueprintByPath(ObjectPath);
-	UWidget* Widget = ResolveWidgetFromRef(WidgetBlueprint, WidgetRef);
-	if (WidgetBlueprint == nullptr || Widget == nullptr || Widget->Slot == nullptr || PatchOperations == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("object_path, widget_ref, and patch are required and widget must have a slot for umg.slot.patch.v2.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	TArray<FString> ChangedProperties;
-	FMCPDiagnostic PatchDiagnostic;
-	if (!Request.Context.bDryRun)
-	{
-		EnsureWidgetGuidMap(WidgetBlueprint);
-		FScopedTransaction Transaction(FText::FromString(TEXT("MCP UMG Slot Patch V2")));
-		WidgetBlueprint->Modify();
-		Widget->Slot->Modify();
-		if (!MCPObjectUtils::ApplyPatchV2(Widget->Slot, PatchOperations, ChangedProperties, PatchDiagnostic))
+	return FMCPToolsUMGStructureHandler::HandleSlotPatchV2(
+		Request,
+		OutResult,
+		[](const FString& ObjectPath) { return LoadWidgetBlueprintByPath(ObjectPath); },
+		[](UWidgetBlueprint* WidgetBlueprint, const TSharedPtr<FJsonObject>* WidgetRef)
 		{
-			Transaction.Cancel();
-			OutResult.Diagnostics.Add(PatchDiagnostic);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-
-		Widget->Slot->PostEditChange();
-		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WidgetBlueprint);
-		WidgetBlueprint->MarkPackageDirty();
-	}
-	else
-	{
-		CollectChangedPropertiesFromPatchOperations(PatchOperations, ChangedProperties);
-	}
-
-	MCPObjectUtils::AppendTouchedPackage(WidgetBlueprint, OutResult.TouchedPackages);
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetArrayField(TEXT("changed_properties"), ToJsonStringArray(ChangedProperties));
-	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(OutResult.TouchedPackages));
-	OutResult.Status = EMCPResponseStatus::Ok;
-	return true;
+			return ResolveWidgetFromRef(WidgetBlueprint, WidgetRef);
+		},
+		[](UWidgetBlueprint* WidgetBlueprint) { EnsureWidgetGuidMap(WidgetBlueprint); });
 }
 
 bool UMCPToolRegistrySubsystem::HandleUMGAnimationList(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString ObjectPath;
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
-	}
-
-	UWidgetBlueprint* WidgetBlueprint = LoadWidgetBlueprintByPath(ObjectPath);
-	if (WidgetBlueprint == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::OBJECT_NOT_FOUND;
-		Diagnostic.Message = TEXT("Widget blueprint not found.");
-		Diagnostic.Detail = ObjectPath;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	FArrayProperty* AnimationsArrayProperty = nullptr;
-	void* AnimationsArrayPtr = nullptr;
-	if (!TryResolveWidgetAnimationArray(WidgetBlueprint, AnimationsArrayProperty, AnimationsArrayPtr))
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = TEXT("MCP.UMG.ANIMATION.UNSUPPORTED");
-		Diagnostic.Message = TEXT("Current engine/widget blueprint does not expose animations array via reflection.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	const FObjectPropertyBase* AnimationObjectProperty = CastField<FObjectPropertyBase>(AnimationsArrayProperty->Inner);
-	FScriptArrayHelper ArrayHelper(AnimationsArrayProperty, AnimationsArrayPtr);
-	TArray<TSharedPtr<FJsonValue>> Animations;
-	Animations.Reserve(ArrayHelper.Num());
-	for (int32 Index = 0; Index < ArrayHelper.Num(); ++Index)
-	{
-		UObject* AnimationObject = AnimationObjectProperty != nullptr
-			? AnimationObjectProperty->GetObjectPropertyValue(ArrayHelper.GetRawPtr(Index))
-			: nullptr;
-		if (AnimationObject == nullptr)
-		{
-			continue;
-		}
-
-		TSharedRef<FJsonObject> AnimationEntry = MakeShared<FJsonObject>();
-		AnimationEntry->SetStringField(TEXT("name"), AnimationObject->GetName());
-		AnimationEntry->SetStringField(TEXT("object_path"), AnimationObject->GetPathName());
-		Animations.Add(MakeShared<FJsonValueObject>(AnimationEntry));
-	}
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetArrayField(TEXT("animations"), Animations);
-	OutResult.ResultObject->SetNumberField(TEXT("animation_count"), Animations.Num());
-	OutResult.Status = EMCPResponseStatus::Ok;
-	return true;
+	return FMCPToolsUMGAnimationHandler::HandleAnimationList(Request, OutResult);
 }
 
 bool UMCPToolRegistrySubsystem::HandleUMGAnimationCreate(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString ObjectPath;
-	FString AnimationName;
-	bool bCompileOnSuccess = true;
-	bool bAutoSave = false;
-	bool bOverwrite = false;
-
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
-		Request.Params->TryGetStringField(TEXT("animation_name"), AnimationName);
-		Request.Params->TryGetBoolField(TEXT("compile_on_success"), bCompileOnSuccess);
-		Request.Params->TryGetBoolField(TEXT("overwrite"), bOverwrite);
-		ParseAutoSaveOption(Request.Params, bAutoSave);
-	}
-
-	if (ObjectPath.IsEmpty() || AnimationName.IsEmpty())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("object_path and animation_name are required for umg.animation.create.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UWidgetBlueprint* WidgetBlueprint = LoadWidgetBlueprintByPath(ObjectPath);
-	if (WidgetBlueprint == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::OBJECT_NOT_FOUND;
-		Diagnostic.Message = TEXT("Widget blueprint not found.");
-		Diagnostic.Detail = ObjectPath;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	FArrayProperty* AnimationsArrayProperty = nullptr;
-	void* AnimationsArrayPtr = nullptr;
-	if (!TryResolveWidgetAnimationArray(WidgetBlueprint, AnimationsArrayProperty, AnimationsArrayPtr))
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = TEXT("MCP.UMG.ANIMATION.UNSUPPORTED");
-		Diagnostic.Message = TEXT("Current engine/widget blueprint does not expose animations array via reflection.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	const FObjectPropertyBase* AnimationObjectProperty = CastField<FObjectPropertyBase>(AnimationsArrayProperty->Inner);
-	FScriptArrayHelper ArrayHelper(AnimationsArrayProperty, AnimationsArrayPtr);
-
-	UObject* ExistingAnimation = nullptr;
-	int32 ExistingIndex = INDEX_NONE;
-	for (int32 Index = 0; Index < ArrayHelper.Num(); ++Index)
-	{
-		UObject* AnimationObject = AnimationObjectProperty != nullptr
-			? AnimationObjectProperty->GetObjectPropertyValue(ArrayHelper.GetRawPtr(Index))
-			: nullptr;
-		if (AnimationObject != nullptr && AnimationObject->GetName().Equals(AnimationName, ESearchCase::IgnoreCase))
+	return FMCPToolsUMGAnimationHandler::HandleAnimationCreate(
+		Request,
+		OutResult,
+		[](const FString& PackageName, FMCPToolExecutionResult& InOutResult)
 		{
-			ExistingAnimation = AnimationObject;
-			ExistingIndex = Index;
-			break;
-		}
-	}
-
-	UObject* ResultAnimation = ExistingAnimation;
-	bool bCreated = false;
-	if (!Request.Context.bDryRun)
-	{
-		FScopedTransaction Transaction(FText::FromString(TEXT("MCP UMG Animation Create")));
-		WidgetBlueprint->Modify();
-
-		if (ExistingAnimation == nullptr)
-		{
-			UWidgetAnimation* NewAnimation = NewObject<UWidgetAnimation>(
-				WidgetBlueprint,
-				FName(*AnimationName),
-				RF_Public | RF_Transactional);
-			if (NewAnimation == nullptr)
-			{
-				Transaction.Cancel();
-				FMCPDiagnostic Diagnostic;
-				Diagnostic.Code = MCPErrorCodes::INTERNAL_EXCEPTION;
-				Diagnostic.Message = TEXT("Failed to allocate UWidgetAnimation object.");
-				OutResult.Diagnostics.Add(Diagnostic);
-				OutResult.Status = EMCPResponseStatus::Error;
-				return false;
-			}
-
-			const int32 InsertIndex = ArrayHelper.AddValue();
-			if (AnimationObjectProperty != nullptr)
-			{
-				AnimationObjectProperty->SetObjectPropertyValue(ArrayHelper.GetRawPtr(InsertIndex), NewAnimation);
-			}
-			ResultAnimation = NewAnimation;
-			bCreated = true;
-		}
-		else if (bOverwrite)
-		{
-			if (AnimationObjectProperty != nullptr && ExistingIndex >= 0)
-			{
-				UWidgetAnimation* ReplacementAnimation = NewObject<UWidgetAnimation>(
-					WidgetBlueprint,
-					FName(*AnimationName),
-					RF_Public | RF_Transactional);
-				if (ReplacementAnimation == nullptr)
-				{
-					Transaction.Cancel();
-					FMCPDiagnostic Diagnostic;
-					Diagnostic.Code = MCPErrorCodes::INTERNAL_EXCEPTION;
-					Diagnostic.Message = TEXT("Failed to allocate replacement UWidgetAnimation object.");
-					OutResult.Diagnostics.Add(Diagnostic);
-					OutResult.Status = EMCPResponseStatus::Error;
-					return false;
-				}
-
-				AnimationObjectProperty->SetObjectPropertyValue(ArrayHelper.GetRawPtr(ExistingIndex), ReplacementAnimation);
-				ResultAnimation = ReplacementAnimation;
-				bCreated = true;
-			}
-		}
-
-		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WidgetBlueprint);
-		WidgetBlueprint->MarkPackageDirty();
-	}
-
-	TSharedRef<FJsonObject> CompileObject = MakeShared<FJsonObject>();
-	if (bCompileOnSuccess && !Request.Context.bDryRun)
-	{
-		FKismetEditorUtilities::CompileBlueprint(WidgetBlueprint);
-		CompileObject->SetStringField(TEXT("status"), TEXT("requested"));
-	}
-	else
-	{
-		CompileObject->SetStringField(TEXT("status"), TEXT("skipped"));
-	}
-
-	MCPObjectUtils::AppendTouchedPackage(WidgetBlueprint, OutResult.TouchedPackages);
-	bool bAllSaved = true;
-	if (!Request.Context.bDryRun && bAutoSave)
-	{
-		for (const FString& PackageName : OutResult.TouchedPackages)
-		{
-			bAllSaved &= SavePackageByName(PackageName, OutResult);
-		}
-	}
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetBoolField(TEXT("created"), bCreated && !Request.Context.bDryRun);
-	OutResult.ResultObject->SetBoolField(TEXT("reused"), !bCreated && ResultAnimation != nullptr);
-	OutResult.ResultObject->SetBoolField(TEXT("dry_run"), Request.Context.bDryRun);
-	OutResult.ResultObject->SetStringField(TEXT("animation_name"), AnimationName);
-	OutResult.ResultObject->SetStringField(TEXT("animation_object_path"), ResultAnimation != nullptr ? ResultAnimation->GetPathName() : FString());
-	OutResult.ResultObject->SetObjectField(TEXT("compile"), CompileObject);
-	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(OutResult.TouchedPackages));
-	OutResult.Status = bAllSaved ? EMCPResponseStatus::Ok : EMCPResponseStatus::Partial;
-	return true;
+			return SavePackageByName(PackageName, InOutResult);
+		});
 }
 
 bool UMCPToolRegistrySubsystem::HandleUMGAnimationRemove(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString ObjectPath;
-	FString AnimationName;
-	bool bCompileOnSuccess = true;
-	bool bAutoSave = false;
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
-		Request.Params->TryGetStringField(TEXT("animation_name"), AnimationName);
-		Request.Params->TryGetBoolField(TEXT("compile_on_success"), bCompileOnSuccess);
-		ParseAutoSaveOption(Request.Params, bAutoSave);
-	}
-
-	if (ObjectPath.IsEmpty() || AnimationName.IsEmpty())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("object_path and animation_name are required for umg.animation.remove.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UWidgetBlueprint* WidgetBlueprint = LoadWidgetBlueprintByPath(ObjectPath);
-	if (WidgetBlueprint == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::OBJECT_NOT_FOUND;
-		Diagnostic.Message = TEXT("Widget blueprint not found.");
-		Diagnostic.Detail = ObjectPath;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	FArrayProperty* AnimationsArrayProperty = nullptr;
-	void* AnimationsArrayPtr = nullptr;
-	if (!TryResolveWidgetAnimationArray(WidgetBlueprint, AnimationsArrayProperty, AnimationsArrayPtr))
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = TEXT("MCP.UMG.ANIMATION.UNSUPPORTED");
-		Diagnostic.Message = TEXT("Current engine/widget blueprint does not expose animations array via reflection.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	const FObjectPropertyBase* AnimationObjectProperty = CastField<FObjectPropertyBase>(AnimationsArrayProperty->Inner);
-	FScriptArrayHelper ArrayHelper(AnimationsArrayProperty, AnimationsArrayPtr);
-
-	TArray<int32> RemoveIndices;
-	TArray<FString> RemovedObjectPaths;
-	for (int32 Index = 0; Index < ArrayHelper.Num(); ++Index)
-	{
-		UObject* AnimationObject = AnimationObjectProperty != nullptr
-			? AnimationObjectProperty->GetObjectPropertyValue(ArrayHelper.GetRawPtr(Index))
-			: nullptr;
-		if (AnimationObject == nullptr)
+	return FMCPToolsUMGAnimationHandler::HandleAnimationRemove(
+		Request,
+		OutResult,
+		[](const FString& PackageName, FMCPToolExecutionResult& InOutResult)
 		{
-			continue;
-		}
-
-		if (AnimationObject->GetName().Equals(AnimationName, ESearchCase::IgnoreCase)
-			|| AnimationObject->GetPathName().Equals(AnimationName, ESearchCase::IgnoreCase))
-		{
-			RemoveIndices.Add(Index);
-			RemovedObjectPaths.Add(AnimationObject->GetPathName());
-		}
-	}
-
-	if (!Request.Context.bDryRun && RemoveIndices.Num() > 0)
-	{
-		FScopedTransaction Transaction(FText::FromString(TEXT("MCP UMG Animation Remove")));
-		WidgetBlueprint->Modify();
-
-		RemoveIndices.Sort();
-		for (int32 RemoveIdx = RemoveIndices.Num() - 1; RemoveIdx >= 0; --RemoveIdx)
-		{
-			ArrayHelper.RemoveValues(RemoveIndices[RemoveIdx], 1);
-		}
-
-		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WidgetBlueprint);
-		WidgetBlueprint->MarkPackageDirty();
-	}
-
-	TSharedRef<FJsonObject> CompileObject = MakeShared<FJsonObject>();
-	if (bCompileOnSuccess && !Request.Context.bDryRun)
-	{
-		FKismetEditorUtilities::CompileBlueprint(WidgetBlueprint);
-		CompileObject->SetStringField(TEXT("status"), TEXT("requested"));
-	}
-	else
-	{
-		CompileObject->SetStringField(TEXT("status"), TEXT("skipped"));
-	}
-
-	MCPObjectUtils::AppendTouchedPackage(WidgetBlueprint, OutResult.TouchedPackages);
-	bool bAllSaved = true;
-	if (!Request.Context.bDryRun && bAutoSave)
-	{
-		for (const FString& PackageName : OutResult.TouchedPackages)
-		{
-			bAllSaved &= SavePackageByName(PackageName, OutResult);
-		}
-	}
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetBoolField(TEXT("dry_run"), Request.Context.bDryRun);
-	OutResult.ResultObject->SetNumberField(TEXT("removed_count"), RemoveIndices.Num());
-	OutResult.ResultObject->SetArrayField(TEXT("removed"), ToJsonStringArray(RemovedObjectPaths));
-	OutResult.ResultObject->SetObjectField(TEXT("compile"), CompileObject);
-	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(OutResult.TouchedPackages));
-	OutResult.Status = bAllSaved ? EMCPResponseStatus::Ok : EMCPResponseStatus::Partial;
-	return true;
+			return SavePackageByName(PackageName, InOutResult);
+		});
 }
 
 bool UMCPToolRegistrySubsystem::HandleUMGAnimationTrackAdd(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString ObjectPath;
-	FString AnimationName;
-	FString PropertyPath;
-	const TSharedPtr<FJsonObject>* WidgetRef = nullptr;
-	bool bCompileOnSuccess = true;
-	bool bAutoSave = false;
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
-		Request.Params->TryGetStringField(TEXT("animation_name"), AnimationName);
-		Request.Params->TryGetStringField(TEXT("property_path"), PropertyPath);
-		Request.Params->TryGetObjectField(TEXT("widget_ref"), WidgetRef);
-		Request.Params->TryGetBoolField(TEXT("compile_on_success"), bCompileOnSuccess);
-		ParseAutoSaveOption(Request.Params, bAutoSave);
-	}
-
-	if (ObjectPath.IsEmpty() || AnimationName.IsEmpty() || PropertyPath.IsEmpty() || WidgetRef == nullptr || !WidgetRef->IsValid())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("object_path, animation_name, widget_ref and property_path are required for umg.animation.track.add.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	FMCPUMGAnimationPropertySpec PropertySpec;
-	FMCPDiagnostic ParseDiagnostic;
-	if (!MCPUMGAnim_ParsePropertySpec(PropertyPath, false, PropertySpec, ParseDiagnostic))
-	{
-		OutResult.Diagnostics.Add(ParseDiagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UWidgetBlueprint* WidgetBlueprint = LoadWidgetBlueprintByPath(ObjectPath);
-	UWidget* Widget = ResolveWidgetFromRef(WidgetBlueprint, WidgetRef);
-	if (WidgetBlueprint == nullptr || Widget == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::OBJECT_NOT_FOUND;
-		Diagnostic.Message = TEXT("object_path or widget_ref could not be resolved.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UWidgetAnimation* Animation = MCPUMGAnim_FindAnimationByNameOrPath(WidgetBlueprint, AnimationName);
-	if (Animation == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::OBJECT_NOT_FOUND;
-		Diagnostic.Message = TEXT("animation_name was not found in widget blueprint.");
-		Diagnostic.Detail = AnimationName;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UMovieScene* MovieScene = Animation->GetMovieScene();
-	if (MovieScene == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = TEXT("MCP.UMG.ANIMATION.NO_MOVIESCENE");
-		Diagnostic.Message = TEXT("Target animation has no MovieScene.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	bool bBindingCreated = false;
-	bool bTrackAdded = false;
-	bool bSectionAdded = false;
-	FGuid BindingGuid;
-	if (!Request.Context.bDryRun)
-	{
-		FScopedTransaction Transaction(FText::FromString(TEXT("MCP UMG Animation Track Add")));
-		WidgetBlueprint->Modify();
-		Animation->Modify();
-		MovieScene->Modify();
-
-		FMCPDiagnostic BindingDiagnostic;
-		if (!MCPUMGAnim_ResolveBindingGuid(Animation, Widget, true, BindingGuid, bBindingCreated, BindingDiagnostic))
+	return FMCPToolsUMGAnimationHandler::HandleAnimationTrackAdd(
+		Request,
+		OutResult,
+		[](const FString& PackageName, FMCPToolExecutionResult& InOutResult)
 		{
-			Transaction.Cancel();
-			OutResult.Diagnostics.Add(BindingDiagnostic);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-
-		UMovieSceneTrack* Track = MCPUMGAnim_FindOrAddTrackForSpec(
-			MovieScene,
-			BindingGuid,
-			PropertySpec,
-			true,
-			bTrackAdded);
-		if (Track == nullptr)
-		{
-			Transaction.Cancel();
-			FMCPDiagnostic Diagnostic;
-			Diagnostic.Code = TEXT("MCP.UMG.ANIMATION.TRACK_CREATE_FAILED");
-			Diagnostic.Message = TEXT("Failed to resolve or create MovieScene track.");
-			Diagnostic.Detail = PropertySpec.CanonicalPath;
-			OutResult.Diagnostics.Add(Diagnostic);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-
-		if (PropertySpec.TrackKind == EMCPUMGAnimationTrackKind::Float)
-		{
-			FMovieSceneFloatChannel* FloatChannel = MCPUMGAnim_ResolveChannelFromTrack(Track, PropertySpec, true, bSectionAdded);
-			if (FloatChannel == nullptr)
-			{
-				Transaction.Cancel();
-				FMCPDiagnostic Diagnostic;
-				Diagnostic.Code = TEXT("MCP.UMG.ANIMATION.SECTION_CREATE_FAILED");
-				Diagnostic.Message = TEXT("Failed to resolve float section/channel for track.");
-				OutResult.Diagnostics.Add(Diagnostic);
-				OutResult.Status = EMCPResponseStatus::Error;
-				return false;
-			}
-		}
-		else
-		{
-			if (PropertySpec.TrackKind == EMCPUMGAnimationTrackKind::Transform2D)
-			{
-				UMovieScene2DTransformTrack* TransformTrack = Cast<UMovieScene2DTransformTrack>(Track);
-				UMovieScene2DTransformSection* Section = MCPUMGAnim_FindOrAddSection<UMovieScene2DTransformSection>(
-					TransformTrack, true, bSectionAdded);
-				if (Section == nullptr)
-				{
-					Transaction.Cancel();
-					FMCPDiagnostic Diagnostic;
-					Diagnostic.Code = TEXT("MCP.UMG.ANIMATION.SECTION_CREATE_FAILED");
-					Diagnostic.Message = TEXT("Failed to resolve transform section for track.");
-					OutResult.Diagnostics.Add(Diagnostic);
-					OutResult.Status = EMCPResponseStatus::Error;
-					return false;
-				}
-			}
-			else if (PropertySpec.TrackKind == EMCPUMGAnimationTrackKind::Color)
-			{
-				UMovieSceneColorTrack* ColorTrack = Cast<UMovieSceneColorTrack>(Track);
-				UMovieSceneColorSection* Section = MCPUMGAnim_FindOrAddSection<UMovieSceneColorSection>(
-					ColorTrack, true, bSectionAdded);
-				if (Section == nullptr)
-				{
-					Transaction.Cancel();
-					FMCPDiagnostic Diagnostic;
-					Diagnostic.Code = TEXT("MCP.UMG.ANIMATION.SECTION_CREATE_FAILED");
-					Diagnostic.Message = TEXT("Failed to resolve color section for track.");
-					OutResult.Diagnostics.Add(Diagnostic);
-					OutResult.Status = EMCPResponseStatus::Error;
-					return false;
-				}
-			}
-		}
-
-		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WidgetBlueprint);
-		WidgetBlueprint->MarkPackageDirty();
-	}
-	else
-	{
-		FMCPDiagnostic BindingDiagnostic;
-		bool bDummyCreated = false;
-		MCPUMGAnim_ResolveBindingGuid(Animation, Widget, false, BindingGuid, bDummyCreated, BindingDiagnostic);
-		if (BindingGuid.IsValid())
-		{
-			UMovieSceneTrack* ExistingTrack = MCPUMGAnim_FindOrAddTrackForSpec(
-				MovieScene,
-				BindingGuid,
-				PropertySpec,
-				false,
-				bTrackAdded);
-			bTrackAdded = ExistingTrack == nullptr;
-		}
-		else
-		{
-			bBindingCreated = true;
-			bTrackAdded = true;
-			bSectionAdded = true;
-		}
-	}
-
-	TSharedRef<FJsonObject> CompileObject = MakeShared<FJsonObject>();
-	if (bCompileOnSuccess && !Request.Context.bDryRun)
-	{
-		FKismetEditorUtilities::CompileBlueprint(WidgetBlueprint);
-		CompileObject->SetStringField(TEXT("status"), TEXT("requested"));
-	}
-	else
-	{
-		CompileObject->SetStringField(TEXT("status"), TEXT("skipped"));
-	}
-
-	MCPObjectUtils::AppendTouchedPackage(WidgetBlueprint, OutResult.TouchedPackages);
-	bool bAllSaved = true;
-	if (!Request.Context.bDryRun && bAutoSave)
-	{
-		for (const FString& PackageName : OutResult.TouchedPackages)
-		{
-			bAllSaved &= SavePackageByName(PackageName, OutResult);
-		}
-	}
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetBoolField(TEXT("dry_run"), Request.Context.bDryRun);
-	OutResult.ResultObject->SetBoolField(TEXT("binding_created"), bBindingCreated && !Request.Context.bDryRun);
-	OutResult.ResultObject->SetBoolField(TEXT("track_added"), bTrackAdded);
-	OutResult.ResultObject->SetBoolField(TEXT("section_added"), bSectionAdded);
-	OutResult.ResultObject->SetStringField(TEXT("track_kind"), MCPUMGAnim_TrackKindToString(PropertySpec.TrackKind));
-	OutResult.ResultObject->SetStringField(TEXT("property_path"), PropertySpec.CanonicalPath);
-	OutResult.ResultObject->SetStringField(TEXT("channel"), MCPUMGAnim_ChannelToString(PropertySpec.Channel));
-	OutResult.ResultObject->SetStringField(TEXT("widget_name"), Widget->GetName());
-	OutResult.ResultObject->SetStringField(TEXT("animation_object_path"), Animation->GetPathName());
-	OutResult.ResultObject->SetStringField(TEXT("binding_guid"), BindingGuid.IsValid() ? BindingGuid.ToString() : FString());
-	OutResult.ResultObject->SetObjectField(TEXT("compile"), CompileObject);
-	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(OutResult.TouchedPackages));
-	OutResult.Status = bAllSaved ? EMCPResponseStatus::Ok : EMCPResponseStatus::Partial;
-	return true;
+			return SavePackageByName(PackageName, InOutResult);
+		});
 }
 
 bool UMCPToolRegistrySubsystem::HandleUMGAnimationKeySet(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString ObjectPath;
-	FString AnimationName;
-	FString PropertyPath;
-	const TSharedPtr<FJsonObject>* WidgetRef = nullptr;
-	double KeyValue = 0.0;
-	bool bHasValue = false;
-	bool bCompileOnSuccess = true;
-	bool bAutoSave = false;
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
-		Request.Params->TryGetStringField(TEXT("animation_name"), AnimationName);
-		Request.Params->TryGetStringField(TEXT("property_path"), PropertyPath);
-		Request.Params->TryGetObjectField(TEXT("widget_ref"), WidgetRef);
-		bHasValue = Request.Params->TryGetNumberField(TEXT("value"), KeyValue);
-		Request.Params->TryGetBoolField(TEXT("compile_on_success"), bCompileOnSuccess);
-		ParseAutoSaveOption(Request.Params, bAutoSave);
-	}
-
-	if (ObjectPath.IsEmpty() || AnimationName.IsEmpty() || PropertyPath.IsEmpty() || WidgetRef == nullptr || !WidgetRef->IsValid() || !bHasValue)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("object_path, animation_name, widget_ref, property_path and value are required for umg.animation.key.set.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	FMCPUMGAnimationPropertySpec PropertySpec;
-	FMCPDiagnostic ParseDiagnostic;
-	if (!MCPUMGAnim_ParsePropertySpec(PropertyPath, true, PropertySpec, ParseDiagnostic))
-	{
-		OutResult.Diagnostics.Add(ParseDiagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UWidgetBlueprint* WidgetBlueprint = LoadWidgetBlueprintByPath(ObjectPath);
-	UWidget* Widget = ResolveWidgetFromRef(WidgetBlueprint, WidgetRef);
-	if (WidgetBlueprint == nullptr || Widget == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::OBJECT_NOT_FOUND;
-		Diagnostic.Message = TEXT("object_path or widget_ref could not be resolved.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UWidgetAnimation* Animation = MCPUMGAnim_FindAnimationByNameOrPath(WidgetBlueprint, AnimationName);
-	if (Animation == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::OBJECT_NOT_FOUND;
-		Diagnostic.Message = TEXT("animation_name was not found in widget blueprint.");
-		Diagnostic.Detail = AnimationName;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UMovieScene* MovieScene = Animation->GetMovieScene();
-	if (MovieScene == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = TEXT("MCP.UMG.ANIMATION.NO_MOVIESCENE");
-		Diagnostic.Message = TEXT("Target animation has no MovieScene.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	FFrameNumber FrameNumber = 0;
-	double TimeSeconds = 0.0;
-	FMCPDiagnostic TimeDiagnostic;
-	if (!MCPUMGAnim_ParseKeyTime(Request.Params, MovieScene->GetTickResolution(), FrameNumber, TimeSeconds, TimeDiagnostic))
-	{
-		OutResult.Diagnostics.Add(TimeDiagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	EMovieSceneKeyInterpolation Interpolation = EMovieSceneKeyInterpolation::Auto;
-	FMCPDiagnostic InterpolationDiagnostic;
-	if (!MCPUMGAnim_ParseInterpolation(Request.Params, Interpolation, InterpolationDiagnostic))
-	{
-		OutResult.Diagnostics.Add(InterpolationDiagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	bool bBindingCreated = false;
-	bool bTrackAdded = false;
-	bool bSectionAdded = false;
-	bool bKeySet = false;
-	FGuid BindingGuid;
-	if (!Request.Context.bDryRun)
-	{
-		FScopedTransaction Transaction(FText::FromString(TEXT("MCP UMG Animation Key Set")));
-		WidgetBlueprint->Modify();
-		Animation->Modify();
-		MovieScene->Modify();
-
-		FMCPDiagnostic BindingDiagnostic;
-		if (!MCPUMGAnim_ResolveBindingGuid(Animation, Widget, true, BindingGuid, bBindingCreated, BindingDiagnostic))
+	return FMCPToolsUMGAnimationHandler::HandleAnimationKeySet(
+		Request,
+		OutResult,
+		[](const FString& PackageName, FMCPToolExecutionResult& InOutResult)
 		{
-			Transaction.Cancel();
-			OutResult.Diagnostics.Add(BindingDiagnostic);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-
-		UMovieSceneTrack* Track = MCPUMGAnim_FindOrAddTrackForSpec(
-			MovieScene,
-			BindingGuid,
-			PropertySpec,
-			true,
-			bTrackAdded);
-		if (Track == nullptr)
-		{
-			Transaction.Cancel();
-			FMCPDiagnostic Diagnostic;
-			Diagnostic.Code = TEXT("MCP.UMG.ANIMATION.TRACK_CREATE_FAILED");
-			Diagnostic.Message = TEXT("Failed to resolve or create MovieScene track.");
-			Diagnostic.Detail = PropertySpec.CanonicalPath;
-			OutResult.Diagnostics.Add(Diagnostic);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-
-		FMovieSceneFloatChannel* Channel = MCPUMGAnim_ResolveChannelFromTrack(Track, PropertySpec, true, bSectionAdded);
-		if (Channel == nullptr)
-		{
-			Transaction.Cancel();
-			FMCPDiagnostic Diagnostic;
-			Diagnostic.Code = TEXT("MCP.UMG.ANIMATION.CHANNEL_NOT_FOUND");
-			Diagnostic.Message = TEXT("Failed to resolve channel for property_path.");
-			Diagnostic.Detail = PropertySpec.CanonicalPath;
-			OutResult.Diagnostics.Add(Diagnostic);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-
-		const int32 AddedKeyIndex = AddFloatKeyWithInterpolation(
-			Channel,
-			FrameNumber,
-			static_cast<float>(KeyValue),
-			Interpolation);
-		bKeySet = AddedKeyIndex != INDEX_NONE;
-		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WidgetBlueprint);
-		WidgetBlueprint->MarkPackageDirty();
-	}
-	else
-	{
-		bKeySet = true;
-	}
-
-	TSharedRef<FJsonObject> CompileObject = MakeShared<FJsonObject>();
-	if (bCompileOnSuccess && !Request.Context.bDryRun)
-	{
-		FKismetEditorUtilities::CompileBlueprint(WidgetBlueprint);
-		CompileObject->SetStringField(TEXT("status"), TEXT("requested"));
-	}
-	else
-	{
-		CompileObject->SetStringField(TEXT("status"), TEXT("skipped"));
-	}
-
-	MCPObjectUtils::AppendTouchedPackage(WidgetBlueprint, OutResult.TouchedPackages);
-	bool bAllSaved = true;
-	if (!Request.Context.bDryRun && bAutoSave)
-	{
-		for (const FString& PackageName : OutResult.TouchedPackages)
-		{
-			bAllSaved &= SavePackageByName(PackageName, OutResult);
-		}
-	}
-
-	FString InterpolationString = TEXT("auto");
-	switch (Interpolation)
-	{
-	case EMovieSceneKeyInterpolation::SmartAuto:
-		InterpolationString = TEXT("smart_auto");
-		break;
-	case EMovieSceneKeyInterpolation::Linear:
-		InterpolationString = TEXT("linear");
-		break;
-	case EMovieSceneKeyInterpolation::Constant:
-		InterpolationString = TEXT("constant");
-		break;
-	case EMovieSceneKeyInterpolation::User:
-		InterpolationString = TEXT("user");
-		break;
-	case EMovieSceneKeyInterpolation::Break:
-		InterpolationString = TEXT("break");
-		break;
-	case EMovieSceneKeyInterpolation::Auto:
-	default:
-		InterpolationString = TEXT("auto");
-		break;
-	}
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetBoolField(TEXT("dry_run"), Request.Context.bDryRun);
-	OutResult.ResultObject->SetBoolField(TEXT("binding_created"), bBindingCreated && !Request.Context.bDryRun);
-	OutResult.ResultObject->SetBoolField(TEXT("track_added"), bTrackAdded && !Request.Context.bDryRun);
-	OutResult.ResultObject->SetBoolField(TEXT("section_added"), bSectionAdded && !Request.Context.bDryRun);
-	OutResult.ResultObject->SetBoolField(TEXT("key_set"), bKeySet);
-	OutResult.ResultObject->SetNumberField(TEXT("frame"), FrameNumber.Value);
-	OutResult.ResultObject->SetNumberField(TEXT("time_seconds"), TimeSeconds);
-	OutResult.ResultObject->SetNumberField(TEXT("value"), KeyValue);
-	OutResult.ResultObject->SetStringField(TEXT("interpolation"), InterpolationString);
-	OutResult.ResultObject->SetStringField(TEXT("track_kind"), MCPUMGAnim_TrackKindToString(PropertySpec.TrackKind));
-	OutResult.ResultObject->SetStringField(TEXT("property_path"), PropertySpec.CanonicalPath);
-	OutResult.ResultObject->SetStringField(TEXT("channel"), MCPUMGAnim_ChannelToString(PropertySpec.Channel));
-	OutResult.ResultObject->SetStringField(TEXT("widget_name"), Widget->GetName());
-	OutResult.ResultObject->SetStringField(TEXT("animation_object_path"), Animation->GetPathName());
-	OutResult.ResultObject->SetStringField(TEXT("binding_guid"), BindingGuid.IsValid() ? BindingGuid.ToString() : FString());
-	OutResult.ResultObject->SetObjectField(TEXT("compile"), CompileObject);
-	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(OutResult.TouchedPackages));
-	OutResult.Status = bAllSaved ? EMCPResponseStatus::Ok : EMCPResponseStatus::Partial;
-	return true;
+			return SavePackageByName(PackageName, InOutResult);
+		});
 }
 
 bool UMCPToolRegistrySubsystem::HandleUMGAnimationKeyRemove(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString ObjectPath;
-	FString AnimationName;
-	FString PropertyPath;
-	const TSharedPtr<FJsonObject>* WidgetRef = nullptr;
-	bool bCompileOnSuccess = true;
-	bool bAutoSave = false;
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
-		Request.Params->TryGetStringField(TEXT("animation_name"), AnimationName);
-		Request.Params->TryGetStringField(TEXT("property_path"), PropertyPath);
-		Request.Params->TryGetObjectField(TEXT("widget_ref"), WidgetRef);
-		Request.Params->TryGetBoolField(TEXT("compile_on_success"), bCompileOnSuccess);
-		ParseAutoSaveOption(Request.Params, bAutoSave);
-	}
-
-	if (ObjectPath.IsEmpty() || AnimationName.IsEmpty() || PropertyPath.IsEmpty() || WidgetRef == nullptr || !WidgetRef->IsValid())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("object_path, animation_name, widget_ref and property_path are required for umg.animation.key.remove.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	FMCPUMGAnimationPropertySpec PropertySpec;
-	FMCPDiagnostic ParseDiagnostic;
-	if (!MCPUMGAnim_ParsePropertySpec(PropertyPath, true, PropertySpec, ParseDiagnostic))
-	{
-		OutResult.Diagnostics.Add(ParseDiagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UWidgetBlueprint* WidgetBlueprint = LoadWidgetBlueprintByPath(ObjectPath);
-	UWidget* Widget = ResolveWidgetFromRef(WidgetBlueprint, WidgetRef);
-	if (WidgetBlueprint == nullptr || Widget == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::OBJECT_NOT_FOUND;
-		Diagnostic.Message = TEXT("object_path or widget_ref could not be resolved.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UWidgetAnimation* Animation = MCPUMGAnim_FindAnimationByNameOrPath(WidgetBlueprint, AnimationName);
-	if (Animation == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::OBJECT_NOT_FOUND;
-		Diagnostic.Message = TEXT("animation_name was not found in widget blueprint.");
-		Diagnostic.Detail = AnimationName;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UMovieScene* MovieScene = Animation->GetMovieScene();
-	if (MovieScene == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = TEXT("MCP.UMG.ANIMATION.NO_MOVIESCENE");
-		Diagnostic.Message = TEXT("Target animation has no MovieScene.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	FFrameNumber FrameNumber = 0;
-	double TimeSeconds = 0.0;
-	FMCPDiagnostic TimeDiagnostic;
-	if (!MCPUMGAnim_ParseKeyTime(Request.Params, MovieScene->GetTickResolution(), FrameNumber, TimeSeconds, TimeDiagnostic))
-	{
-		OutResult.Diagnostics.Add(TimeDiagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	int32 RemovedCount = 0;
-	bool bTrackFound = false;
-	bool bSectionFound = false;
-	FGuid BindingGuid;
-	if (!Request.Context.bDryRun)
-	{
-		FScopedTransaction Transaction(FText::FromString(TEXT("MCP UMG Animation Key Remove")));
-		WidgetBlueprint->Modify();
-		Animation->Modify();
-		MovieScene->Modify();
-
-		FMCPDiagnostic BindingDiagnostic;
-		bool bBindingCreated = false;
-		if (!MCPUMGAnim_ResolveBindingGuid(Animation, Widget, false, BindingGuid, bBindingCreated, BindingDiagnostic))
+	return FMCPToolsUMGAnimationHandler::HandleAnimationKeyRemove(
+		Request,
+		OutResult,
+		[](const FString& PackageName, FMCPToolExecutionResult& InOutResult)
 		{
-			Transaction.Cancel();
-			if (!BindingDiagnostic.Code.Equals(TEXT("MCP.UMG.ANIMATION.BINDING_NOT_FOUND"), ESearchCase::IgnoreCase))
-			{
-				OutResult.Diagnostics.Add(BindingDiagnostic);
-				OutResult.Status = EMCPResponseStatus::Error;
-				return false;
-			}
-		}
-		else
-		{
-			bool bTrackAdded = false;
-			UMovieSceneTrack* Track = MCPUMGAnim_FindOrAddTrackForSpec(
-				MovieScene,
-				BindingGuid,
-				PropertySpec,
-				false,
-				bTrackAdded);
-			bTrackFound = Track != nullptr;
-			if (Track != nullptr)
-			{
-				bool bSectionAdded = false;
-				FMovieSceneFloatChannel* Channel = MCPUMGAnim_ResolveChannelFromTrack(Track, PropertySpec, false, bSectionAdded);
-				bSectionFound = Channel != nullptr;
-				if (Channel != nullptr)
-				{
-					auto ChannelData = Channel->GetData();
-					int32 KeyIndex = ChannelData.FindKey(FrameNumber, 0);
-					while (KeyIndex != INDEX_NONE)
-					{
-						ChannelData.RemoveKey(KeyIndex);
-						++RemovedCount;
-						KeyIndex = ChannelData.FindKey(FrameNumber, 0);
-					}
-				}
-			}
-		}
-
-		if (RemovedCount > 0)
-		{
-			FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WidgetBlueprint);
-			WidgetBlueprint->MarkPackageDirty();
-		}
-		else
-		{
-			Transaction.Cancel();
-		}
-	}
-	else
-	{
-		RemovedCount = 0;
-	}
-
-	TSharedRef<FJsonObject> CompileObject = MakeShared<FJsonObject>();
-	const bool bShouldCompile = bCompileOnSuccess && !Request.Context.bDryRun && RemovedCount > 0;
-	if (bShouldCompile)
-	{
-		FKismetEditorUtilities::CompileBlueprint(WidgetBlueprint);
-		CompileObject->SetStringField(TEXT("status"), TEXT("requested"));
-	}
-	else
-	{
-		CompileObject->SetStringField(TEXT("status"), TEXT("skipped"));
-	}
-
-	MCPObjectUtils::AppendTouchedPackage(WidgetBlueprint, OutResult.TouchedPackages);
-	bool bAllSaved = true;
-	if (!Request.Context.bDryRun && bAutoSave && RemovedCount > 0)
-	{
-		for (const FString& PackageName : OutResult.TouchedPackages)
-		{
-			bAllSaved &= SavePackageByName(PackageName, OutResult);
-		}
-	}
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetBoolField(TEXT("dry_run"), Request.Context.bDryRun);
-	OutResult.ResultObject->SetNumberField(TEXT("removed_count"), RemovedCount);
-	OutResult.ResultObject->SetBoolField(TEXT("track_found"), bTrackFound || Request.Context.bDryRun);
-	OutResult.ResultObject->SetBoolField(TEXT("section_found"), bSectionFound || Request.Context.bDryRun);
-	OutResult.ResultObject->SetNumberField(TEXT("frame"), FrameNumber.Value);
-	OutResult.ResultObject->SetNumberField(TEXT("time_seconds"), TimeSeconds);
-	OutResult.ResultObject->SetStringField(TEXT("track_kind"), MCPUMGAnim_TrackKindToString(PropertySpec.TrackKind));
-	OutResult.ResultObject->SetStringField(TEXT("property_path"), PropertySpec.CanonicalPath);
-	OutResult.ResultObject->SetStringField(TEXT("channel"), MCPUMGAnim_ChannelToString(PropertySpec.Channel));
-	OutResult.ResultObject->SetStringField(TEXT("widget_name"), Widget->GetName());
-	OutResult.ResultObject->SetStringField(TEXT("animation_object_path"), Animation->GetPathName());
-	OutResult.ResultObject->SetStringField(TEXT("binding_guid"), BindingGuid.IsValid() ? BindingGuid.ToString() : FString());
-	OutResult.ResultObject->SetObjectField(TEXT("compile"), CompileObject);
-	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(OutResult.TouchedPackages));
-	OutResult.Status = bAllSaved ? EMCPResponseStatus::Ok : EMCPResponseStatus::Partial;
-	return true;
+			return SavePackageByName(PackageName, InOutResult);
+		});
 }
 
 bool UMCPToolRegistrySubsystem::HandleUMGBindingList(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString ObjectPath;
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
-	}
-
-	UWidgetBlueprint* WidgetBlueprint = LoadWidgetBlueprintByPath(ObjectPath);
-	if (WidgetBlueprint == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::OBJECT_NOT_FOUND;
-		Diagnostic.Message = TEXT("Widget blueprint not found.");
-		Diagnostic.Detail = ObjectPath;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	FArrayProperty* BindingsArrayProperty = nullptr;
-	void* BindingsArrayPtr = nullptr;
-	if (!TryGetWidgetBlueprintBindingArray(WidgetBlueprint, BindingsArrayProperty, BindingsArrayPtr))
-	{
-		TArray<TSharedPtr<FJsonValue>> EmptyBindings;
-		OutResult.ResultObject = MakeShared<FJsonObject>();
-		OutResult.ResultObject->SetArrayField(TEXT("bindings"), EmptyBindings);
-		OutResult.ResultObject->SetNumberField(TEXT("binding_count"), 0);
-		OutResult.Status = EMCPResponseStatus::Ok;
-		return true;
-	}
-
-	const FStructProperty* BindingStructProperty = CastField<FStructProperty>(BindingsArrayProperty->Inner);
-	FScriptArrayHelper ArrayHelper(BindingsArrayProperty, BindingsArrayPtr);
-	TArray<TSharedPtr<FJsonValue>> Bindings;
-	Bindings.Reserve(ArrayHelper.Num());
-	for (int32 Index = 0; Index < ArrayHelper.Num(); ++Index)
-	{
-		const void* EntryPtr = ArrayHelper.GetRawPtr(Index);
-		if (EntryPtr == nullptr)
-		{
-			continue;
-		}
-
-		FString ObjectName;
-		FString PropertyName;
-		FString FunctionName;
-		FString SourcePath;
-		TryReadStructFieldAsString(BindingStructProperty->Struct, EntryPtr, { TEXT("ObjectName"), TEXT("WidgetName") }, ObjectName);
-		TryReadStructFieldAsString(BindingStructProperty->Struct, EntryPtr, { TEXT("PropertyName"), TEXT("DelegatePropertyName") }, PropertyName);
-		TryReadStructFieldAsString(BindingStructProperty->Struct, EntryPtr, { TEXT("FunctionName"), TEXT("SourceFunctionName") }, FunctionName);
-		TryReadStructFieldAsString(BindingStructProperty->Struct, EntryPtr, { TEXT("SourcePath"), TEXT("SourcePathString") }, SourcePath);
-
-		TSharedRef<FJsonObject> BindingObject = MakeShared<FJsonObject>();
-		BindingObject->SetNumberField(TEXT("index"), Index);
-		BindingObject->SetStringField(TEXT("object_name"), ObjectName);
-		BindingObject->SetStringField(TEXT("property_name"), PropertyName);
-		BindingObject->SetStringField(TEXT("function_name"), FunctionName);
-		if (!SourcePath.IsEmpty())
-		{
-			BindingObject->SetStringField(TEXT("source_path"), SourcePath);
-		}
-		Bindings.Add(MakeShared<FJsonValueObject>(BindingObject));
-	}
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetArrayField(TEXT("bindings"), Bindings);
-	OutResult.ResultObject->SetNumberField(TEXT("binding_count"), Bindings.Num());
-	OutResult.Status = EMCPResponseStatus::Ok;
-	return true;
+	return FMCPToolsUMGReadHandler::HandleBindingList(Request, OutResult);
 }
 
 bool UMCPToolRegistrySubsystem::HandleUMGBindingSet(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString ObjectPath;
-	const TSharedPtr<FJsonObject>* WidgetRef = nullptr;
-	FString ObjectName;
-	FString PropertyName;
-	FString FunctionName;
-	bool bCompileOnSuccess = true;
-	bool bAutoSave = false;
-	bool bReplace = true;
-
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
-		Request.Params->TryGetObjectField(TEXT("widget_ref"), WidgetRef);
-		Request.Params->TryGetStringField(TEXT("object_name"), ObjectName);
-		Request.Params->TryGetStringField(TEXT("property_name"), PropertyName);
-		Request.Params->TryGetStringField(TEXT("function_name"), FunctionName);
-		Request.Params->TryGetBoolField(TEXT("compile_on_success"), bCompileOnSuccess);
-		Request.Params->TryGetBoolField(TEXT("replace"), bReplace);
-		ParseAutoSaveOption(Request.Params, bAutoSave);
-	}
-
-	UWidgetBlueprint* WidgetBlueprint = LoadWidgetBlueprintByPath(ObjectPath);
-	UWidget* Widget = ResolveWidgetFromRef(WidgetBlueprint, WidgetRef);
-	if (Widget != nullptr)
-	{
-		ObjectName = Widget->GetName();
-	}
-
-	if (WidgetBlueprint == nullptr || ObjectName.IsEmpty() || PropertyName.IsEmpty() || FunctionName.IsEmpty())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("object_path, property_name, function_name and (widget_ref|object_name) are required for umg.binding.set.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	FArrayProperty* BindingsArrayProperty = nullptr;
-	void* BindingsArrayPtr = nullptr;
-	if (!TryGetWidgetBlueprintBindingArray(WidgetBlueprint, BindingsArrayProperty, BindingsArrayPtr))
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = TEXT("MCP.UMG.BINDING.UNSUPPORTED");
-		Diagnostic.Message = TEXT("Current engine/widget blueprint does not expose Bindings array via reflection.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	const FStructProperty* BindingStructProperty = CastField<FStructProperty>(BindingsArrayProperty->Inner);
-	FScriptArrayHelper ArrayHelper(BindingsArrayProperty, BindingsArrayPtr);
-
-	int32 ExistingIndex = INDEX_NONE;
-	for (int32 Index = 0; Index < ArrayHelper.Num(); ++Index)
-	{
-		const void* EntryPtr = ArrayHelper.GetRawPtr(Index);
-		FString EntryObjectName;
-		FString EntryPropertyName;
-		TryReadStructFieldAsString(BindingStructProperty->Struct, EntryPtr, { TEXT("ObjectName"), TEXT("WidgetName") }, EntryObjectName);
-		TryReadStructFieldAsString(BindingStructProperty->Struct, EntryPtr, { TEXT("PropertyName"), TEXT("DelegatePropertyName") }, EntryPropertyName);
-		if (EntryObjectName.Equals(ObjectName, ESearchCase::IgnoreCase) && EntryPropertyName.Equals(PropertyName, ESearchCase::IgnoreCase))
+	return FMCPToolsUMGBindingHandler::HandleBindingSet(
+		Request,
+		OutResult,
+		[](const FString& PackageName, FMCPToolExecutionResult& InOutResult)
 		{
-			ExistingIndex = Index;
-			break;
-		}
-	}
-
-	int32 AppliedIndex = ExistingIndex;
-	if (!Request.Context.bDryRun)
-	{
-		FScopedTransaction Transaction(FText::FromString(TEXT("MCP UMG Binding Set")));
-		WidgetBlueprint->Modify();
-
-		if (ExistingIndex == INDEX_NONE)
-		{
-			AppliedIndex = ArrayHelper.AddValue();
-		}
-		else if (!bReplace)
-		{
-			FMCPDiagnostic Diagnostic;
-			Diagnostic.Code = MCPErrorCodes::IDEMPOTENCY_CONFLICT;
-			Diagnostic.Message = TEXT("Binding already exists and replace=false.");
-			Diagnostic.Detail = FString::Printf(TEXT("object=%s property=%s"), *ObjectName, *PropertyName);
-			OutResult.Diagnostics.Add(Diagnostic);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-
-		void* EntryPtr = ArrayHelper.GetRawPtr(AppliedIndex);
-		if (ExistingIndex == INDEX_NONE)
-		{
-			BindingStructProperty->InitializeValue(EntryPtr);
-		}
-		TryWriteStructFieldFromString(BindingStructProperty->Struct, EntryPtr, { TEXT("ObjectName"), TEXT("WidgetName") }, ObjectName);
-		TryWriteStructFieldFromString(BindingStructProperty->Struct, EntryPtr, { TEXT("PropertyName"), TEXT("DelegatePropertyName") }, PropertyName);
-		TryWriteStructFieldFromString(BindingStructProperty->Struct, EntryPtr, { TEXT("FunctionName"), TEXT("SourceFunctionName") }, FunctionName);
-		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WidgetBlueprint);
-		WidgetBlueprint->MarkPackageDirty();
-	}
-
-	TSharedRef<FJsonObject> CompileObject = MakeShared<FJsonObject>();
-	if (bCompileOnSuccess && !Request.Context.bDryRun)
-	{
-		FKismetEditorUtilities::CompileBlueprint(WidgetBlueprint);
-		CompileObject->SetStringField(TEXT("status"), TEXT("requested"));
-	}
-	else
-	{
-		CompileObject->SetStringField(TEXT("status"), TEXT("skipped"));
-	}
-
-	MCPObjectUtils::AppendTouchedPackage(WidgetBlueprint, OutResult.TouchedPackages);
-	bool bAllSaved = true;
-	if (!Request.Context.bDryRun && bAutoSave)
-	{
-		for (const FString& PackageName : OutResult.TouchedPackages)
-		{
-			bAllSaved &= SavePackageByName(PackageName, OutResult);
-		}
-	}
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetBoolField(TEXT("bound"), !Request.Context.bDryRun);
-	OutResult.ResultObject->SetBoolField(TEXT("dry_run"), Request.Context.bDryRun);
-	OutResult.ResultObject->SetStringField(TEXT("object_name"), ObjectName);
-	OutResult.ResultObject->SetStringField(TEXT("property_name"), PropertyName);
-	OutResult.ResultObject->SetStringField(TEXT("function_name"), FunctionName);
-	OutResult.ResultObject->SetNumberField(TEXT("binding_index"), AppliedIndex);
-	OutResult.ResultObject->SetObjectField(TEXT("compile"), CompileObject);
-	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(OutResult.TouchedPackages));
-	OutResult.Status = bAllSaved ? EMCPResponseStatus::Ok : EMCPResponseStatus::Partial;
-	return true;
+			return SavePackageByName(PackageName, InOutResult);
+		});
 }
 
 bool UMCPToolRegistrySubsystem::HandleUMGBindingClear(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString ObjectPath;
-	const TSharedPtr<FJsonObject>* WidgetRef = nullptr;
-	FString ObjectName;
-	FString PropertyName;
-	FString FunctionName;
-	bool bCompileOnSuccess = true;
-	bool bAutoSave = false;
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
-		Request.Params->TryGetObjectField(TEXT("widget_ref"), WidgetRef);
-		Request.Params->TryGetStringField(TEXT("object_name"), ObjectName);
-		Request.Params->TryGetStringField(TEXT("property_name"), PropertyName);
-		Request.Params->TryGetStringField(TEXT("function_name"), FunctionName);
-		Request.Params->TryGetBoolField(TEXT("compile_on_success"), bCompileOnSuccess);
-		ParseAutoSaveOption(Request.Params, bAutoSave);
-	}
-
-	UWidgetBlueprint* WidgetBlueprint = LoadWidgetBlueprintByPath(ObjectPath);
-	UWidget* Widget = ResolveWidgetFromRef(WidgetBlueprint, WidgetRef);
-	if (Widget != nullptr)
-	{
-		ObjectName = Widget->GetName();
-	}
-
-	if (WidgetBlueprint == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::OBJECT_NOT_FOUND;
-		Diagnostic.Message = TEXT("Widget blueprint not found.");
-		Diagnostic.Detail = ObjectPath;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	FArrayProperty* BindingsArrayProperty = nullptr;
-	void* BindingsArrayPtr = nullptr;
-	if (!TryGetWidgetBlueprintBindingArray(WidgetBlueprint, BindingsArrayProperty, BindingsArrayPtr))
-	{
-		TArray<TSharedPtr<FJsonValue>> EmptyRemoved;
-		OutResult.ResultObject = MakeShared<FJsonObject>();
-		OutResult.ResultObject->SetNumberField(TEXT("removed_count"), 0);
-		OutResult.ResultObject->SetArrayField(TEXT("removed"), EmptyRemoved);
-		OutResult.Status = EMCPResponseStatus::Ok;
-		return true;
-	}
-
-	const FStructProperty* BindingStructProperty = CastField<FStructProperty>(BindingsArrayProperty->Inner);
-	FScriptArrayHelper ArrayHelper(BindingsArrayProperty, BindingsArrayPtr);
-	TArray<int32> RemoveIndices;
-	TArray<FString> RemovedDescriptions;
-	for (int32 Index = 0; Index < ArrayHelper.Num(); ++Index)
-	{
-		const void* EntryPtr = ArrayHelper.GetRawPtr(Index);
-		FString EntryObjectName;
-		FString EntryPropertyName;
-		FString EntryFunctionName;
-		TryReadStructFieldAsString(BindingStructProperty->Struct, EntryPtr, { TEXT("ObjectName"), TEXT("WidgetName") }, EntryObjectName);
-		TryReadStructFieldAsString(BindingStructProperty->Struct, EntryPtr, { TEXT("PropertyName"), TEXT("DelegatePropertyName") }, EntryPropertyName);
-		TryReadStructFieldAsString(BindingStructProperty->Struct, EntryPtr, { TEXT("FunctionName"), TEXT("SourceFunctionName") }, EntryFunctionName);
-
-		const bool bObjectMatch = ObjectName.IsEmpty() || EntryObjectName.Equals(ObjectName, ESearchCase::IgnoreCase);
-		const bool bPropertyMatch = PropertyName.IsEmpty() || EntryPropertyName.Equals(PropertyName, ESearchCase::IgnoreCase);
-		const bool bFunctionMatch = FunctionName.IsEmpty() || EntryFunctionName.Equals(FunctionName, ESearchCase::IgnoreCase);
-		if (bObjectMatch && bPropertyMatch && bFunctionMatch)
+	return FMCPToolsUMGBindingHandler::HandleBindingClear(
+		Request,
+		OutResult,
+		[](const FString& PackageName, FMCPToolExecutionResult& InOutResult)
 		{
-			RemoveIndices.Add(Index);
-			RemovedDescriptions.Add(FString::Printf(TEXT("%s.%s -> %s"), *EntryObjectName, *EntryPropertyName, *EntryFunctionName));
-		}
-	}
-
-	if (!Request.Context.bDryRun && RemoveIndices.Num() > 0)
-	{
-		FScopedTransaction Transaction(FText::FromString(TEXT("MCP UMG Binding Clear")));
-		WidgetBlueprint->Modify();
-		RemoveIndices.Sort();
-		for (int32 RemoveIdx = RemoveIndices.Num() - 1; RemoveIdx >= 0; --RemoveIdx)
-		{
-			ArrayHelper.RemoveValues(RemoveIndices[RemoveIdx], 1);
-		}
-		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WidgetBlueprint);
-		WidgetBlueprint->MarkPackageDirty();
-	}
-
-	TSharedRef<FJsonObject> CompileObject = MakeShared<FJsonObject>();
-	if (bCompileOnSuccess && !Request.Context.bDryRun)
-	{
-		FKismetEditorUtilities::CompileBlueprint(WidgetBlueprint);
-		CompileObject->SetStringField(TEXT("status"), TEXT("requested"));
-	}
-	else
-	{
-		CompileObject->SetStringField(TEXT("status"), TEXT("skipped"));
-	}
-
-	MCPObjectUtils::AppendTouchedPackage(WidgetBlueprint, OutResult.TouchedPackages);
-	bool bAllSaved = true;
-	if (!Request.Context.bDryRun && bAutoSave)
-	{
-		for (const FString& PackageName : OutResult.TouchedPackages)
-		{
-			bAllSaved &= SavePackageByName(PackageName, OutResult);
-		}
-	}
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetBoolField(TEXT("dry_run"), Request.Context.bDryRun);
-	OutResult.ResultObject->SetNumberField(TEXT("removed_count"), RemoveIndices.Num());
-	OutResult.ResultObject->SetArrayField(TEXT("removed"), ToJsonStringArray(RemovedDescriptions));
-	OutResult.ResultObject->SetObjectField(TEXT("compile"), CompileObject);
-	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(OutResult.TouchedPackages));
-	OutResult.Status = bAllSaved ? EMCPResponseStatus::Ok : EMCPResponseStatus::Partial;
-	return true;
+			return SavePackageByName(PackageName, InOutResult);
+		});
 }
 
 bool UMCPToolRegistrySubsystem::HandleUMGWidgetEventBind(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	if (!Request.Params.IsValid())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("params are required for umg.widget.event.bind.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	FString EventName;
-	Request.Params->TryGetStringField(TEXT("event_name"), EventName);
-	if (EventName.IsEmpty())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("event_name is required for umg.widget.event.bind.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	FMCPRequestEnvelope DelegatedRequest = Request;
-	DelegatedRequest.Tool = TEXT("umg.binding.set");
-	DelegatedRequest.Params = MakeShared<FJsonObject>();
-	FString ObjectPath;
-	Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
-	DelegatedRequest.Params->SetStringField(TEXT("object_path"), ObjectPath);
-	const TSharedPtr<FJsonObject>* WidgetRef = nullptr;
-	if (Request.Params->TryGetObjectField(TEXT("widget_ref"), WidgetRef) && WidgetRef != nullptr && WidgetRef->IsValid())
-	{
-		DelegatedRequest.Params->SetObjectField(TEXT("widget_ref"), *WidgetRef);
-	}
-	DelegatedRequest.Params->SetStringField(TEXT("property_name"), EventName);
-	FString FunctionName;
-	Request.Params->TryGetStringField(TEXT("function_name"), FunctionName);
-	DelegatedRequest.Params->SetStringField(TEXT("function_name"), FunctionName);
-	bool bCompileOnSuccess = true;
-	Request.Params->TryGetBoolField(TEXT("compile_on_success"), bCompileOnSuccess);
-	DelegatedRequest.Params->SetBoolField(TEXT("compile_on_success"), bCompileOnSuccess);
-	return HandleUMGBindingSet(DelegatedRequest, OutResult);
+	return FMCPToolsUMGBindingHandler::HandleWidgetEventBind(
+		Request,
+		OutResult,
+		[](const FString& PackageName, FMCPToolExecutionResult& InOutResult)
+		{
+			return SavePackageByName(PackageName, InOutResult);
+		});
 }
 
 bool UMCPToolRegistrySubsystem::HandleUMGWidgetEventUnbind(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	if (!Request.Params.IsValid())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("params are required for umg.widget.event.unbind.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	FMCPRequestEnvelope DelegatedRequest = Request;
-	DelegatedRequest.Tool = TEXT("umg.binding.clear");
-	DelegatedRequest.Params = MakeShared<FJsonObject>();
-	FString ObjectPath;
-	Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
-	DelegatedRequest.Params->SetStringField(TEXT("object_path"), ObjectPath);
-	const TSharedPtr<FJsonObject>* WidgetRef = nullptr;
-	if (Request.Params->TryGetObjectField(TEXT("widget_ref"), WidgetRef) && WidgetRef != nullptr && WidgetRef->IsValid())
-	{
-		DelegatedRequest.Params->SetObjectField(TEXT("widget_ref"), *WidgetRef);
-	}
-	FString EventName;
-	Request.Params->TryGetStringField(TEXT("event_name"), EventName);
-	if (!EventName.IsEmpty())
-	{
-		DelegatedRequest.Params->SetStringField(TEXT("property_name"), EventName);
-	}
-	FString FunctionName;
-	Request.Params->TryGetStringField(TEXT("function_name"), FunctionName);
-	if (!FunctionName.IsEmpty())
-	{
-		DelegatedRequest.Params->SetStringField(TEXT("function_name"), FunctionName);
-	}
-	bool bCompileOnSuccess = true;
-	Request.Params->TryGetBoolField(TEXT("compile_on_success"), bCompileOnSuccess);
-	DelegatedRequest.Params->SetBoolField(TEXT("compile_on_success"), bCompileOnSuccess);
-	return HandleUMGBindingClear(DelegatedRequest, OutResult);
+	return FMCPToolsUMGBindingHandler::HandleWidgetEventUnbind(
+		Request,
+		OutResult,
+		[](const FString& PackageName, FMCPToolExecutionResult& InOutResult)
+		{
+			return SavePackageByName(PackageName, InOutResult);
+		});
 }
 
 bool UMCPToolRegistrySubsystem::HandleUMGGraphSummary(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	FString ObjectPath;
-	bool bIncludeNames = true;
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("object_path"), ObjectPath);
-		Request.Params->TryGetBoolField(TEXT("include_names"), bIncludeNames);
-	}
-
-	UWidgetBlueprint* WidgetBlueprint = LoadWidgetBlueprintByPath(ObjectPath);
-	if (WidgetBlueprint == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::OBJECT_NOT_FOUND;
-		Diagnostic.Message = TEXT("Widget blueprint not found.");
-		Diagnostic.Detail = ObjectPath;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	auto SummarizeGraphArray = [bIncludeNames](UBlueprint* Blueprint, const TCHAR* PropertyName, TSharedRef<FJsonObject> OutSummary)
-	{
-		FArrayProperty* ArrayProperty = FindFProperty<FArrayProperty>(Blueprint->GetClass(), PropertyName);
-		int32 Count = 0;
-		int32 NodeCount = 0;
-		TArray<TSharedPtr<FJsonValue>> Names;
-		if (ArrayProperty != nullptr && ArrayProperty->Inner->IsA<FObjectPropertyBase>())
-		{
-			void* ArrayPtr = ArrayProperty->ContainerPtrToValuePtr<void>(Blueprint);
-			FScriptArrayHelper ArrayHelper(ArrayProperty, ArrayPtr);
-			const FObjectPropertyBase* ObjectProperty = CastField<FObjectPropertyBase>(ArrayProperty->Inner);
-			for (int32 Index = 0; Index < ArrayHelper.Num(); ++Index)
-			{
-				UObject* GraphObject = ObjectProperty->GetObjectPropertyValue(ArrayHelper.GetRawPtr(Index));
-				UEdGraph* Graph = Cast<UEdGraph>(GraphObject);
-				if (Graph == nullptr)
-				{
-					continue;
-				}
-
-				++Count;
-				NodeCount += Graph->Nodes.Num();
-				if (bIncludeNames)
-				{
-					Names.Add(MakeShared<FJsonValueString>(Graph->GetName()));
-				}
-			}
-		}
-
-		OutSummary->SetNumberField(TEXT("graph_count"), Count);
-		OutSummary->SetNumberField(TEXT("node_count"), NodeCount);
-		if (bIncludeNames)
-		{
-			OutSummary->SetArrayField(TEXT("names"), Names);
-		}
-	};
-
-	TSharedRef<FJsonObject> UbergraphSummary = MakeShared<FJsonObject>();
-	TSharedRef<FJsonObject> FunctionGraphSummary = MakeShared<FJsonObject>();
-	TSharedRef<FJsonObject> DelegateGraphSummary = MakeShared<FJsonObject>();
-	TSharedRef<FJsonObject> MacroGraphSummary = MakeShared<FJsonObject>();
-	SummarizeGraphArray(WidgetBlueprint, TEXT("UbergraphPages"), UbergraphSummary);
-	SummarizeGraphArray(WidgetBlueprint, TEXT("FunctionGraphs"), FunctionGraphSummary);
-	SummarizeGraphArray(WidgetBlueprint, TEXT("DelegateSignatureGraphs"), DelegateGraphSummary);
-	SummarizeGraphArray(WidgetBlueprint, TEXT("MacroGraphs"), MacroGraphSummary);
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetObjectField(TEXT("ubergraph"), UbergraphSummary);
-	OutResult.ResultObject->SetObjectField(TEXT("function_graphs"), FunctionGraphSummary);
-	OutResult.ResultObject->SetObjectField(TEXT("delegate_graphs"), DelegateGraphSummary);
-	OutResult.ResultObject->SetObjectField(TEXT("macro_graphs"), MacroGraphSummary);
-	OutResult.Status = EMCPResponseStatus::Ok;
-	return true;
+	return FMCPToolsUMGReadHandler::HandleGraphSummary(Request, OutResult);
 }
 
 bool UMCPToolRegistrySubsystem::HandleObjectPatchV2(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	const TSharedPtr<FJsonObject>* TargetObject = nullptr;
-	const TArray<TSharedPtr<FJsonValue>>* PatchOperations = nullptr;
-	FString TransactionLabel = TEXT("MCP Patch V2");
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetObjectField(TEXT("target"), TargetObject);
-		Request.Params->TryGetArrayField(TEXT("patch"), PatchOperations);
-		const TSharedPtr<FJsonObject>* TransactionObject = nullptr;
-		if (Request.Params->TryGetObjectField(TEXT("transaction"), TransactionObject) && TransactionObject != nullptr && TransactionObject->IsValid())
-		{
-			(*TransactionObject)->TryGetStringField(TEXT("label"), TransactionLabel);
-		}
-	}
-
-	if (TargetObject == nullptr || !TargetObject->IsValid() || PatchOperations == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("target and patch are required for object.patch.v2.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	UObject* ResolvedObject = nullptr;
-	FMCPDiagnostic ResolveDiagnostic;
-	if (!MCPObjectUtils::ResolveTargetObject(*TargetObject, ResolvedObject, ResolveDiagnostic))
-	{
-		OutResult.Diagnostics.Add(ResolveDiagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	TArray<FString> ChangedProperties;
-	FMCPDiagnostic PatchDiagnostic;
-	if (!Request.Context.bDryRun)
-	{
-		FScopedTransaction Transaction(FText::FromString(TransactionLabel));
-		ResolvedObject->Modify();
-		if (!MCPObjectUtils::ApplyPatchV2(ResolvedObject, PatchOperations, ChangedProperties, PatchDiagnostic))
-		{
-			Transaction.Cancel();
-			OutResult.Diagnostics.Add(PatchDiagnostic);
-			OutResult.Status = EMCPResponseStatus::Error;
-			return false;
-		}
-
-		ResolvedObject->PostEditChange();
-		ResolvedObject->MarkPackageDirty();
-	}
-	else
-	{
-		CollectChangedPropertiesFromPatchOperations(PatchOperations, ChangedProperties);
-	}
-
-	MCPObjectUtils::AppendTouchedPackage(ResolvedObject, OutResult.TouchedPackages);
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetArrayField(TEXT("changed_properties"), ToJsonStringArray(ChangedProperties));
-	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(OutResult.TouchedPackages));
-	OutResult.Status = EMCPResponseStatus::Ok;
-	return true;
+	return FMCPToolsObjectHandler::HandlePatchV2(Request, OutResult);
 }
 
 bool UMCPToolRegistrySubsystem::HandleChangeSetList(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	const UMCPChangeSetSubsystem* ChangeSetSubsystem = GEditor ? GEditor->GetEditorSubsystem<UMCPChangeSetSubsystem>() : nullptr;
-	if (ChangeSetSubsystem == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::INTERNAL_EXCEPTION;
-		Diagnostic.Message = TEXT("ChangeSet subsystem is unavailable.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	int32 Limit = 50;
-	FString ToolGlob;
-	FString SessionId;
-	TArray<FString> StatusFilter;
-
-	if (Request.Params.IsValid())
-	{
-		double LimitNumber = static_cast<double>(Limit);
-		Request.Params->TryGetNumberField(TEXT("limit"), LimitNumber);
-		Limit = static_cast<int32>(LimitNumber);
-		Request.Params->TryGetStringField(TEXT("tool_glob"), ToolGlob);
-		Request.Params->TryGetStringField(TEXT("session_id"), SessionId);
-
-		const TArray<TSharedPtr<FJsonValue>>* StatusValues = nullptr;
-		if (Request.Params->TryGetArrayField(TEXT("status_in"), StatusValues) && StatusValues != nullptr)
-		{
-			for (const TSharedPtr<FJsonValue>& StatusValue : *StatusValues)
-			{
-				FString Status;
-				if (StatusValue.IsValid() && StatusValue->TryGetString(Status))
-				{
-					StatusFilter.Add(Status);
-				}
-			}
-		}
-	}
-
-	const int32 Cursor = ParseCursor(Request.Params);
-	TArray<TSharedPtr<FJsonObject>> Items;
-	int32 NextCursor = -1;
-	FMCPDiagnostic Diagnostic;
-
-	if (!ChangeSetSubsystem->ListChangeSets(
-		Limit,
-		Cursor,
-		StatusFilter,
-		ToolGlob,
-		SessionId,
-		Items,
-		NextCursor,
-		Diagnostic))
-	{
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	TArray<TSharedPtr<FJsonValue>> ItemValues;
-	ItemValues.Reserve(Items.Num());
-	for (const TSharedPtr<FJsonObject>& Item : Items)
-	{
-		ItemValues.Add(MakeShared<FJsonValueObject>(Item.ToSharedRef()));
-	}
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetArrayField(TEXT("changesets"), ItemValues);
-	if (NextCursor >= 0)
-	{
-		OutResult.ResultObject->SetStringField(TEXT("next_cursor"), FString::FromInt(NextCursor));
-	}
-	OutResult.Status = EMCPResponseStatus::Ok;
-	return true;
+	return FMCPToolsOpsHandler::HandleChangeSetList(Request, OutResult);
 }
 
 bool UMCPToolRegistrySubsystem::HandleChangeSetGet(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	const UMCPChangeSetSubsystem* ChangeSetSubsystem = GEditor ? GEditor->GetEditorSubsystem<UMCPChangeSetSubsystem>() : nullptr;
-	if (ChangeSetSubsystem == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::INTERNAL_EXCEPTION;
-		Diagnostic.Message = TEXT("ChangeSet subsystem is unavailable.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	FString ChangeSetId;
-	bool bIncludeLogs = true;
-	bool bIncludeSnapshots = false;
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("changeset_id"), ChangeSetId);
-		Request.Params->TryGetBoolField(TEXT("include_logs"), bIncludeLogs);
-		Request.Params->TryGetBoolField(TEXT("include_snapshots"), bIncludeSnapshots);
-	}
-
-	if (ChangeSetId.IsEmpty())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("changeset_id is required.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	TSharedPtr<FJsonObject> ResultObject;
-	FMCPDiagnostic Diagnostic;
-	if (!ChangeSetSubsystem->GetChangeSet(ChangeSetId, bIncludeLogs, bIncludeSnapshots, ResultObject, Diagnostic))
-	{
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	OutResult.ResultObject = ResultObject;
-	OutResult.Status = EMCPResponseStatus::Ok;
-	return true;
+	return FMCPToolsOpsHandler::HandleChangeSetGet(Request, OutResult);
 }
 
 bool UMCPToolRegistrySubsystem::HandleChangeSetRollbackPreview(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	const UMCPChangeSetSubsystem* ChangeSetSubsystem = GEditor ? GEditor->GetEditorSubsystem<UMCPChangeSetSubsystem>() : nullptr;
-	if (ChangeSetSubsystem == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::INTERNAL_EXCEPTION;
-		Diagnostic.Message = TEXT("ChangeSet subsystem is unavailable.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	FString ChangeSetId;
-	FString Mode = TEXT("local_snapshot");
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("changeset_id"), ChangeSetId);
-		Request.Params->TryGetStringField(TEXT("mode"), Mode);
-	}
-
-	if (ChangeSetId.IsEmpty())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("changeset_id is required.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	TSharedPtr<FJsonObject> ResultObject;
-	FMCPDiagnostic Diagnostic;
-	if (!ChangeSetSubsystem->PreviewRollback(ChangeSetId, Mode, ResultObject, Diagnostic))
-	{
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	OutResult.ResultObject = ResultObject;
-	OutResult.Status = EMCPResponseStatus::Ok;
-	return true;
+	return FMCPToolsOpsHandler::HandleChangeSetRollbackPreview(Request, OutResult);
 }
 
 bool UMCPToolRegistrySubsystem::HandleChangeSetRollbackApply(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	const UMCPChangeSetSubsystem* ChangeSetSubsystem = GEditor ? GEditor->GetEditorSubsystem<UMCPChangeSetSubsystem>() : nullptr;
-	UMCPObservabilitySubsystem* ObservabilitySubsystem = GEditor ? GEditor->GetEditorSubsystem<UMCPObservabilitySubsystem>() : nullptr;
-	if (ChangeSetSubsystem == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::INTERNAL_EXCEPTION;
-		Diagnostic.Message = TEXT("ChangeSet subsystem is unavailable.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	FString ChangeSetId;
-	FString Mode = TEXT("local_snapshot");
-	bool bForce = false;
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("changeset_id"), ChangeSetId);
-		Request.Params->TryGetStringField(TEXT("mode"), Mode);
-		Request.Params->TryGetBoolField(TEXT("force"), bForce);
-	}
-
-	if (ChangeSetId.IsEmpty())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("changeset_id is required.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	bool bApplied = false;
-	TArray<FString> TouchedPackages;
-	FMCPDiagnostic Diagnostic;
-	if (!ChangeSetSubsystem->ApplyRollback(ChangeSetId, Mode, bForce, TouchedPackages, bApplied, Diagnostic))
-	{
-		if (ObservabilitySubsystem != nullptr)
-		{
-			ObservabilitySubsystem->RecordRollbackResult(false);
-		}
-
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	OutResult.TouchedPackages = TouchedPackages;
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetBoolField(TEXT("applied"), bApplied);
-	OutResult.ResultObject->SetField(TEXT("rollback_changeset_id"), MakeShared<FJsonValueNull>());
-	OutResult.ResultObject->SetArrayField(TEXT("touched_packages"), ToJsonStringArray(TouchedPackages));
-	OutResult.Status = EMCPResponseStatus::Ok;
-
-	if (ObservabilitySubsystem != nullptr)
-	{
-		ObservabilitySubsystem->RecordRollbackResult(bApplied);
-	}
-
-	return true;
+	return FMCPToolsOpsHandler::HandleChangeSetRollbackApply(Request, OutResult);
 }
 
 bool UMCPToolRegistrySubsystem::HandleJobGet(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	UMCPJobSubsystem* JobSubsystem = GEditor ? GEditor->GetEditorSubsystem<UMCPJobSubsystem>() : nullptr;
-	if (JobSubsystem == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::INTERNAL_EXCEPTION;
-		Diagnostic.Message = TEXT("Job subsystem is unavailable.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	FString JobId;
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("job_id"), JobId);
-	}
-
-	if (JobId.IsEmpty())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("job_id is required.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	FMCPJobRecord Record;
-	if (!JobSubsystem->GetJob(JobId, Record))
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::JOB_NOT_FOUND;
-		Diagnostic.Message = TEXT("Requested job was not found.");
-		Diagnostic.Detail = JobId;
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	TArray<TSharedPtr<FJsonValue>> Diagnostics;
-	for (const FMCPDiagnostic& Diagnostic : Record.Diagnostics)
-	{
-		Diagnostics.Add(MakeShared<FJsonValueObject>(Diagnostic.ToJson()));
-	}
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetStringField(TEXT("job_id"), Record.JobId);
-	OutResult.ResultObject->SetStringField(TEXT("status"), UMCPJobSubsystem::StatusToString(Record.Status));
-	OutResult.ResultObject->SetNumberField(TEXT("progress"), Record.Progress);
-	OutResult.ResultObject->SetStringField(TEXT("started_at"), Record.StartedAtUtc.ToIso8601());
-	OutResult.ResultObject->SetStringField(TEXT("updated_at"), Record.UpdatedAtUtc.ToIso8601());
-	OutResult.ResultObject->SetObjectField(TEXT("result"), Record.Result.IsValid() ? Record.Result.ToSharedRef() : MakeShared<FJsonObject>());
-	OutResult.ResultObject->SetArrayField(TEXT("diagnostics"), Diagnostics);
-	OutResult.Status = EMCPResponseStatus::Ok;
-	return true;
+	return FMCPToolsOpsHandler::HandleJobGet(Request, OutResult);
 }
 
 bool UMCPToolRegistrySubsystem::HandleJobCancel(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
-	UMCPJobSubsystem* JobSubsystem = GEditor ? GEditor->GetEditorSubsystem<UMCPJobSubsystem>() : nullptr;
-	if (JobSubsystem == nullptr)
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::INTERNAL_EXCEPTION;
-		Diagnostic.Message = TEXT("Job subsystem is unavailable.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	FString JobId;
-	if (Request.Params.IsValid())
-	{
-		Request.Params->TryGetStringField(TEXT("job_id"), JobId);
-	}
-
-	if (JobId.IsEmpty())
-	{
-		FMCPDiagnostic Diagnostic;
-		Diagnostic.Code = MCPErrorCodes::SCHEMA_INVALID_PARAMS;
-		Diagnostic.Message = TEXT("job_id is required.");
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	FMCPJobRecord Record;
-	FMCPDiagnostic Diagnostic;
-	if (!JobSubsystem->CancelJob(JobId, Record, Diagnostic))
-	{
-		OutResult.Diagnostics.Add(Diagnostic);
-		OutResult.Status = EMCPResponseStatus::Error;
-		return false;
-	}
-
-	OutResult.ResultObject = MakeShared<FJsonObject>();
-	OutResult.ResultObject->SetStringField(TEXT("job_id"), Record.JobId);
-	OutResult.ResultObject->SetBoolField(TEXT("canceled"), Record.Status == EMCPJobStatus::Canceled);
-	OutResult.ResultObject->SetStringField(TEXT("status"), UMCPJobSubsystem::StatusToString(Record.Status));
-	OutResult.Status = EMCPResponseStatus::Ok;
-	return true;
+	return FMCPToolsOpsHandler::HandleJobCancel(Request, OutResult);
 }
