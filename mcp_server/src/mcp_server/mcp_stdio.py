@@ -15,6 +15,7 @@ from mcp_server.logging_setup import configure_logging
 from mcp_server.mcp_facade import MCPFacade
 from mcp_server.metrics import RuntimeMetrics
 from mcp_server.request_broker import RequestBroker
+from mcp_server.sequencer_orchestrator import SequencerOrchestrationService
 from mcp_server.tool_catalog import ToolCatalog, ToolDefinition
 from mcp_server.tool_passthrough import CatalogGuardError, MCPPassThroughService, UnknownToolError
 from mcp_server.umg_orchestrator import UMGOrchestrationService
@@ -247,9 +248,11 @@ class MCPRequestDispatcher:
         pass_through: MCPPassThroughService,
         *,
         umg_orchestration: UMGOrchestrationService | None = None,
+        sequencer_orchestration: SequencerOrchestrationService | None = None,
     ) -> None:
         self._pass_through = pass_through
         self._umg_orchestration = umg_orchestration or UMGOrchestrationService(pass_through)
+        self._sequencer_orchestration = sequencer_orchestration or SequencerOrchestrationService(pass_through)
         self._initialized = False
 
     async def handle_request(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -340,6 +343,7 @@ class MCPRequestDispatcher:
 
         tools = [self._build_mcp_tool(tool) for tool in self._pass_through.list_tools()]
         tools.extend(self._umg_orchestration.list_virtual_tools())
+        tools.extend(self._sequencer_orchestration.list_virtual_tools())
         return {
             "tools": tools,
         }
@@ -369,6 +373,12 @@ class MCPRequestDispatcher:
         try:
             if self._umg_orchestration.is_virtual_tool(tool_name):
                 result = await self._umg_orchestration.call_virtual_tool(
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    request_id=tool_request_id,
+                )
+            elif self._sequencer_orchestration.is_virtual_tool(tool_name):
+                result = await self._sequencer_orchestration.call_virtual_tool(
                     tool_name=tool_name,
                     arguments=arguments,
                     request_id=tool_request_id,

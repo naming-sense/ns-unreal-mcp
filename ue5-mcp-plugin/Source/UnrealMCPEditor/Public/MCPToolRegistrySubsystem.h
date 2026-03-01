@@ -122,6 +122,26 @@ private:
 	bool HandleUMGWidgetEventBind(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
 	bool HandleUMGWidgetEventUnbind(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
 	bool HandleUMGGraphSummary(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleSeqAssetCreate(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleSeqAssetLoad(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleSeqInspect(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleSeqBindingList(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleSeqTrackList(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleSeqSectionList(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleSeqChannelList(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleSeqBindingAdd(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleSeqBindingRemove(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleSeqTrackAdd(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleSeqTrackRemove(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleSeqSectionAdd(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleSeqSectionPatch(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleSeqSectionRemove(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleSeqKeySet(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleSeqKeyRemove(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleSeqKeyBulkSet(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleSeqPlaybackPatch(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleSeqSave(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
+	bool HandleSeqValidate(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const;
 
 	FString BuildDeleteConfirmationToken(const TArray<FString>& ObjectPaths, bool bFailIfReferenced) const;
 	bool ConsumeDeleteConfirmationToken(const FString& Token, const TArray<FString>& ObjectPaths, bool bFailIfReferenced) const;

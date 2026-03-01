@@ -30,6 +30,7 @@ public class UnrealMCPEditor : ModuleRules
                 "WebSocketNetworking",
                 "Kismet",
                 "KismetCompiler",
+                "LevelSequence",
                 "MovieScene",
                 "MovieSceneTracks",
                 "Slate",

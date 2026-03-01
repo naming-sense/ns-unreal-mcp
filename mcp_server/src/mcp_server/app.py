@@ -16,6 +16,7 @@ from mcp_server.logging_setup import configure_logging
 from mcp_server.mcp_facade import MCPFacade
 from mcp_server.metrics import RuntimeMetrics
 from mcp_server.request_broker import RequestBroker
+from mcp_server.sequencer_orchestrator import SequencerOrchestrationService
 from mcp_server.tool_catalog import ToolCatalog
 from mcp_server.tool_passthrough import CatalogGuardError, MCPPassThroughService, UnknownToolError
 from mcp_server.umg_orchestrator import UMGOrchestrationService
@@ -112,6 +113,7 @@ async def run(
         metrics=metrics,
     )
     umg_orchestration = UMGOrchestrationService(pass_through)
+    sequencer_orchestration = SequencerOrchestrationService(pass_through)
 
     stop_event = asyncio.Event()
     metrics_task: asyncio.Task[None] | None = None
@@ -175,7 +177,10 @@ async def run(
                 "schema_hash": pass_through.schema_hash,
                 "last_refresh_ms": pass_through.last_refresh_ms,
                 "tools": pass_through.list_tools_as_dict(),
-                "virtual_tools": umg_orchestration.list_virtual_tools(),
+                "virtual_tools": [
+                    *umg_orchestration.list_virtual_tools(),
+                    *sequencer_orchestration.list_virtual_tools(),
+                ],
             }
             print(json.dumps(payload, ensure_ascii=False))
             _maybe_print_metrics(
@@ -190,6 +195,12 @@ async def run(
                 if stream_events:
                     if umg_orchestration.is_virtual_tool(call_tool):
                         call_result = await umg_orchestration.call_virtual_tool(
+                            tool_name=call_tool,
+                            arguments=call_tool_params or {},
+                            request_id=f"cli-{call_tool}",
+                        )
+                    elif sequencer_orchestration.is_virtual_tool(call_tool):
+                        call_result = await sequencer_orchestration.call_virtual_tool(
                             tool_name=call_tool,
                             arguments=call_tool_params or {},
                             request_id=f"cli-{call_tool}",
@@ -217,6 +228,12 @@ async def run(
                 else:
                     if umg_orchestration.is_virtual_tool(call_tool):
                         call_result = await umg_orchestration.call_virtual_tool(
+                            tool_name=call_tool,
+                            arguments=call_tool_params or {},
+                            request_id=f"cli-{call_tool}",
+                        )
+                    elif sequencer_orchestration.is_virtual_tool(call_tool):
+                        call_result = await sequencer_orchestration.call_virtual_tool(
                             tool_name=call_tool,
                             arguments=call_tool_params or {},
                             request_id=f"cli-{call_tool}",

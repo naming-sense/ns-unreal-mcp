@@ -177,6 +177,7 @@ async def test_initialize_then_tools_list() -> None:
     tool_names = {tool["name"] for tool in tools}
     assert "system.health" in tool_names
     assert "umg.workflow.compose" in tool_names
+    assert "seq.workflow.compose" in tool_names
 
 
 @pytest.mark.asyncio
@@ -321,6 +322,56 @@ async def test_tools_call_virtual_umg_workflow_compose() -> None:
     assert response["result"]["isError"] is False
     assert response["result"]["structuredContent"]["status"] == "ok"
     assert fake.call_requests[-1]["tool"] == "umg.widget.patch"
+
+
+@pytest.mark.asyncio
+async def test_tools_call_virtual_seq_workflow_compose() -> None:
+    fake = FakePassThrough()
+    fake.add_tool(
+        ToolDefinition(
+            name="seq.inspect",
+            domain="seq",
+            version="1.0.0",
+            enabled=True,
+            write=False,
+            params_schema={"type": "object"},
+            result_schema={"type": "object"},
+        )
+    )
+
+    dispatcher = MCPRequestDispatcher(fake)  # type: ignore[arg-type]
+    await dispatcher.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "2025-03-26"},
+        }
+    )
+
+    response = await dispatcher.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "tools/call",
+            "params": {
+                "name": "seq.workflow.compose",
+                "arguments": {
+                    "object_path": "/Game/Seq/LS_Test.LS_Test",
+                    "actions": [
+                        {
+                            "kind": "inspect",
+                            "args": {},
+                        }
+                    ],
+                },
+            },
+        }
+    )
+
+    assert response["result"]["isError"] is False
+    assert response["result"]["structuredContent"]["status"] == "ok"
+    assert fake.call_requests[-1]["tool"] == "seq.inspect"
 
 
 def test_build_endpoint_listing_payload_includes_selector_hint(tmp_path: Path) -> None:

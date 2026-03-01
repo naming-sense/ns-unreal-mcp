@@ -608,7 +608,7 @@ namespace
 				FString CurrentText;
 				FString TestText;
 				CurrentProperty->ExportTextItem_Direct(CurrentText, CurrentValuePtr, nullptr, nullptr, PPF_None);
-				void* ScratchValue = FMemory::Malloc(CurrentProperty->ElementSize, CurrentProperty->GetMinAlignment());
+				void* ScratchValue = FMemory::Malloc(CurrentProperty->GetElementSize(), CurrentProperty->GetMinAlignment());
 				CurrentProperty->InitializeValue(ScratchValue);
 				const bool bConverted = JsonValueToProperty(CurrentProperty, ScratchValue, ValueJson, OutDiagnostic);
 				if (bConverted)

@@ -34,7 +34,7 @@ class ScenarioSpec:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="E2E smoke runner for material/niagara/umg(+extended) + asset lifecycle tools"
+        description="E2E smoke runner for material/niagara/umg/sequencer(+extended) + asset lifecycle tools"
     )
     parser.add_argument("--config", type=Path, default=None, help="Path to YAML config")
     parser.add_argument("--log-level", type=str, default=None, help="Override log level")
@@ -42,6 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--material-path", type=str, default=None, help="Material instance object path")
     parser.add_argument("--niagara-path", type=str, default=None, help="Niagara system object path")
     parser.add_argument("--umg-path", type=str, default=None, help="Widget blueprint object path")
+    parser.add_argument("--sequencer-path", type=str, default=None, help="Level sequence object path")
     parser.add_argument(
         "--skip-asset-lifecycle",
         action="store_true",
@@ -139,6 +140,16 @@ def _scenario_specs() -> tuple[ScenarioSpec, ...]:
                 "depth": 3,
             },
         ),
+        ScenarioSpec(
+            key="sequencer",
+            tool="seq.inspect",
+            path_arg="sequencer_path",
+            discover_class_paths=("/Script/LevelSequence.LevelSequence",),
+            discover_name_glob="LS_*",
+            params_builder=lambda path: {
+                "object_path": path,
+            },
+        ),
     )
 
 
@@ -205,6 +216,9 @@ def _build_success_summary(spec: ScenarioSpec, result: ToolCallResult) -> dict[s
     elif spec.key == "umg":
         nodes = result.result.get("nodes")
         summary["node_count"] = len(nodes) if isinstance(nodes, list) else 0
+    elif spec.key == "sequencer":
+        summary["binding_count"] = int(result.result.get("binding_count", 0))
+        summary["master_track_count"] = int(result.result.get("master_track_count", 0))
     return summary
 
 
@@ -512,6 +526,285 @@ async def _run_umg_extended_scenario(
     }
 
 
+async def _run_sequencer_extended_scenario(
+    *,
+    pass_through: MCPPassThroughService,
+    timeout_ms: int | None,
+    stream_events: bool,
+    print_event_lines: bool,
+    include_result: bool,
+    root_path: str,
+    keep_assets: bool,
+) -> dict[str, Any]:
+    required_tools = (
+        "seq.asset.create",
+        "seq.inspect",
+        "seq.binding.add",
+        "seq.track.add",
+        "seq.section.add",
+        "seq.channel.list",
+        "seq.key.set",
+        "seq.playback.patch",
+        "seq.save",
+        "seq.validate",
+        "asset.delete",
+    )
+    missing_tools = [tool for tool in required_tools if not _tool_is_available(pass_through, tool)]
+    if missing_tools:
+        return {
+            "scenario": "sequencer_extended",
+            "status": "skipped",
+            "reason": f"required tools missing: {', '.join(missing_tools)}",
+            "missing_tools": missing_tools,
+        }
+
+    scenario_started = time.perf_counter()
+    scenario_events: list[dict[str, Any]] = []
+    steps: list[dict[str, Any]] = []
+
+    unique = uuid.uuid4().hex[:8].upper()
+    package_path = f"{root_path.rstrip('/')}/LS_E2E_{unique}"
+    asset_name = f"LS_E2E_{unique}"
+    object_path = f"{package_path}.{asset_name}"
+
+    async def _invoke(step_name: str, tool: str, params: dict[str, Any]) -> ToolCallResult:
+        started = time.perf_counter()
+        step_events: list[dict[str, Any]] = []
+        try:
+            if stream_events:
+
+                def _on_event(event: dict[str, Any]) -> None:
+                    scenario_events.append(event)
+                    step_events.append(event)
+                    if print_event_lines:
+                        print(
+                            json.dumps(
+                                {
+                                    "type": "event",
+                                    "scenario": "sequencer_extended",
+                                    "step": step_name,
+                                    "event": event,
+                                },
+                                ensure_ascii=False,
+                            ),
+                            flush=True,
+                        )
+
+                result = await pass_through.call_tool_stream(
+                    tool=tool,
+                    params=params,
+                    timeout_ms=timeout_ms,
+                    on_event=_on_event,
+                )
+            else:
+                result = await pass_through.call_tool(
+                    tool=tool,
+                    params=params,
+                    timeout_ms=timeout_ms,
+                )
+        except Exception as exc:
+            duration_ms = int((time.perf_counter() - started) * 1000)
+            steps.append(
+                {
+                    "step": step_name,
+                    "tool": tool,
+                    "status": "error",
+                    "duration_ms": duration_ms,
+                    "event_count": len(step_events),
+                    "error": {
+                        "type": exc.__class__.__name__,
+                        "message": str(exc),
+                    },
+                }
+            )
+            raise
+
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        step_payload: dict[str, Any] = {
+            "step": step_name,
+            "tool": tool,
+            "request_id": result.request_id,
+            "status": result.status if result.ok and result.status != "error" else "error",
+            "duration_ms": duration_ms,
+            "event_count": len(step_events),
+            "diagnostics": result.diagnostics,
+        }
+        if include_result:
+            step_payload["result"] = result.result
+        steps.append(step_payload)
+        return result
+
+    try:
+        create_result = await _invoke(
+            "create",
+            "seq.asset.create",
+            {
+                "package_path": root_path,
+                "asset_name": asset_name,
+                "display_rate": {"numerator": 30, "denominator": 1},
+                "tick_resolution": {"numerator": 24000, "denominator": 1},
+            },
+        )
+        created_path = create_result.result.get("object_path")
+        if isinstance(created_path, str) and created_path:
+            object_path = created_path
+
+        await _invoke("inspect", "seq.inspect", {"object_path": object_path})
+        binding_result = await _invoke(
+            "binding.add",
+            "seq.binding.add",
+            {
+                "object_path": object_path,
+                "mode": "possessable",
+                "class_path": "/Script/Engine.Actor",
+                "display_name": "E2EActor",
+            },
+        )
+        binding_id = binding_result.result.get("binding_id")
+        if not isinstance(binding_id, str) or not binding_id:
+            raise RuntimeError("seq.binding.add did not return binding_id")
+
+        track_result = await _invoke(
+            "track.add",
+            "seq.track.add",
+            {
+                "object_path": object_path,
+                "binding_id": binding_id,
+                "track_type": "float",
+            },
+        )
+        track_id = track_result.result.get("track_id")
+        if not isinstance(track_id, str) or not track_id:
+            raise RuntimeError("seq.track.add did not return track_id")
+
+        section_result = await _invoke(
+            "section.add",
+            "seq.section.add",
+            {
+                "track_id": track_id,
+                "start_frame": 0,
+                "end_frame": 120,
+            },
+        )
+        section_id = section_result.result.get("section_id")
+        if not isinstance(section_id, str) or not section_id:
+            raise RuntimeError("seq.section.add did not return section_id")
+
+        channel_result = await _invoke(
+            "channel.list",
+            "seq.channel.list",
+            {
+                "object_path": object_path,
+                "section_id": section_id,
+            },
+        )
+        channel_id = ""
+        channels = channel_result.result.get("channels")
+        if isinstance(channels, list) and channels:
+            first_channel = channels[0]
+            if isinstance(first_channel, dict):
+                candidate = first_channel.get("channel_id")
+                if isinstance(candidate, str):
+                    channel_id = candidate
+
+        if channel_id:
+            await _invoke(
+                "key.set.0",
+                "seq.key.set",
+                {
+                    "channel_id": channel_id,
+                    "frame": 0,
+                    "value": 0.0,
+                },
+            )
+            await _invoke(
+                "key.set.120",
+                "seq.key.set",
+                {
+                    "channel_id": channel_id,
+                    "frame": 120,
+                    "value": 1.0,
+                    "interp": "linear",
+                },
+            )
+        else:
+            steps.append(
+                {
+                    "step": "key.set",
+                    "tool": "seq.key.set",
+                    "status": "skipped",
+                    "reason": "channel.list returned no channel_id",
+                }
+            )
+
+        await _invoke(
+            "playback.patch",
+            "seq.playback.patch",
+            {
+                "object_path": object_path,
+                "start_frame": 0,
+                "end_frame": 120,
+            },
+        )
+        await _invoke("save", "seq.save", {"object_path": object_path})
+        await _invoke("validate", "seq.validate", {"object_path": object_path})
+    except Exception as exc:
+        return {
+            "scenario": "sequencer_extended",
+            "status": "error",
+            "duration_ms": int((time.perf_counter() - scenario_started) * 1000),
+            "event_count": len(scenario_events),
+            "error": {
+                "type": exc.__class__.__name__,
+                "message": str(exc),
+            },
+            "summary": {
+                "object_path": object_path,
+                "keep_assets": keep_assets,
+            },
+            "steps": steps,
+        }
+    finally:
+        if not keep_assets:
+            try:
+                delete_preview = await _invoke(
+                    "delete.preview",
+                    "asset.delete",
+                    {
+                        "object_paths": [object_path],
+                        "mode": "preview",
+                        "fail_if_referenced": False,
+                    },
+                )
+                confirm_token = delete_preview.result.get("confirm_token")
+                if isinstance(confirm_token, str) and confirm_token:
+                    await _invoke(
+                        "delete.apply",
+                        "asset.delete",
+                        {
+                            "object_paths": [object_path],
+                            "mode": "apply",
+                            "fail_if_referenced": False,
+                            "confirm_token": confirm_token,
+                        },
+                    )
+            except Exception:
+                pass
+
+    return {
+        "scenario": "sequencer_extended",
+        "status": "ok",
+        "duration_ms": int((time.perf_counter() - scenario_started) * 1000),
+        "event_count": len(scenario_events),
+        "summary": {
+            "object_path": object_path,
+            "keep_assets": keep_assets,
+            "step_count": len(steps),
+        },
+        "steps": steps,
+    }
+
+
 async def _run_asset_lifecycle_scenario(
     *,
     pass_through: MCPPassThroughService,
@@ -748,6 +1041,7 @@ async def run_e2e(
     material_path: str | None,
     niagara_path: str | None,
     umg_path: str | None,
+    sequencer_path: str | None,
     path_glob: str,
     auto_discover: bool,
     require_all: bool,
@@ -798,11 +1092,13 @@ async def run_e2e(
         "material": material_path,
         "niagara": niagara_path,
         "umg": umg_path,
+        "sequencer": sequencer_path,
     }
     resolved_paths: dict[str, str | None] = {
         "material": None,
         "niagara": None,
         "umg": None,
+        "sequencer": None,
     }
 
     scenarios: list[dict[str, Any]] = []
@@ -950,6 +1246,21 @@ async def run_e2e(
             if require_all and umg_extended_result.get("status") == "skipped":
                 overall_ok = False
 
+        sequencer_extended_result = await _run_sequencer_extended_scenario(
+            pass_through=pass_through,
+            timeout_ms=timeout_ms,
+            stream_events=stream_events,
+            print_event_lines=print_event_lines,
+            include_result=include_result,
+            root_path=asset_lifecycle_root_path,
+            keep_assets=asset_lifecycle_keep_assets,
+        )
+        scenarios.append(sequencer_extended_result)
+        if sequencer_extended_result.get("status") == "error":
+            overall_ok = False
+        if require_all and sequencer_extended_result.get("status") == "skipped":
+            overall_ok = False
+
         if not skip_asset_lifecycle:
             lifecycle_result = await _run_asset_lifecycle_scenario(
                 pass_through=pass_through,
@@ -1008,6 +1319,7 @@ def main() -> int:
                 material_path=args.material_path,
                 niagara_path=args.niagara_path,
                 umg_path=args.umg_path,
+                sequencer_path=args.sequencer_path,
                 path_glob=args.path_glob,
                 auto_discover=not args.no_auto_discover,
                 require_all=args.require_all,

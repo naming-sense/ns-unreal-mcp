@@ -21,6 +21,10 @@
 #include "Tools/Niagara/MCPToolsNiagaraHandler.h"
 #include "Tools/Object/MCPToolsObjectHandler.h"
 #include "Tools/Ops/MCPToolsOpsHandler.h"
+#include "Tools/Sequencer/MCPToolsSequencerKeyHandler.h"
+#include "Tools/Sequencer/MCPToolsSequencerReadHandler.h"
+#include "Tools/Sequencer/MCPToolsSequencerStructureHandler.h"
+#include "Tools/Sequencer/MCPToolsSequencerValidationHandler.h"
 #include "Tools/UMG/MCPToolsUMGAnimationHandler.h"
 #include "Tools/UMG/MCPToolsUMGBindingHandler.h"
 #include "Tools/UMG/MCPToolsUMGReadHandler.h"
@@ -948,7 +952,9 @@ TArray<FString> UMCPToolRegistrySubsystem::GetCapabilities() const
 		TEXT("observability_metrics_v1"),
 		TEXT("event_stream_ws_push_v1"),
 		TEXT("live_coding_compile_v1"),
-		TEXT("umg_widget_event_k2_v1")
+		TEXT("umg_widget_event_k2_v1"),
+		TEXT("sequencer_core_v1"),
+		TEXT("sequencer_keys_v1")
 	};
 }
 
@@ -1008,6 +1014,28 @@ void UMCPToolRegistrySubsystem::RegisterBuiltInToolsImpl()
 		{ TEXT("niagara.params.set"), true, &UMCPToolRegistrySubsystem::HandleNiagaraParamsSet },
 		{ TEXT("niagara.stack.list"), false, &UMCPToolRegistrySubsystem::HandleNiagaraStackList },
 		{ TEXT("niagara.stack.module.set_param"), true, &UMCPToolRegistrySubsystem::HandleNiagaraStackModuleSetParam },
+		{ TEXT("seq.asset.create"), true, &UMCPToolRegistrySubsystem::HandleSeqAssetCreate },
+		{ TEXT("seq.asset.load"), false, &UMCPToolRegistrySubsystem::HandleSeqAssetLoad },
+		{ TEXT("seq.inspect"), false, &UMCPToolRegistrySubsystem::HandleSeqInspect },
+		{ TEXT("seq.binding.list"), false, &UMCPToolRegistrySubsystem::HandleSeqBindingList },
+		{ TEXT("seq.track.list"), false, &UMCPToolRegistrySubsystem::HandleSeqTrackList },
+		{ TEXT("seq.section.list"), false, &UMCPToolRegistrySubsystem::HandleSeqSectionList },
+		{ TEXT("seq.channel.list"), false, &UMCPToolRegistrySubsystem::HandleSeqChannelList },
+		{ TEXT("seq.binding.add"), true, &UMCPToolRegistrySubsystem::HandleSeqBindingAdd },
+		{ TEXT("seq.binding.remove"), true, &UMCPToolRegistrySubsystem::HandleSeqBindingRemove },
+		{ TEXT("seq.track.add"), true, &UMCPToolRegistrySubsystem::HandleSeqTrackAdd },
+		{ TEXT("seq.track.remove"), true, &UMCPToolRegistrySubsystem::HandleSeqTrackRemove },
+		{ TEXT("seq.section.add"), true, &UMCPToolRegistrySubsystem::HandleSeqSectionAdd },
+		{ TEXT("seq.section.patch"), true, &UMCPToolRegistrySubsystem::HandleSeqSectionPatch },
+		{ TEXT("seq.section.remove"), true, &UMCPToolRegistrySubsystem::HandleSeqSectionRemove },
+		{ TEXT("seq.key.set"), true, &UMCPToolRegistrySubsystem::HandleSeqKeySet },
+		{ TEXT("seq.key.remove"), true, &UMCPToolRegistrySubsystem::HandleSeqKeyRemove },
+		{ TEXT("seq.key.bulk_set"), true, &UMCPToolRegistrySubsystem::HandleSeqKeyBulkSet },
+		{ TEXT("seq.object.inspect"), false, &UMCPToolRegistrySubsystem::HandleObjectInspect },
+		{ TEXT("seq.object.patch.v2"), true, &UMCPToolRegistrySubsystem::HandleObjectPatchV2 },
+		{ TEXT("seq.playback.patch"), true, &UMCPToolRegistrySubsystem::HandleSeqPlaybackPatch },
+		{ TEXT("seq.save"), true, &UMCPToolRegistrySubsystem::HandleSeqSave },
+		{ TEXT("seq.validate"), false, &UMCPToolRegistrySubsystem::HandleSeqValidate },
 		{ TEXT("umg.blueprint.create"), true, &UMCPToolRegistrySubsystem::HandleUMGBlueprintCreate },
 		{ TEXT("umg.blueprint.patch"), true, &UMCPToolRegistrySubsystem::HandleUMGBlueprintPatch },
 		{ TEXT("umg.blueprint.reparent"), true, &UMCPToolRegistrySubsystem::HandleUMGBlueprintReparent },
@@ -2013,6 +2041,106 @@ bool UMCPToolRegistrySubsystem::HandleNiagaraStackList(const FMCPRequestEnvelope
 bool UMCPToolRegistrySubsystem::HandleNiagaraStackModuleSetParam(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
 {
 	return FMCPToolsNiagaraHandler::HandleStackModuleSetParam(Request, OutResult);
+}
+
+bool UMCPToolRegistrySubsystem::HandleSeqAssetCreate(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
+{
+	return FMCPToolsSequencerReadHandler::HandleAssetCreate(Request, OutResult);
+}
+
+bool UMCPToolRegistrySubsystem::HandleSeqAssetLoad(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
+{
+	return FMCPToolsSequencerReadHandler::HandleAssetLoad(Request, OutResult);
+}
+
+bool UMCPToolRegistrySubsystem::HandleSeqInspect(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
+{
+	return FMCPToolsSequencerReadHandler::HandleInspect(Request, OutResult);
+}
+
+bool UMCPToolRegistrySubsystem::HandleSeqBindingList(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
+{
+	return FMCPToolsSequencerReadHandler::HandleBindingList(Request, OutResult);
+}
+
+bool UMCPToolRegistrySubsystem::HandleSeqTrackList(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
+{
+	return FMCPToolsSequencerReadHandler::HandleTrackList(Request, OutResult);
+}
+
+bool UMCPToolRegistrySubsystem::HandleSeqSectionList(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
+{
+	return FMCPToolsSequencerReadHandler::HandleSectionList(Request, OutResult);
+}
+
+bool UMCPToolRegistrySubsystem::HandleSeqChannelList(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
+{
+	return FMCPToolsSequencerReadHandler::HandleChannelList(Request, OutResult);
+}
+
+bool UMCPToolRegistrySubsystem::HandleSeqBindingAdd(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
+{
+	return FMCPToolsSequencerStructureHandler::HandleBindingAdd(Request, OutResult);
+}
+
+bool UMCPToolRegistrySubsystem::HandleSeqBindingRemove(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
+{
+	return FMCPToolsSequencerStructureHandler::HandleBindingRemove(Request, OutResult);
+}
+
+bool UMCPToolRegistrySubsystem::HandleSeqTrackAdd(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
+{
+	return FMCPToolsSequencerStructureHandler::HandleTrackAdd(Request, OutResult);
+}
+
+bool UMCPToolRegistrySubsystem::HandleSeqTrackRemove(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
+{
+	return FMCPToolsSequencerStructureHandler::HandleTrackRemove(Request, OutResult);
+}
+
+bool UMCPToolRegistrySubsystem::HandleSeqSectionAdd(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
+{
+	return FMCPToolsSequencerStructureHandler::HandleSectionAdd(Request, OutResult);
+}
+
+bool UMCPToolRegistrySubsystem::HandleSeqSectionPatch(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
+{
+	return FMCPToolsSequencerStructureHandler::HandleSectionPatch(Request, OutResult);
+}
+
+bool UMCPToolRegistrySubsystem::HandleSeqSectionRemove(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
+{
+	return FMCPToolsSequencerStructureHandler::HandleSectionRemove(Request, OutResult);
+}
+
+bool UMCPToolRegistrySubsystem::HandleSeqKeySet(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
+{
+	return FMCPToolsSequencerKeyHandler::HandleKeySet(Request, OutResult);
+}
+
+bool UMCPToolRegistrySubsystem::HandleSeqKeyRemove(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
+{
+	return FMCPToolsSequencerKeyHandler::HandleKeyRemove(Request, OutResult);
+}
+
+bool UMCPToolRegistrySubsystem::HandleSeqKeyBulkSet(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
+{
+	return FMCPToolsSequencerKeyHandler::HandleKeyBulkSet(Request, OutResult);
+}
+
+bool UMCPToolRegistrySubsystem::HandleSeqPlaybackPatch(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
+{
+	return FMCPToolsSequencerStructureHandler::HandlePlaybackPatch(Request, OutResult);
+}
+
+bool UMCPToolRegistrySubsystem::HandleSeqSave(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
+{
+	return FMCPToolsSequencerStructureHandler::HandleSave(Request, OutResult);
+}
+
+bool UMCPToolRegistrySubsystem::HandleSeqValidate(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
+{
+	return FMCPToolsSequencerValidationHandler::HandleValidate(Request, OutResult);
 }
 
 bool UMCPToolRegistrySubsystem::HandleUMGWidgetClassList(const FMCPRequestEnvelope& Request, FMCPToolExecutionResult& OutResult) const
